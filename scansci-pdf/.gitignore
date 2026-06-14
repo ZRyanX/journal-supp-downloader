@@ -1,0 +1,40 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.db
+*.db-journal
+*.db-wal
+.DS_Store
+Thumbs.db
+.env
+.venv/
+.scansci-pdf/
+piao_top30.json
+piao_top30_dois.txt
+webvpn.dat
+=3.0
+
+# Cython build artifacts (generated locally, not tracked)
+*.c
+*.pyd
+*.so
+
+# Playwright MCP browser logs, screenshots, page snapshots
+.playwright-mcp/
+
+# Test artifacts
+test_output/
+
+# Claude Code local settings
+.claude/
+
+# Temporary test scripts
+batch_download_*.py
+download_*.py
+login_and_download.py
+test_download*.py
+ISSUE_REPORT*.md

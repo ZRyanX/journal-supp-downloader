@@ -1,0 +1,23 @@
+SocksPort 0.0.0.0:9050
+DataDirectory /var/lib/tor
+Log notice stderr
+
+# Enable obfs4 pluggable transport
+ClientTransportPlugin obfs4 exec /usr/bin/obfs4proxy
+
+# Use bridges (uncomment and add your bridges from https://bridges.torproject.org/bridges)
+# For now, use some default bridges - replace with your own for better reliability
+UseBridges 1
+
+# Default obfs4 bridges from Tor Project
+# These are public bridges - for better privacy, get your own from https://bridges.torproject.org/
+Bridge obfs4 193.11.166.113:27025 1AE2C08904527F517375C544BDCD02B91C3CAF76 cert=ItvYZzW5tn6v3G4UnQa6Qz04Npro6e81AP70YujmK/KXwDFPTs3aHXcHp4n8Vt6w/bv8cA iat-mode=0
+Bridge obfs4 193.11.166.113:443 1AE2C08904527F517375C544BDCD02B91C3CAF76 cert=ItvYZzW5tn6v3G4UnQa6Qz04Npro6e81AP70YujmK/KXwDFPTs3aHXcHp4n8Vt6w/bv8cA iat-mode=0
+Bridge obfs4 209.148.46.65:443 74FAD1316880624660D71DDB00C5C80D8CBEBE5F cert=504A18EDFA0D19ABDD15C3D1A3E7E6E5C9D8B3F1 iat-mode=0
+
+# Connection settings
+SocksTimeout 120
+CircuitBuildTimeout 60
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 3600
+NewCircuitPeriod 150
