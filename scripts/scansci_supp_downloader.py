@@ -28,12 +28,7 @@ from urllib.parse import urljoin, urlparse
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Ensure scansci_pdf is in path
-# Check local copy first, then fall back to original relative path
-local_scansci = Path(__file__).resolve().parents[1] / "scansci-pdf" / "src"
-if local_scansci.is_dir():
-    sys.path.append(str(local_scansci))
-else:
-    sys.path.append(str(Path(__file__).resolve().parents[2] / "scansci-pdf" / "src"))
+sys.path.append(str(Path(__file__).resolve().parents[2] / "scansci-pdf" / "src"))
 
 import requests
 
@@ -173,12 +168,21 @@ def is_data_url(url):
     if MMC_PATTERN.search(url_lower):
         return True
 
-    # Check for supplementary keyword + data extension
+    # Check for supplementary keyword + data extension (or PDF)
     if SUPP_FILE_PATTERN.search(url_lower):
+        if path.endswith(".pdf"):
+            return True
         for ext in DATA_EXTENSIONS:
             pattern = re.escape(ext) + r'(?:[^a-z0-9]|$)'
             if re.search(pattern, url_lower):
                 return True
+
+    # Check for table keyword + data extension (or PDF)
+    # e.g., table_a1.pdf, table-s1.pdf, table1.pdf, tbl_s2.pdf
+    TABLE_FILE_PATTERN = re.compile(r"(?:table|tbl|附表)_?[a-z]?\.?\d+", re.IGNORECASE)
+    if TABLE_FILE_PATTERN.search(url_lower):
+        if path.endswith(".pdf") or any(path.endswith(ext) for ext in DATA_EXTENSIONS):
+            return True
 
     # General fallback for any data extension in URL (with strict boundary check)
     for ext in DATA_EXTENSIONS:
@@ -240,11 +244,33 @@ def find_supplementary_links(html_content, base_url):
     soup = BeautifulSoup(html_content, 'html.parser')
     links = set()
 
-    # 1. Look for hrefs matching mmc, suppl, etc.
+    # Table pattern like: Table A1, Table S1, Table A.1, Tab A1, 附表1
+    table_text_pattern = re.compile(r"^\s*(?:Table|Tab\.|附表)\s*[a-zA-Z]?\.?\d+", re.IGNORECASE)
+
+    # 1. Look for hrefs matching mmc, suppl, etc. or having "Table A1" in anchor text
     for a in soup.find_all('a', href=True):
         href = a['href']
         full_url = urljoin(base_url, href)
-        if not is_excluded_url(full_url) and is_data_url(full_url):
+        if is_excluded_url(full_url):
+            continue
+            
+        link_text = a.get_text().strip()
+        
+        # Check if the URL is a data URL (Excel, zip, etc. or table PDF)
+        is_data = is_data_url(full_url)
+        
+        # Or check if link text is "Table A1" etc.
+        is_table_text = bool(table_text_pattern.match(link_text))
+        
+        # If the text indicates a table, and the URL is a potential file download (not HTML page)
+        is_valid_table_link = False
+        if is_table_text:
+            parsed = urlparse(full_url)
+            path = parsed.path.lower()
+            if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
+                is_valid_table_link = True
+
+        if is_data or is_valid_table_link:
             if not is_article_figure_url(full_url):
                 links.add(full_url)
 
@@ -257,7 +283,21 @@ def find_supplementary_links(html_content, base_url):
                 for a in parent.find_all('a', href=True):
                     href = a['href']
                     full_url = urljoin(base_url, href)
-                    if not is_excluded_url(full_url) and is_data_url(full_url):
+                    if is_excluded_url(full_url):
+                        continue
+                        
+                    link_text = a.get_text().strip()
+                    is_data = is_data_url(full_url)
+                    is_table_text = bool(table_text_pattern.match(link_text))
+                    
+                    is_valid_table_link = False
+                    if is_table_text:
+                        parsed = urlparse(full_url)
+                        path = parsed.path.lower()
+                        if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
+                            is_valid_table_link = True
+
+                    if is_data or is_valid_table_link:
                         if not is_article_figure_url(full_url):
                             links.add(full_url)
 
@@ -796,15 +836,7 @@ def main():
     parser.add_argument("--max-mmc", type=int, default=15, help="Max mmc number to scan in CDN brute-force")
     args = parser.parse_args()
 
-    if HAS_SCANSCI:
-        config = load_config()
-    else:
-        # Standalone mode: load configuration from environment variables
-        config = {
-            "elsevier_api_key": os.environ.get("ELSEVIER_API_KEY", ""),
-            "elsevier_insttoken": os.environ.get("ELSEVIER_INSTTOKEN", ""),
-            "is_campus_network": os.environ.get("IS_CAMPUS_NETWORK", "true").lower() in ("true", "1", "yes"),
-        }
+    config = load_config() if HAS_SCANSCI else {}
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
@@ -865,64 +897,8 @@ def main():
                         )
                 except Exception:
                     pass
-    elif not args.no_cookies:
-        # Standalone mode: load cookies from local cookies.json file
-        cookies_file = Path("cookies.json")
-        if cookies_file.exists():
-            try:
-                cdata = json.loads(cookies_file.read_text(encoding="utf-8"))
-                if isinstance(cdata, list):
-                    for c in cdata:
-                        session.cookies.set(
-                            c.get("name", ""), c.get("value", ""),
-                            domain=c.get("domain", ""), path=c.get("path", "/")
-                        )
-                elif isinstance(cdata, dict):
-                    for k, v in cdata.items():
-                        session.cookies.set(k, v)
-                print(f"  Loaded cookies from {cookies_file.name} into requests session.")
-            except Exception as e:
-                print(f"  Warning: Failed to load local cookies.json: {e}")
 
-    # Inject cookies for Playwright/browser
-    if HAS_SCANSCI and not args.no_cookies:
-        play_cookies = load_all_scansci_cookies(config)
-    elif not args.no_cookies:
-        cookies_file = Path("cookies.json")
-        play_cookies = []
-        if cookies_file.exists():
-            try:
-                cdata = json.loads(cookies_file.read_text(encoding="utf-8"))
-                if isinstance(cdata, list):
-                    for c in cdata:
-                        if "name" in c and "value" in c:
-                            domain = c.get("domain", "")
-                            if not domain:
-                                domain = ".sciencedirect.com"
-                            play_cookies.append({
-                                "name": c["name"],
-                                "value": c["value"],
-                                "domain": domain,
-                                "path": c.get("path", "/"),
-                                "secure": c.get("secure", False),
-                                "httpOnly": c.get("httpOnly", False),
-                            })
-                elif isinstance(cdata, dict):
-                    for k, v in cdata.items():
-                        play_cookies.append({
-                            "name": k,
-                            "value": v,
-                            "domain": ".sciencedirect.com",
-                            "path": "/",
-                            "secure": False,
-                            "httpOnly": False,
-                        })
-                if play_cookies:
-                    print(f"  Loaded {len(play_cookies)} cookies from {cookies_file.name} for browser fetcher.")
-            except Exception as e:
-                print(f"  Warning: Failed to load browser cookies: {e}")
-    else:
-        play_cookies = []
+    play_cookies = load_all_scansci_cookies(config) if HAS_SCANSCI and not args.no_cookies else []
 
     # Fetch the page
     html_content, status = fetch_page_html(url, session, play_cookies, args.headful)

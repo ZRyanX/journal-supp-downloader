@@ -84,6 +84,8 @@ def is_excluded_url(url):
 def is_data_url(url):
     """Check if a URL points to a data file (based on extension or MMC naming)."""
     url_lower = url.lower()
+    parsed = urlparse(url)
+    path = parsed.path.lower()
 
     # Elsevier MMC (MultiMedia Component) = supplementary data
     if MMC_PATTERN.search(url_lower):
@@ -91,9 +93,17 @@ def is_data_url(url):
 
     # Supplementary keywords in URL path
     if SUPP_FILE_PATTERN.search(url_lower):
+        if path.endswith(".pdf"):
+            return True
         for ext in DATA_EXTENSIONS:
             if ext in url_lower:
                 return True
+
+    # Check for table keyword + data extension (or PDF)
+    TABLE_FILE_PATTERN = re.compile(r"(?:table|tbl|附表)_?[a-z]?\.?\d+", re.IGNORECASE)
+    if TABLE_FILE_PATTERN.search(url_lower):
+        if path.endswith(".pdf") or any(ext in url_lower for ext in DATA_EXTENSIONS):
+            return True
 
     # Direct data file extensions
     for ext in DATA_EXTENSIONS:
@@ -185,6 +195,31 @@ def find_supplementary_links(page, base_url):
                         links.add(full_url)
         except Exception:
             pass
+
+    # Strategy 4: scan all <a> tags for "Table A1" etc. in anchor text
+    try:
+        table_text_pattern = re.compile(r"^\s*(?:Table|Tab\.|附表)\s*[a-zA-Z]?\.?\d+", re.IGNORECASE)
+        all_links = page.css("a")
+        for el in all_links:
+            href = el.attrib.get("href", "")
+            if href:
+                full_url = urljoin(base_url, href)
+                if not is_excluded_url(full_url):
+                    link_text = (el.get_all_text() or "").strip()
+                    is_table_text = bool(table_text_pattern.match(link_text))
+                    
+                    is_valid_table_link = False
+                    if is_table_text:
+                        parsed = urlparse(full_url)
+                        path = parsed.path.lower()
+                        if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
+                            is_valid_table_link = True
+                            
+                    if is_data_url(full_url) or is_valid_table_link:
+                        if not is_article_figure_url(full_url):
+                            links.add(full_url)
+    except Exception:
+        pass
 
     return sorted(links)
 
