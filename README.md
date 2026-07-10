@@ -47,7 +47,7 @@
 
 ---
 
-## 使用方法
+## 使用方法（看不懂可以用Claude code、codex、antigravity、opencode等本地AI软件学习该项目并引导配置）
 
 本工具提供两个主要运行入口：
 
