@@ -235,6 +235,16 @@ def _extract_pii(url):
     return None
 
 
+def is_html_file(filepath):
+    """Check if a downloaded file is actually an HTML page (error/Cloudflare/login)."""
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(200).strip().lower()
+        return b'<!doctype html' in header or b'<html' in header or b'<body' in header
+    except Exception:
+        return False
+
+
 def download_file(url, output_dir):
     """Download a single file using HTTP Fetcher (not browser-based). Returns path or None."""
     fname = os.path.basename(urlparse(url).path)
@@ -244,7 +254,7 @@ def download_file(url, output_dir):
     fname = sanitize_filename(fname)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath):
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
         print(f"  [SKIP] {fname} (already exists)")
         return filepath
 
@@ -264,7 +274,7 @@ def download_file(url, output_dir):
                 fname = cd_match.group(1).strip('"\'')
                 fname = sanitize_filename(fname)
                 filepath = os.path.join(output_dir, fname)
-                if os.path.exists(filepath):
+                if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
                     print(f"[SKIP] {fname} (already exists)")
                     return filepath
 
@@ -272,10 +282,16 @@ def download_file(url, output_dir):
             f.write(resp.body)
 
         size_kb = len(resp.body) / 1024
-        print(f"OK ({size_kb:.1f} KB)")
-        return filepath
+        if size_kb > 1.0 and not is_html_file(filepath):
+            print(f"OK ({size_kb:.1f} KB)")
+            return filepath
+        else:
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     except Exception as e:
+        if os.path.exists(filepath):
+            os.remove(filepath)
         print(f"FAIL: {e}")
         return None
 

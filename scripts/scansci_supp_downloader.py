@@ -17,6 +17,13 @@ import argparse
 import os
 import re
 import sys
+
+# Reconfigure stdout/stderr to UTF-8 to prevent encoding crashes on Windows cp936 console
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8')
+
 import json
 import time
 import subprocess
@@ -638,6 +645,15 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
 
 # ── Tier 1/2: Page Scrape + Link Download ────────────────────────────────────
 
+def is_html_file(filepath):
+    try:
+        with open(filepath, 'rb') as f:
+            header = f.read(200).strip().lower()
+        return b'<!doctype html' in header or b'<html' in header or b'<body' in header
+    except Exception:
+        return False
+
+
 def download_file(url, output_dir, session=None, cookies=None):
     """Download a single file, trying requests then Scrapling as fallback."""
     fname = os.path.basename(urlparse(url).path)
@@ -646,7 +662,7 @@ def download_file(url, output_dir, session=None, cookies=None):
     fname = sanitize_filename(fname)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+    if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
         print(f"  [SKIP] {fname} (already exists)")
         return filepath
 
@@ -663,7 +679,7 @@ def download_file(url, output_dir, session=None, cookies=None):
                     if cd_match:
                         fname = sanitize_filename(cd_match.group(1).strip('"\''))
                         filepath = os.path.join(output_dir, fname)
-                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
+                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
 
@@ -673,13 +689,15 @@ def download_file(url, output_dir, session=None, cookies=None):
                             f.write(chunk)
 
                 size_kb = os.path.getsize(filepath) / 1024
-                if size_kb > 1.0: # Check if it's a real file (not a tiny error page)
+                if size_kb > 1.0 and not is_html_file(filepath):
                     print(f"OK ({size_kb:.1f} KB)")
                     return filepath
                 else:
-                    os.remove(filepath)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
         except Exception:
-            pass
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     # Method 2: Scrapling Fetcher (basic HTTP client)
     if HAS_SCRAPLING:
@@ -692,10 +710,14 @@ def download_file(url, output_dir, session=None, cookies=None):
                 with open(filepath, "wb") as f:
                     f.write(resp.body)
                 size_kb = len(resp.body) / 1024
-                print(f"OK (via Scrapling, {size_kb:.1f} KB)")
-                return filepath
+                if not is_html_file(filepath):
+                    print(f"OK (via Scrapling, {size_kb:.1f} KB)")
+                    return filepath
+                else:
+                    os.remove(filepath)
         except Exception:
-            pass
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     # Method 3: Scrapling StealthySession + Playwright sync download fallback (for Cloudflare/Akamai WAF bypass)
     if HAS_SCRAPLING:
@@ -731,22 +753,25 @@ def download_file(url, output_dir, session=None, cookies=None):
             session_stealth.close()
             
             size_kb = os.path.getsize(filepath) / 1024
-            if size_kb > 1.0:
+            if size_kb > 1.0 and not is_html_file(filepath):
                 print(f"OK (via StealthySession, {size_kb:.1f} KB)")
                 return filepath
             else:
-                os.remove(filepath)
+                if os.path.exists(filepath):
+                    os.remove(filepath)
         except Exception:
             try:
                 session_stealth.close()
             except Exception:
                 pass
+            if os.path.exists(filepath):
+                os.remove(filepath)
 
     # Method 4: curl.exe (robust fallback for SSL/proxy negotiation issues on Windows)
     try:
         cmd = ["curl.exe", "-s", "-L", "-o", filepath, url]
         res = subprocess.run(cmd, timeout=120)
-        if res.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1000:
+        if res.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1000 and not is_html_file(filepath):
             size_kb = os.path.getsize(filepath) / 1024
             print(f"OK (via curl.exe, {size_kb:.1f} KB)")
             return filepath

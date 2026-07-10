@@ -1,0 +1,25 @@
+# macOS AppleDouble / resource fork files
+._*
+.DS_Store
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Downloads and outputs
+downloads/
+*.xlsx
+*.csv
+*.zip
+*.log
+
+# Cookies & sensitive user configs
+*cookies.txt
+.cnki_cookies.txt

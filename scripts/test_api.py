@@ -3,9 +3,7 @@
 import requests
 import json
 
-import os
-
-api_key = os.environ.get("ELSEVIER_API_KEY", "YOUR_ELSEVIER_API_KEY")
+api_key = "66e68474293c31b16c0e4f5f7e092bf0"
 doi = "10.1016/j.oregeorev.2026.107349"
 
 r = requests.get(
