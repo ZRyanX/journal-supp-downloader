@@ -34,10 +34,41 @@ from urllib.parse import urljoin, urlparse
 # Suppress SSL warnings for expired WebVPN certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Ensure scansci_pdf is in path
+# Ensure scripts directory and scansci_pdf are in path
+scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "scansci-pdf" / "src"))
 sys.path.append(str(Path(__file__).resolve().parents[2] / "scansci-pdf" / "src"))
 
 import requests
+
+# Import unified candidate recognition and file validation module
+from supp_finder import (
+    find_all_candidates,
+    validate_downloaded_file,
+    sanitize_filename,
+    extract_filename_from_url,
+    extract_filename_from_content_disposition,
+    infer_file_extension,
+    cookies_to_dict,
+    extract_effective_base_url,
+    detect_declared_supplement_count,
+    is_result_obviously_incomplete,
+    Candidate,
+    FindingDiagnostics,
+    DATA_EXTENSIONS,
+    MMC_PATTERN,
+    SUPP_KEYWORD_PATTERN,
+    TABLE_FILENAME_PATTERN,
+    TABLE_LABEL_PATTERN,
+    EXCLUDE_URL_PATTERNS,
+    ARTICLE_FIGURE_PATTERN,
+    is_excluded_url,
+    is_article_figure_url,
+    check_data_extension,
+)
 
 # Try importing scrapling
 try:
@@ -63,43 +94,57 @@ except ImportError as e:
     HAS_SCANSCI = False
     print(f"Warning: scansci_pdf not found. Running in standalone mode. Error: {e}")
 
-# Data file extensions (supplementary files)
-DATA_EXTENSIONS = {
-    ".xlsx", ".xls", ".csv", ".tsv", ".zip", ".gz", ".tar", ".7z", ".rar",
-    ".txt", ".json", ".xml", ".r", ".py", ".ipynb", ".m", ".nb",
-    ".cif", ".pdb", ".mol", ".sdf", ".xyz", ".fasta", ".fa", ".gb",
-    ".nii", ".nii.gz", ".dcm", ".h5", ".hdf5", ".mat", ".pkl", ".rda", ".sav",
-    ".docx", ".doc", ".pptx", ".ppt",
-}
 
-MMC_PATTERN = re.compile(r"mmc\d+", re.IGNORECASE)
-SUPP_FILE_PATTERN = re.compile(r"(suppl?e?m?e?n?t?a?r?y|supp?_?|si_?|appendix|esm)", re.IGNORECASE)
-EXCLUDE_URL_PATTERNS = [
-    r"scholar\.google\.com", r"scholar_lookup", r"plu\.mx", r"relx\.com",
-    r"elsevier\.com/(?!cdn)", r"#(m\d{4}|s\d{4}|!)", r"/journal/.*/vol/",
-    r"doi\.org/journal/", r"service\.elsevier\.com", r"linkedin\.com",
-    r"facebook\.com", r"twitter\.com", r"hub\.elsevier\.com", r"mendeley\.com",
-    r"crossmark", r"crossref\.org", r"orcid\.org", r"doi\.org/10\.\d+/",
-]
-ARTICLE_FIGURE_PATTERN = re.compile(r"-(?:gr|ga|fx)\d+[a-z]?_(?:lrg|sml)?", re.IGNORECASE)
+def load_saved_cookies_standalone():
+    """Load cookies in standalone mode from login wizard profile or local cookies.json."""
+    paths = [
+        os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json"),
+        os.path.abspath("cookies.json"),
+    ]
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    cdata = json.load(f)
+                    if isinstance(cdata, list) and cdata:
+                        return cdata
+                    elif isinstance(cdata, dict) and cdata:
+                        return [{"name": k, "value": v, "domain": "", "path": "/"} for k, v in cdata.items()]
+            except Exception:
+                pass
+    return []
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def resolve_doi_url(doi_or_url):
-    """Resolve a DOI or URL to its final destination, using curl.exe as a robust fallback for SSL issues."""
-    if doi_or_url.startswith("http"):
+    """
+    Resolve a DOI or DOI URL to its final destination publisher URL.
+    Handles '10.xxxx/...', 'https://doi.org/...', and 'http://dx.doi.org/...'.
+    Uses curl (cross-platform) as robust fallback for SSL/proxy issues.
+    """
+    doi_or_url = (doi_or_url or "").strip()
+    if not doi_or_url:
+        return ""
+
+    # If it's already a direct publisher URL (not a doi.org link), return directly
+    if doi_or_url.startswith("http") and "doi.org" not in doi_or_url:
         return doi_or_url
 
-    doi = doi_or_url.strip()
-    url = f"https://doi.org/{doi}"
+    if doi_or_url.startswith("http"):
+        url = doi_or_url
+        doi = doi_or_url.split("doi.org/")[-1].strip("/")
+    else:
+        doi = doi_or_url
+        url = f"https://doi.org/{doi}"
+
     print(f"Resolving DOI: {doi} via doi.org ...")
 
     # Method 1: Requests (HEAD)
     try:
         resp = requests.head(url, allow_redirects=True, timeout=15, verify=False,
                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-        if resp.url and resp.url.startswith("http"):
+        if resp.url and resp.url.startswith("http") and "doi.org" not in resp.url:
             print(f"  [requests] Resolved to: {resp.url}")
             return resp.url
     except Exception:
@@ -110,19 +155,21 @@ def resolve_doi_url(doi_or_url):
         resp = requests.get(url, allow_redirects=True, timeout=15, stream=True, verify=False,
                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
         resp.close()
-        if resp.url and resp.url.startswith("http"):
+        if resp.url and resp.url.startswith("http") and "doi.org" not in resp.url:
             print(f"  [requests] Resolved to: {resp.url}")
             return resp.url
     except Exception:
         pass
 
-    # Method 3: curl.exe (using subprocess, extremely robust for SSL issues on Windows)
+    # Method 3: curl (using subprocess, cross-platform)
     try:
-        cmd = ["curl.exe", "-w", "%{url_effective}", "-o", "NUL", "-s", "-L", url]
+        curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
+        null_dev = "NUL" if sys.platform.startswith("win") else "/dev/null"
+        cmd = [curl_cmd, "-w", "%{url_effective}", "-o", null_dev, "-s", "-L", url]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         out = res.stdout.strip()
-        if out.startswith("http"):
-            print(f"  [curl.exe] Resolved to: {out}")
+        if out.startswith("http") and "doi.org" not in out:
+            print(f"  [{curl_cmd}] Resolved to: {out}")
             return out
     except Exception:
         pass
@@ -132,14 +179,13 @@ def resolve_doi_url(doi_or_url):
         try:
             from scrapling import Fetcher
             r = Fetcher.get(url, stealthy_headers=True, timeout=15000)
-            if r.url and r.url.startswith("http"):
+            if r.url and r.url.startswith("http") and "doi.org" not in r.url:
                 print(f"  [scrapling] Resolved to: {r.url}")
                 return r.url
         except Exception:
             pass
 
     # Method 5: Publisher direct constructor heuristics (fallback if everything else fails)
-    # Springer / Nature:
     if "10.1007" in doi or "10.1038" in doi:
         fallback = f"https://link.springer.com/article/{doi}"
         print(f"  [fallback] Springer/Nature URL: {fallback}")
@@ -149,64 +195,24 @@ def resolve_doi_url(doi_or_url):
     return url
 
 
-def is_excluded_url(url):
-    for pattern in EXCLUDE_URL_PATTERNS:
-        if re.search(pattern, url, re.IGNORECASE):
-            return True
-    return False
-
-
 def is_data_url(url):
+    """Backward-compatible helper checking if URL points to supplementary/data file."""
     parsed = urlparse(url)
     path = parsed.path.lower()
-    
-    # 1. First check if the path ends with any data extension
-    for ext in DATA_EXTENSIONS:
-        if path.endswith(ext):
-            return True
-            
-    # Check for MDPI-style /s1, /s2 extensionless paths
-    if re.search(r'/s\d+$', path) or re.search(r'/s\d+/', path):
+    if check_data_extension(url):
         return True
-            
-    # 2. Check general URL string matching but be strict about extension boundaries
-    # to avoid false positives (e.g. matching .mc for .m)
+    if re.search(r'/s\d+/?$', path):
+        return True
     url_lower = url.lower()
     if MMC_PATTERN.search(url_lower):
         return True
-
-    # Check for supplementary keyword + data extension (or PDF)
-    if SUPP_FILE_PATTERN.search(url_lower):
-        if path.endswith(".pdf"):
+    if SUPP_KEYWORD_PATTERN.search(url_lower):
+        if path.endswith(".pdf") or check_data_extension(url):
             return True
-        for ext in DATA_EXTENSIONS:
-            pattern = re.escape(ext) + r'(?:[^a-z0-9]|$)'
-            if re.search(pattern, url_lower):
-                return True
-
-    # Check for table keyword + data extension (or PDF)
-    # e.g., table_a1.pdf, table-s1.pdf, table1.pdf, tbl_s2.pdf
-    TABLE_FILE_PATTERN = re.compile(r"(?:table|tbl|附表)_?[a-z]?\.?\d+", re.IGNORECASE)
-    if TABLE_FILE_PATTERN.search(url_lower):
-        if path.endswith(".pdf") or any(path.endswith(ext) for ext in DATA_EXTENSIONS):
+    if TABLE_FILENAME_PATTERN.search(url_lower):
+        if path.endswith(".pdf") or check_data_extension(url):
             return True
-
-    # General fallback for any data extension in URL (with strict boundary check)
-    for ext in DATA_EXTENSIONS:
-        pattern = re.escape(ext) + r'(?:[^a-z0-9]|$)'
-        if re.search(pattern, url_lower):
-            return True
-
     return False
-
-
-def is_article_figure_url(url):
-    return bool(ARTICLE_FIGURE_PATTERN.search(url))
-
-
-def sanitize_filename(name):
-    name = re.sub(r'[\\/*?:"<>|]', "_", name)
-    return name.strip(". ") or "download"
 
 
 def extract_article_title(html_content, default="unknown_article"):
@@ -245,70 +251,10 @@ def normalize_url(url):
     return url
 
 
-def find_supplementary_links(html_content, base_url):
-    """Scan HTML content for supplementary material links."""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html_content, 'html.parser')
-    links = set()
-
-    # Table pattern like: Table A1, Table S1, Table A.1, Tab A1, 附表1
-    table_text_pattern = re.compile(r"^\s*(?:Table|Tab\.|附表)\s*[a-zA-Z]?\.?\d+", re.IGNORECASE)
-
-    # 1. Look for hrefs matching mmc, suppl, etc. or having "Table A1" in anchor text
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        full_url = urljoin(base_url, href)
-        if is_excluded_url(full_url):
-            continue
-            
-        link_text = a.get_text().strip()
-        
-        # Check if the URL is a data URL (Excel, zip, etc. or table PDF)
-        is_data = is_data_url(full_url)
-        
-        # Or check if link text is "Table A1" etc.
-        is_table_text = bool(table_text_pattern.match(link_text))
-        
-        # If the text indicates a table, and the URL is a potential file download (not HTML page)
-        is_valid_table_link = False
-        if is_table_text:
-            parsed = urlparse(full_url)
-            path = parsed.path.lower()
-            if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
-                is_valid_table_link = True
-
-        if is_data or is_valid_table_link:
-            if not is_article_figure_url(full_url):
-                links.add(full_url)
-
-    # 2. Look for headings with supplementary keywords
-    for heading in soup.find_all(['h2', 'h3', 'h4', 'section', 'div']):
-        text = heading.get_text().lower()
-        if any(kw in text for kw in ["appendix", "supplementary", "supplement", "supporting information", "additional file"]):
-            parent = heading.parent
-            if parent:
-                for a in parent.find_all('a', href=True):
-                    href = a['href']
-                    full_url = urljoin(base_url, href)
-                    if is_excluded_url(full_url):
-                        continue
-                        
-                    link_text = a.get_text().strip()
-                    is_data = is_data_url(full_url)
-                    is_table_text = bool(table_text_pattern.match(link_text))
-                    
-                    is_valid_table_link = False
-                    if is_table_text:
-                        parsed = urlparse(full_url)
-                        path = parsed.path.lower()
-                        if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
-                            is_valid_table_link = True
-
-                    if is_data or is_valid_table_link:
-                        if not is_article_figure_url(full_url):
-                            links.add(full_url)
-
-    return sorted(links)
+def find_supplementary_links(html_content, base_url, original_url=None):
+    """Scan HTML content for supplementary material links (uses unified supp_finder)."""
+    diag = find_all_candidates(html_content, base_url, original_url=original_url or base_url)
+    return sorted({c.url for c in diag.candidates})
 
 
 # ── Cookie Loading ───────────────────────────────────────────────────────────
@@ -401,13 +347,6 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     On campus network, the Elsevier Article Retrieval API returns the full
     article XML/JSON. We parse it to extract the precise mmc file references
     (including correct extensions), then download directly from CDN.
-
-    This is faster than CDN brute-force because:
-    - No extension guessing (API tells us mmc1.xlsx, mmc4.docx, etc.)
-    - Single API call to discover ALL supplements
-    - CDN files are public, download is instant
-
-    Requires: campus network IP + elsevier_api_key in scansci-pdf config.
     """
     if not config.get("is_campus_network") and not config.get("elsevier_insttoken"):
         return []
@@ -428,7 +367,6 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     if insttoken:
         headers["X-ELS-InstToken"] = insttoken
 
-    # Resolve DOI to clean format
     doi_clean = doi
     if not doi_clean.startswith("10."):
         m = re.search(r"10\.\d{4,}/[^\s?&]+", doi)
@@ -459,7 +397,6 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     elapsed_api = time.time() - t0
     print(f"  API responded in {elapsed_api:.1f}s")
 
-    # Parse the response to find mmc references
     try:
         data = resp.json()
         article = data.get("full-text-retrieval-response", {})
@@ -467,11 +404,9 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         print("  [Tier A] Failed to parse API JSON response.")
         return []
 
-    # Extract PII from API response if not provided
     if not pii:
         core = article.get("coredata", {})
         raw_pii = core.get("pii", "")
-        # API returns formatted PII like 'S0169-1368(26)00248-9', convert to URL form
         pii = re.sub(r"[^A-Z0-9]", "", raw_pii, flags=re.IGNORECASE)
         if pii:
             print(f"  PII from API: {pii}")
@@ -480,25 +415,22 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         print("  [Tier A] Cannot determine PII, skipping CDN download.")
         return []
 
-    # Scan originalText for mmc file references with extensions
     original_text = article.get("originalText", "")
     if isinstance(original_text, dict):
         original_text = json.dumps(original_text)
     elif not isinstance(original_text, str):
         original_text = str(original_text)
-    # Pattern: mmc{N}.{ext} in the XML
+
     mmc_files = set()
-    # Look for e-component references like: 1-s2.0-{PII}-mmc{N}.{ext}
     pattern = re.compile(r"mmc(\d+)\.(\w+)", re.IGNORECASE)
+    valid_exts = {e.lstrip('.') for e in DATA_EXTENSIONS} | {"pdf"}
     for m in pattern.finditer(original_text):
         num = m.group(1)
         ext = m.group(2).lower()
-        if ext in {"xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx",
-                   "txt", "gz", "tar", "rar", "7z", "xml", "json"}:
+        if ext in valid_exts:
             mmc_files.add((int(num), ext))
 
     if not mmc_files:
-        # Fallback: just find mmc{N} references without extensions
         mmc_nums = set()
         for m in re.finditer(r"mmc(\d+)", original_text, re.IGNORECASE):
             mmc_nums.add(int(m.group(1)))
@@ -521,16 +453,17 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         url = f"{cdn_base}-{fname}"
         filepath = os.path.join(output_dir, fname)
 
-        if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-            print(f"  [SKIP] {fname} (already exists)")
-            found_files.append(filepath)
-            continue
+        if os.path.exists(filepath):
+            is_val, _ = validate_downloaded_file(filepath)
+            if is_val:
+                print(f"  [SKIP] {fname} (already exists)")
+                found_files.append(filepath)
+                continue
 
         print(f"  [API→CDN] {fname} ...", end=" ", flush=True)
         try:
             dl_resp = dl_session.get(url, timeout=60, stream=True)
             if dl_resp.status_code == 200:
-                # Check Content-Disposition for real filename
                 cd = dl_resp.headers.get("content-disposition", "")
                 if cd:
                     cd_match = re.search(r'filename[^;=\n]*=(["\']?)(.+?)\1(;|$)', cd)
@@ -543,12 +476,25 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     for chunk in dl_resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
-                actual_size = os.path.getsize(filepath)
-                print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                found_files.append(filepath)
+
+                is_val, reason = validate_downloaded_file(
+                    filepath,
+                    response_status=dl_resp.status_code,
+                    headers=dl_resp.headers
+                )
+                if is_val:
+                    actual_size = os.path.getsize(filepath)
+                    print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
+                    found_files.append(filepath)
+                else:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    print(f"FAIL ({reason})")
             else:
                 print(f"FAIL (HTTP {dl_resp.status_code})")
         except Exception as e:
+            if os.path.exists(filepath):
+                os.remove(filepath)
             print(f"FAIL ({e})")
 
     total_time = time.time() - t0
@@ -565,7 +511,8 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
     """
     Elsevier hosts supplement files on a public CDN at:
       https://ars.els-cdn.com/content/image/1-s2.0-{PII}-mmc{N}.{ext}
-    No authentication is required. This is the fastest method.
+    No authentication is required. Tracks probe diagnostics and does not
+    discard small files under 1 KB.
     """
     if not pii:
         return []
@@ -574,12 +521,15 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
     exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt"]
     found_files = []
     consecutive_misses = 0
+    scanned_count = 0
+    stop_reason = ""
 
-    print(f"\n[Tier 0] Scanning Elsevier CDN for PII={pii} ...")
+    print(f"\n[Tier 0] Scanning Elsevier CDN for PII={pii} (max={max_mmc}) ...")
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
     for i in range(1, max_mmc + 1):
+        scanned_count = i
         found_this_mmc = False
         for ext in exts:
             url = f"{base}-mmc{i}.{ext}"
@@ -587,23 +537,21 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
                 resp = session.head(url, timeout=10, allow_redirects=True)
                 if resp.status_code == 200:
                     size = int(resp.headers.get("content-length", 0))
-                    ct = resp.headers.get("content-type", "")
-                    if size < 100:
-                        continue  # likely an error page
                     fname = f"mmc{i}.{ext}"
                     filepath = os.path.join(output_dir, fname)
 
-                    if os.path.exists(filepath) and os.path.getsize(filepath) > 0:
-                        print(f"  [SKIP] {fname} (already exists)")
-                        found_files.append(filepath)
-                        found_this_mmc = True
-                        break
+                    if os.path.exists(filepath):
+                        is_val, _ = validate_downloaded_file(filepath)
+                        if is_val:
+                            print(f"  [SKIP] {fname} (already exists)")
+                            found_files.append(filepath)
+                            found_this_mmc = True
+                            break
 
                     # Download the file
                     print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
                     dl_resp = session.get(url, timeout=30, stream=True)
                     if dl_resp.status_code == 200:
-                        # Check Content-Disposition for real filename
                         cd = dl_resp.headers.get("content-disposition", "")
                         if cd:
                             cd_match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', cd)
@@ -617,11 +565,22 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
                             for chunk in dl_resp.iter_content(chunk_size=8192):
                                 if chunk:
                                     f.write(chunk)
-                        actual_size = os.path.getsize(filepath)
-                        print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                        found_files.append(filepath)
-                        found_this_mmc = True
-                        break
+
+                        is_val, reason = validate_downloaded_file(
+                            filepath,
+                            response_status=dl_resp.status_code,
+                            headers=dl_resp.headers
+                        )
+                        if is_val:
+                            actual_size = os.path.getsize(filepath)
+                            print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
+                            found_files.append(filepath)
+                            found_this_mmc = True
+                            break
+                        else:
+                            if os.path.exists(filepath):
+                                os.remove(filepath)
+                            print(f"FAIL ({reason})")
                     else:
                         print(f"FAIL (HTTP {dl_resp.status_code})")
             except requests.exceptions.Timeout:
@@ -634,8 +593,13 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
         else:
             consecutive_misses += 1
             if consecutive_misses >= 3:
-                break  # Likely no more supplement files
+                stop_reason = f"3 consecutive misses after mmc{i}"
+                break
 
+    if not stop_reason:
+        stop_reason = f"reached scan limit (max_mmc={max_mmc})"
+
+    print(f"  [Tier 0 Diagnostic] Probed mmc1..mmc{scanned_count} (limit: {max_mmc}). Hits: {len(found_files)}. Stopped: {stop_reason}.")
     if found_files:
         print(f"  [Tier 0] Found {len(found_files)} file(s) via CDN.")
     else:
@@ -646,25 +610,28 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
 # ── Tier 1/2: Page Scrape + Link Download ────────────────────────────────────
 
 def is_html_file(filepath):
-    try:
-        with open(filepath, 'rb') as f:
-            header = f.read(200).strip().lower()
-        return b'<!doctype html' in header or b'<html' in header or b'<body' in header
-    except Exception:
-        return False
+    is_valid, _ = validate_downloaded_file(filepath)
+    return not is_valid
 
 
-def download_file(url, output_dir, session=None, cookies=None):
+def download_file(cand_or_url, output_dir, session=None, cookies=None):
     """Download a single file, trying requests then Scrapling as fallback."""
-    fname = os.path.basename(urlparse(url).path)
-    if not fname or fname == "/":
-        fname = f"download_{hash(url) % 100000}.bin"
+    if isinstance(cand_or_url, Candidate):
+        url = cand_or_url.url
+        suggested_fname = cand_or_url.filename
+    else:
+        url = cand_or_url
+        suggested_fname = ""
+
+    fname = suggested_fname or extract_filename_from_url(url)
     fname = sanitize_filename(fname)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
-        print(f"  [SKIP] {fname} (already exists)")
-        return filepath
+    if os.path.exists(filepath):
+        is_val, _ = validate_downloaded_file(filepath)
+        if is_val:
+            print(f"  [SKIP] {fname} (already exists)")
+            return filepath
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
 
@@ -673,24 +640,42 @@ def download_file(url, output_dir, session=None, cookies=None):
         try:
             resp = session.get(url, timeout=30, stream=True, verify=False)
             if resp.status_code < 400:
-                cd = resp.headers.get("content-disposition", "")
-                if cd:
-                    cd_match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', cd)
-                    if cd_match:
-                        fname = sanitize_filename(cd_match.group(1).strip('"\''))
-                        filepath = os.path.join(output_dir, fname)
-                        if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
+                hdr = {k.lower(): v for k, v in resp.headers.items()}
+                cd = hdr.get("content-disposition", "")
+                cd_name = extract_filename_from_content_disposition(cd)
+                if cd_name:
+                    fname = cd_name
+                    filepath = os.path.join(output_dir, fname)
+                    if os.path.exists(filepath):
+                        is_val, _ = validate_downloaded_file(filepath)
+                        if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
 
+                first_chunk = b""
                 with open(filepath, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
+                            if not first_chunk:
+                                first_chunk = chunk
                             f.write(chunk)
 
-                size_kb = os.path.getsize(filepath) / 1024
-                if size_kb > 1.0 and not is_html_file(filepath):
-                    print(f"OK ({size_kb:.1f} KB)")
+                if "." not in fname:
+                    inferred = infer_file_extension(first_chunk, hdr.get("content-type", ""))
+                    if inferred:
+                        new_path = f"{filepath}{inferred}"
+                        os.rename(filepath, new_path)
+                        filepath = new_path
+                        fname = f"{fname}{inferred}"
+
+                is_val, reason = validate_downloaded_file(
+                    filepath,
+                    response_status=resp.status_code,
+                    headers=resp.headers
+                )
+                if is_val:
+                    size_kb = os.path.getsize(filepath) / 1024
+                    print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
                 else:
                     if os.path.exists(filepath):
@@ -704,22 +689,47 @@ def download_file(url, output_dir, session=None, cookies=None):
         try:
             sc_args = {}
             if cookies:
-                sc_args["cookies"] = cookies
+                sc_args["cookies"] = cookies_to_dict(cookies, url)
             resp = Fetcher.get(url, stealthy_headers=True, timeout=30000, **sc_args)
-            if resp.status < 400 and resp.body and len(resp.body) > 1000:
+            if resp.status < 400 and resp.body:
+                hdr = {k.lower(): v for k, v in (resp.headers or {}).items()}
+                cd = hdr.get("content-disposition", "")
+                cd_name = extract_filename_from_content_disposition(cd)
+                if cd_name:
+                    fname = cd_name
+                    filepath = os.path.join(output_dir, fname)
+                    if os.path.exists(filepath):
+                        is_val, _ = validate_downloaded_file(filepath)
+                        if is_val:
+                            print(f"[SKIP] {fname} (already exists)")
+                            return filepath
+
+                if "." not in fname:
+                    inferred = infer_file_extension(resp.body, hdr.get("content-type", ""))
+                    if inferred:
+                        fname = f"{fname}{inferred}"
+                        filepath = os.path.join(output_dir, fname)
+
                 with open(filepath, "wb") as f:
                     f.write(resp.body)
-                size_kb = len(resp.body) / 1024
-                if not is_html_file(filepath):
-                    print(f"OK (via Scrapling, {size_kb:.1f} KB)")
+                is_val, reason = validate_downloaded_file(
+                    filepath,
+                    content_bytes=resp.body,
+                    response_status=resp.status,
+                    headers=resp.headers
+                )
+                if is_val:
+                    size_kb = len(resp.body) / 1024
+                    print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
                 else:
-                    os.remove(filepath)
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
         except Exception:
             if os.path.exists(filepath):
                 os.remove(filepath)
 
-    # Method 3: Scrapling StealthySession + Playwright sync download fallback (for Cloudflare/Akamai WAF bypass)
+    # Method 3: Scrapling StealthySession + Playwright sync download fallback
     if HAS_SCRAPLING:
         try:
             from scrapling.fetchers import StealthySession
@@ -732,16 +742,14 @@ def download_file(url, output_dir, session=None, cookies=None):
             session_stealth.start()
             context = session_stealth.context
             page = context.new_page()
-            
-            # Establish cookies on base domain
+
             parsed = urlparse(url)
             base_url = f"{parsed.scheme}://{parsed.netloc}/"
             try:
                 page.goto(base_url, wait_until="commit")
             except Exception:
                 pass
-                
-            # Perform download expecting download event
+
             with page.expect_download(timeout=60000) as download_info:
                 try:
                     page.goto(url, wait_until="commit")
@@ -749,12 +757,16 @@ def download_file(url, output_dir, session=None, cookies=None):
                     if "Download is starting" not in str(e):
                         raise
             download = download_info.value
+            if hasattr(download, "suggested_filename") and download.suggested_filename:
+                real_name = sanitize_filename(download.suggested_filename)
+                filepath = os.path.join(output_dir, real_name)
             download.save_as(filepath)
             session_stealth.close()
-            
-            size_kb = os.path.getsize(filepath) / 1024
-            if size_kb > 1.0 and not is_html_file(filepath):
-                print(f"OK (via StealthySession, {size_kb:.1f} KB)")
+
+            is_val, reason = validate_downloaded_file(filepath)
+            if is_val:
+                size_kb = os.path.getsize(filepath) / 1024
+                print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 return filepath
             else:
                 if os.path.exists(filepath):
@@ -767,16 +779,19 @@ def download_file(url, output_dir, session=None, cookies=None):
             if os.path.exists(filepath):
                 os.remove(filepath)
 
-    # Method 4: curl.exe (robust fallback for SSL/proxy negotiation issues on Windows)
+    # Method 4: curl (cross-platform fallback)
     try:
-        cmd = ["curl.exe", "-s", "-L", "-o", filepath, url]
+        curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
+        cmd = [curl_cmd, "-s", "-L", "-o", filepath, url]
         res = subprocess.run(cmd, timeout=120)
-        if res.returncode == 0 and os.path.exists(filepath) and os.path.getsize(filepath) > 1000 and not is_html_file(filepath):
-            size_kb = os.path.getsize(filepath) / 1024
-            print(f"OK (via curl.exe, {size_kb:.1f} KB)")
-            return filepath
-        elif os.path.exists(filepath):
-            os.remove(filepath)
+        if res.returncode == 0 and os.path.exists(filepath):
+            is_val, reason = validate_downloaded_file(filepath)
+            if is_val:
+                size_kb = os.path.getsize(filepath) / 1024
+                print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
+                return filepath
+            elif os.path.exists(filepath):
+                os.remove(filepath)
     except Exception:
         pass
 
@@ -785,19 +800,23 @@ def download_file(url, output_dir, session=None, cookies=None):
 
 
 def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_browser=False):
-    """Fetch article page HTML, trying requests then Scrapling StealthyFetcher."""
+    """
+    Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
+    Returns (html_content, status, final_url) for accurate base URL resolution.
+    """
     html_content = ""
+    final_url = url
 
     # Method 1: requests session (fast, but often blocked by Cloudflare)
     if session and not force_browser:
         try:
             resp = session.get(url, timeout=30, verify=False)
             if resp.status_code < 400:
-                # Check if it's a real page (not Cloudflare challenge)
+                final_url = resp.url or url
                 text = resp.text
                 cf_signals = ["challenge-platform", "cf-browser-verification", "just a moment", "Checking your browser"]
                 if not any(sig.lower() in text.lower() for sig in cf_signals):
-                    return text, resp.status_code
+                    return text, resp.status_code, final_url
                 else:
                     print("    (Cloudflare detected, falling through to browser...)")
         except Exception:
@@ -818,11 +837,12 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
                 sc_args["cookies"] = play_cookies
             page = StealthyFetcher.fetch(url, **sc_args)
             html_content = str(page.html_content)
-            return html_content, page.status
+            final_url = getattr(page, "url", None) or url
+            return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
 
-    return html_content, 0
+    return html_content, 0, final_url
 
 
 def _finish_success(tier_name, files, article_dir, doi, url, args, config):
@@ -830,7 +850,6 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config):
     print(f"\n✓ {tier_name} Success: {len(files)} supplementary file(s) downloaded.")
     print(f"  Output: {os.path.abspath(article_dir)}")
 
-    # Try to get article title for better folder naming
     try:
         title = _quick_title_lookup(doi, url)
         if title and title != "supplements":
@@ -842,153 +861,8 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config):
     except Exception:
         pass
 
-    # Try scraping the page to find any additional supplements not on CDN
     print("\n  Checking for additional supplements via page scrape...")
     _try_page_scrape_supplements(url, article_dir, config, args, files)
-
-
-# ── Main Logic ───────────────────────────────────────────────────────────────
-
-def main():
-    parser = argparse.ArgumentParser(description="ScanSci Integrated Supplementary Downloader v3")
-    parser.add_argument("url_or_doi", help="DOI or landing page URL of the paper")
-    parser.add_argument("-o", "--output-dir", default="./journal_downloads", help="Output directory")
-    parser.add_argument("--no-vpn", action="store_true", help="Disable WebVPN proxying")
-    parser.add_argument("--no-cookies", action="store_true", help="Disable scansci-pdf cookies injection")
-    parser.add_argument("--no-api", action="store_true", help="Skip Elsevier API campus-IP tier")
-    parser.add_argument("--headful", action="store_true", help="Show browser window during scraping")
-    parser.add_argument("--skip-cdn", action="store_true", help="Skip CDN brute-force (Tier 0)")
-    parser.add_argument("--max-mmc", type=int, default=15, help="Max mmc number to scan in CDN brute-force")
-    args = parser.parse_args()
-
-    config = load_config() if HAS_SCANSCI else {}
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
-    doi = args.url_or_doi
-    url = resolve_doi_url(doi)
-    url = normalize_url(url)
-    print(f"  Normalized:  {url}")
-
-    # Extract PII for Elsevier CDN
-    pii = extract_pii_from_url(url)
-    if pii:
-        print(f"  Elsevier PII: {pii}")
-
-    # ── Step 2: Tier A — Elsevier API Campus-IP (fastest if on campus) ────
-    article_dir = os.path.join(args.output_dir, "supplements")
-    os.makedirs(article_dir, exist_ok=True)
-
-    api_files = []
-    if not args.no_api and "10.1016" in (doi if doi.startswith("10.") else url):
-        api_files = try_elsevier_api_campus(doi, pii, article_dir, config)
-
-    if api_files:
-        _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config)
-        return
-
-    # ── Step 3: Tier 0 — CDN Brute-Force (fast, no auth) ─────────────────
-    cdn_files = []
-    if pii and not args.skip_cdn:
-        cdn_files = try_elsevier_cdn_brute_force(pii, article_dir, args.max_mmc)
-
-    if cdn_files:
-        _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config)
-        return
-
-    # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
-    print(f"\n[Tier 1/2] Fetching article page for supplement links...")
-
-    # Setup requests session with all cookies
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    })
-    session.verify = False  # WebVPN SSL cert is expired
-
-    if HAS_SCANSCI and not args.no_cookies:
-        inject_cookies(session, config)
-        # Inject CARSI cookies
-        cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
-        carsi_dir = cache_dir / "carsi_cookies"
-        if carsi_dir.is_dir():
-            for cf in carsi_dir.glob("*.json"):
-                try:
-                    for c in json.loads(cf.read_text(encoding="utf-8")):
-                        session.cookies.set(
-                            c.get("name", ""), c.get("value", ""),
-                            domain=c.get("domain", ""), path=c.get("path", "/"),
-                        )
-                except Exception:
-                    pass
-
-    play_cookies = load_all_scansci_cookies(config) if HAS_SCANSCI and not args.no_cookies else []
-
-    # Fetch the page
-    html_content, status = fetch_page_html(url, session, play_cookies, args.headful)
-    if not html_content:
-        print("  ERROR: Failed to fetch article page.")
-        print("  Possible causes: Cloudflare block, network issue, or authentication required.")
-        return
-
-    print(f"  Status: {status}")
-
-    # Extract title
-    article_dirname = extract_article_title(html_content, default="downloaded_article")
-    article_dir = os.path.join(args.output_dir, article_dirname)
-    os.makedirs(article_dir, exist_ok=True)
-    print(f"  Title:  {article_dirname}")
-    print(f"  Folder: {article_dir}")
-
-    # Scan for links
-    print("\n  Scanning for supplementary data links...")
-    links = find_supplementary_links(html_content, url)
-    
-    # Fallback to browser rendering if requests succeeded but found no links
-    if not links and HAS_SCRAPLING and session:
-        print("  No links found in raw HTML. Falling back to browser rendering (JS execution)...")
-        html_content_browser, status_browser = fetch_page_html(url, session, play_cookies, args.headful, force_browser=True)
-        if html_content_browser:
-            links_browser = find_supplementary_links(html_content_browser, url)
-            if links_browser:
-                links = links_browser
-                html_content = html_content_browser
-                print(f"  Found {len(links)} link(s) after browser rendering.")
-                
-                # Re-extract title in case the JS updated it
-                article_dirname = extract_article_title(html_content, default=article_dirname)
-                new_article_dir = os.path.join(args.output_dir, article_dirname)
-                if new_article_dir != article_dir:
-                    os.makedirs(new_article_dir, exist_ok=True)
-                    try:
-                        os.rmdir(article_dir) # remove the old empty directory
-                    except Exception:
-                        pass
-                    article_dir = new_article_dir
-                    print(f"  Updated Title:  {article_dirname}")
-                    print(f"  Updated Folder: {article_dir}")
-
-    if not links:
-        print("  No supplementary links found in HTML.")
-        if pii:
-            print("  (CDN brute-force also found nothing — this paper may have no supplements.)")
-        return
-
-    print(f"  Found {len(links)} potential supplementary file(s):")
-    for link in links:
-        print(f"    • {os.path.basename(urlparse(link).path)}")
-        print(f"      {link}")
-
-    # Download files
-    print(f"\n  Downloading {len(links)} file(s)...")
-    success_count = 0
-    for link in links:
-        res = download_file(link, article_dir, session, play_cookies)
-        if res:
-            success_count += 1
-
-    print(f"\n✓ Done: {success_count}/{len(links)} files downloaded to {os.path.abspath(article_dir)}")
 
 
 def _quick_title_lookup(doi, url):
@@ -1021,7 +895,10 @@ def _quick_title_lookup(doi, url):
 
 
 def _try_page_scrape_supplements(url, article_dir, config, args, existing_files):
-    """After CDN success, optionally scrape the page for non-CDN supplement links."""
+    """
+    After CDN success, scrape the page for non-CDN supplement links.
+    Falls back to browser rendering if raw HTML is blocked or incomplete (Fixing Issue #4).
+    """
     try:
         session = requests.Session()
         session.headers.update({
@@ -1031,37 +908,239 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
 
         if HAS_SCANSCI and not args.no_cookies:
             inject_cookies(session, config)
+            play_cookies = load_all_scansci_cookies(config)
+        elif not args.no_cookies:
+            play_cookies = load_saved_cookies_standalone()
+            for c in play_cookies:
+                session.cookies.set(
+                    c.get("name", ""), c.get("value", ""),
+                    domain=c.get("domain", ""), path=c.get("path", "/"),
+                )
+        else:
+            play_cookies = []
 
-        play_cookies = load_all_scansci_cookies(config) if HAS_SCANSCI and not args.no_cookies else []
-        html_content, status = fetch_page_html(url, session, play_cookies, args.headful)
+        html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful)
+
+        url_to_use = final_url or url
+        effective_base = extract_effective_base_url(html_content, url_to_use)
+        diag = find_all_candidates(html_content, effective_base, original_url=url)
+
+        # Fallback to browser rendering if raw HTML yields no candidates or is incomplete
+        if (not diag.candidates or diag.is_incomplete) and HAS_SCRAPLING:
+            print("    Raw HTML incomplete or blocked. Retrying with browser rendering for page scrape...")
+            html_content_b, status_b, final_url_b = fetch_page_html(url, session, play_cookies, args.headful, force_browser=True)
+            if html_content_b:
+                html_content = html_content_b
+                url_to_use = final_url_b or url_to_use
+                effective_base = extract_effective_base_url(html_content, url_to_use)
+                diag = find_all_candidates(html_content, effective_base, original_url=url)
+
         if not html_content:
             print("    Could not fetch page for additional links.")
             return
 
-        links = find_supplementary_links(html_content, url)
         existing_basenames = {os.path.basename(f) for f in existing_files}
-
-        new_links = []
-        for link in links:
-            link_basename = os.path.basename(urlparse(link).path)
-            # Skip links that match already-downloaded CDN files
-            if link_basename in existing_basenames:
+        seen_cand_urls = set()
+        new_candidates = []
+        for cand in diag.candidates:
+            cand_fname = cand.filename or extract_filename_from_url(cand.url)
+            if cand_fname in existing_basenames:
                 continue
-            # Skip if the link is a CDN link we already tried
-            if "ars.els-cdn.com" in link:
+            if cand.url in seen_cand_urls:
                 continue
-            new_links.append(link)
+            seen_cand_urls.add(cand.url)
+            new_candidates.append(cand)
 
-        if new_links:
-            print(f"    Found {len(new_links)} additional non-CDN supplement link(s):")
-            for link in new_links:
-                print(f"      • {os.path.basename(urlparse(link).path)}: {link}")
-            for link in new_links:
-                download_file(link, article_dir, session, play_cookies)
+        if new_candidates:
+            print(f"    Found {len(new_candidates)} additional supplement link(s):")
+            for cand in new_candidates:
+                print(f"      • {cand.filename}: {cand.url} ({cand.match_rule})")
+            for cand in new_candidates:
+                download_file(cand, article_dir, session, play_cookies)
         else:
             print("    No additional supplements found beyond CDN files.")
     except Exception as e:
         print(f"    Page scrape error: {e}")
+
+
+# ── Main Logic ───────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="ScanSci Integrated Supplementary Downloader v3")
+    parser.add_argument("url_or_doi", help="DOI or landing page URL of the paper")
+    parser.add_argument("-o", "--output-dir", default="./journal_downloads", help="Output directory")
+    parser.add_argument("--no-vpn", action="store_true", help="Disable WebVPN proxying")
+    parser.add_argument("--no-cookies", action="store_true", help="Disable scansci-pdf cookies injection")
+    parser.add_argument("--no-api", action="store_true", help="Skip Elsevier API campus-IP tier")
+    parser.add_argument("--headful", action="store_true", help="Show browser window during scraping")
+    parser.add_argument("--skip-cdn", action="store_true", help="Skip CDN brute-force (Tier 0)")
+    parser.add_argument("--max-mmc", type=int, default=15, help="Max mmc number to scan in CDN brute-force")
+    parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
+    args = parser.parse_args()
+
+    config = load_config() if HAS_SCANSCI else {}
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
+    doi = args.url_or_doi
+    url = resolve_doi_url(doi)
+    url = normalize_url(url)
+    print(f"  Normalized:  {url}")
+
+    # Extract PII for Elsevier CDN
+    pii = extract_pii_from_url(url)
+    if pii:
+        print(f"  Elsevier PII: {pii}")
+
+    # ── Step 2: Tier A — Elsevier API Campus-IP (fastest if on campus) ────
+    article_dir = os.path.join(args.output_dir, "supplements")
+    os.makedirs(article_dir, exist_ok=True)
+
+    api_files = []
+    if not args.no_api and not args.list_only and "10.1016" in (doi if doi.startswith("10.") else url):
+        api_files = try_elsevier_api_campus(doi, pii, article_dir, config)
+
+    if api_files:
+        _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config)
+        return
+
+    # ── Step 3: Tier 0 — CDN Brute-Force (fast, no auth) ─────────────────
+    cdn_files = []
+    if pii and not args.skip_cdn and not args.list_only:
+        cdn_files = try_elsevier_cdn_brute_force(pii, article_dir, args.max_mmc)
+
+    if cdn_files:
+        _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config)
+        return
+
+    # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
+    print(f"\n[Tier 1/2] Fetching article page for supplement links...")
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    })
+    session.verify = False
+
+    if HAS_SCANSCI and not args.no_cookies:
+        inject_cookies(session, config)
+        cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
+        carsi_dir = cache_dir / "carsi_cookies"
+        if carsi_dir.is_dir():
+            for cf in carsi_dir.glob("*.json"):
+                try:
+                    for c in json.loads(cf.read_text(encoding="utf-8")):
+                        session.cookies.set(
+                            c.get("name", ""), c.get("value", ""),
+                            domain=c.get("domain", ""), path=c.get("path", "/"),
+                        )
+                except Exception:
+                    pass
+        play_cookies = load_all_scansci_cookies(config)
+    elif not args.no_cookies:
+        play_cookies = load_saved_cookies_standalone()
+        if play_cookies:
+            for c in play_cookies:
+                session.cookies.set(
+                    c.get("name", ""), c.get("value", ""),
+                    domain=c.get("domain", ""), path=c.get("path", "/"),
+                )
+    else:
+        play_cookies = []
+
+    # Fetch page with redirect resolution (Fixing Issue #1)
+    html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful)
+    if not html_content:
+        print("  ERROR: Failed to fetch article page.")
+        print("  Possible causes: Cloudflare block, network issue, or authentication required.")
+        return
+
+    url = final_url
+    effective_base = extract_effective_base_url(html_content, url)
+    print(f"  Status:    {status}")
+    if url != args.url_or_doi:
+        print(f"  Final URL: {url}")
+    if effective_base != url:
+        print(f"  Base URL:  {effective_base}")
+
+    article_dirname = extract_article_title(html_content, default="downloaded_article")
+    article_dir = os.path.join(args.output_dir, article_dirname)
+    os.makedirs(article_dir, exist_ok=True)
+    print(f"  Title:     {article_dirname}")
+    print(f"  Folder:    {article_dir}")
+
+    # Scan for candidates with unified rules and diagnostics
+    print("\n  Scanning for supplementary data links...")
+    diag = find_all_candidates(html_content, effective_base, original_url=args.url_or_doi)
+    candidates = diag.candidates
+
+    # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
+    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+    if (not candidates or is_inc) and HAS_SCRAPLING and session:
+        print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
+        html_content_browser, status_browser, final_url_browser = fetch_page_html(
+            url, session, play_cookies, args.headful, force_browser=True
+        )
+        if html_content_browser:
+            url = final_url_browser or url
+            effective_base_b = extract_effective_base_url(html_content_browser, url)
+            diag_b = find_all_candidates(html_content_browser, effective_base_b, original_url=args.url_or_doi)
+            seen_urls = {c.url for c in candidates}
+            new_candidates = [c for c in diag_b.candidates if c.url not in seen_urls]
+            if new_candidates:
+                candidates.extend(new_candidates)
+                html_content = html_content_browser
+                diag = diag_b
+                print(f"  Found {len(new_candidates)} additional candidate(s) after browser rendering (total: {len(candidates)}).")
+
+                article_dirname = extract_article_title(html_content, default=article_dirname)
+                new_article_dir = os.path.join(args.output_dir, article_dirname)
+                if new_article_dir != article_dir:
+                    os.makedirs(new_article_dir, exist_ok=True)
+                    try:
+                        os.rmdir(article_dir)
+                    except Exception:
+                        pass
+                    article_dir = new_article_dir
+                    print(f"  Updated Title:  {article_dirname}")
+                    print(f"  Updated Folder: {article_dir}")
+
+    if not candidates:
+        print("  No supplementary links found in HTML.")
+        if diag.incomplete_reason:
+            print(f"  [Diagnostic] {diag.incomplete_reason}")
+        if diag.excluded_links:
+            print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
+        if pii:
+            print("  (CDN brute-force also found nothing — this paper may have no supplements.)")
+        return
+
+    print(f"  Found {len(candidates)} potential supplementary file(s):")
+    for i, cand in enumerate(candidates, 1):
+        print(f"    [{i}] {cand.filename}")
+        print(f"        URL:     {cand.url}")
+        if cand.link_text:
+            print(f"        Text:    {cand.link_text}")
+        print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+
+    if diag.declared_count:
+        print(f"  [Info] Article declares {diag.declared_count} supplementary item(s).")
+    if diag.is_incomplete:
+        print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
+
+    if args.list_only:
+        return
+
+    # Download files
+    print(f"\n  Downloading {len(candidates)} file(s)...")
+    success_count = 0
+    for cand in candidates:
+        res = download_file(cand, article_dir, session, play_cookies)
+        if res:
+            success_count += 1
+
+    print(f"\n✓ Done: {success_count}/{len(candidates)} files downloaded to {os.path.abspath(article_dir)}")
 
 
 if __name__ == "__main__":

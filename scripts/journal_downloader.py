@@ -5,10 +5,11 @@ Uses Scrapling's StealthyFetcher to bypass Cloudflare and download
 attachments/supplementary data from journal websites (Elsevier, Springer, etc.)
 
 Usage:
-    python journal_downloader.py <article_url>
-    python journal_downloader.py <article_url> --output-dir ./downloads
-    python journal_downloader.py <article_url> --headful  # show browser
-    python journal_downloader.py <article_url> --proxy http://user:pass@host:port
+    python journal_downloader.py <article_url_or_doi>
+    python journal_downloader.py <article_url_or_doi> --output-dir ./downloads
+    python journal_downloader.py <article_url_or_doi> --headful  # show browser
+    python journal_downloader.py <article_url_or_doi> --proxy http://user:pass@host:port
+    python journal_downloader.py <article_url_or_doi> --list-only
 
 Dependencies:
     pip install "scrapling[all]"
@@ -16,278 +17,146 @@ Dependencies:
 """
 
 import argparse
-import mimetypes
+import json
 import os
 import re
 import sys
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
+# Ensure scripts directory is on sys.path
+scripts_dir = os.path.dirname(os.path.abspath(__file__))
+if scripts_dir not in sys.path:
+    sys.path.insert(0, scripts_dir)
+
 from scrapling.fetchers import Fetcher, StealthyFetcher
-
-
-# --- Data file extensions (NOT images - those are article figures, not supplementary data) ---
-DATA_EXTENSIONS = {
-    ".xlsx", ".xls", ".csv", ".tsv", ".zip", ".gz", ".tar", ".7z", ".rar",
-    ".txt", ".json", ".xml", ".r", ".py", ".ipynb", ".m", ".nb",
-    ".cif", ".pdb", ".mol", ".sdf", ".xyz", ".fasta", ".fa", ".gb",
-    ".nii", ".nii.gz", ".dcm", ".h5", ".hdf5", ".mat", ".pkl", ".rda", ".sav",
-    ".docx", ".doc", ".pptx", ".ppt",
-}
-
-# --- Elsevier-specific supplementary data patterns ---
-MMC_PATTERN = re.compile(r"mmc\d+", re.IGNORECASE)  # e.g. mmc1.xlsx, mmc2.docx
-SUPP_FILE_PATTERN = re.compile(
-    r"(suppl?e?m?e?n?t?a?r?y|supp?_?|si_?|appendix|esm)",
-    re.IGNORECASE,
-)
-
-# --- URL patterns to EXCLUDE (references, external sites, anchors, article figures) ---
-EXCLUDE_URL_PATTERNS = [
-    r"scholar\.google\.com",
-    r"scholar_lookup",
-    r"plu\.mx",
-    r"relx\.com",
-    r"elsevier\.com/(?!cdn)",
-    r"#(m\d{4}|s\d{4}|!)",  # in-page anchor links
-    r"/journal/.*/vol/",  # journal volume navigation
-    r"doi\.org/journal/",  # journal-level DOI
-    r"service\.elsevier\.com",
-    r"linkedin\.com",
-    r"facebook\.com",
-    r"twitter\.com",
-    r"/article/pii/\w+/pdfft\?md5=",  # reference PDF links (not supplementary)
-    r"/science/article/pii/\w+/pdf\?",  # reference PDF links
-    r"hub\.elsevier\.com",
-    r"mendeley\.com",
-    r"crossmark",
-    r"crossref\.org",
-    r"orcid\.org",
-    r"doi\.org/10\.\d+/",  # DOI links to other articles (references)
-]
-
-# --- Article figure file patterns (gr1, gr2, ga1, fx1, etc.) ---
-ARTICLE_FIGURE_PATTERN = re.compile(
-    r"-(?:gr|ga|fx)\d+[a-z]?_(?:lrg|sml)?" ,
-    re.IGNORECASE,
+from supp_finder import (
+    find_all_candidates,
+    validate_downloaded_file,
+    sanitize_filename,
+    extract_filename_from_url,
+    extract_filename_from_content_disposition,
+    infer_file_extension,
+    cookies_to_dict,
+    extract_effective_base_url,
+    Candidate,
+    FindingDiagnostics,
+    DATA_EXTENSIONS,
+    MMC_PATTERN,
+    is_excluded_url,
+    is_article_figure_url,
 )
 
 
-def is_excluded_url(url):
-    """Check if a URL should be excluded (references, external sites, anchors, etc.)."""
-    for pattern in EXCLUDE_URL_PATTERNS:
-        if re.search(pattern, url, re.IGNORECASE):
-            return True
-    return False
-
-
-def is_data_url(url):
-    """Check if a URL points to a data file (based on extension or MMC naming)."""
-    url_lower = url.lower()
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-
-    # Elsevier MMC (MultiMedia Component) = supplementary data
-    if MMC_PATTERN.search(url_lower):
-        return True
-
-    # Supplementary keywords in URL path
-    if SUPP_FILE_PATTERN.search(url_lower):
-        if path.endswith(".pdf"):
-            return True
-        for ext in DATA_EXTENSIONS:
-            if ext in url_lower:
-                return True
-
-    # Check for table keyword + data extension (or PDF)
-    TABLE_FILE_PATTERN = re.compile(r"(?:table|tbl|附表)_?[a-z]?\.?\d+", re.IGNORECASE)
-    if TABLE_FILE_PATTERN.search(url_lower):
-        if path.endswith(".pdf") or any(ext in url_lower for ext in DATA_EXTENSIONS):
-            return True
-
-    # Direct data file extensions
-    for ext in DATA_EXTENSIONS:
-        if ext in url_lower:
-            return True
-
-    return False
-
-
-def is_article_figure_url(url):
-    """Check if a URL is an article figure (not supplementary data)."""
-    return bool(ARTICLE_FIGURE_PATTERN.search(url))
-
-
-def find_supplementary_links(page, base_url):
-    """Find supplementary data links (not article figures, not references)."""
-    links = set()
-    current_pii = _extract_pii(base_url)
-
-    # Strategy 1: targeted selectors for supplementary materials
-    selectors = [
-        "a[href*='mmc']",
-        "a[href*='suppl']",
-        "a[href*='supp']",
-        "a[href*='esm']",
-        "a[href$='.xlsx']",
-        "a[href$='.xls']",
-        "a[href$='.csv']",
-        "a[href$='.zip']",
-        "a[href$='.docx']",
-        "a[href$='.doc']",
-        "#appendix a",
-        "#supplementary-material a",
-        "#supplementary-data a",
-        ".supplementary-data a",
-        ".supplementary-material a",
-        "[id*='supplementary'] a",
-        "[id*='appendix'] a",
-    ]
-
-    for selector in selectors:
+def load_saved_cookies():
+    """Load saved cookies from login_publishers.py profile if present."""
+    cookie_file = os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json")
+    if os.path.exists(cookie_file):
         try:
-            for el in page.css(selector):
-                href = el.attrib.get("href", "")
-                if href:
-                    full_url = urljoin(base_url, href)
-                    if not is_excluded_url(full_url) and is_data_url(full_url):
-                        if not is_article_figure_url(full_url):
-                            links.add(full_url)
+            with open(cookie_file, "r", encoding="utf-8") as f:
+                cookies = json.load(f)
+                if cookies and isinstance(cookies, list):
+                    return cookies
         except Exception:
             pass
-
-    # Strategy 2: scan all <a> tags near "Appendix"/"Supplementary" headings
-    try:
-        # Find containers near supplementary headings
-        for heading_sel in ["h2", "h3", "h4", "section", "div"]:
-            try:
-                headings = page.css(heading_sel)
-                for h in headings:
-                    text = (h.get_all_text() or "").lower()
-                    if any(kw in text for kw in [
-                        "appendix", "supplementary", "supplement",
-                        "supporting information", "additional file",
-                    ]):
-                        # Get all links in/near this heading's section
-                        parent = h.parent
-                        if parent:
-                            for a in parent.css("a"):
-                                href = a.attrib.get("href", "")
-                                if href:
-                                    full_url = urljoin(base_url, href)
-                                    if not is_excluded_url(full_url) and is_data_url(full_url):
-                                        if not is_article_figure_url(full_url):
-                                            links.add(full_url)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Strategy 3: direct MMC links from els-cdn
-    if current_pii:
-        try:
-            all_links = page.css("a")
-            for el in all_links:
-                href = el.attrib.get("href", "")
-                if href and f"mmc" in href.lower():
-                    full_url = urljoin(base_url, href)
-                    if not is_excluded_url(full_url):
-                        links.add(full_url)
-        except Exception:
-            pass
-
-    # Strategy 4: scan all <a> tags for "Table A1" etc. in anchor text
-    try:
-        table_text_pattern = re.compile(r"^\s*(?:Table|Tab\.|附表)\s*[a-zA-Z]?\.?\d+", re.IGNORECASE)
-        all_links = page.css("a")
-        for el in all_links:
-            href = el.attrib.get("href", "")
-            if href:
-                full_url = urljoin(base_url, href)
-                if not is_excluded_url(full_url):
-                    link_text = (el.get_all_text() or "").strip()
-                    is_table_text = bool(table_text_pattern.match(link_text))
-                    
-                    is_valid_table_link = False
-                    if is_table_text:
-                        parsed = urlparse(full_url)
-                        path = parsed.path.lower()
-                        if not any(path.endswith(html_ext) for html_ext in [".html", ".htm", ".php", ".asp", ".jsp"]):
-                            is_valid_table_link = True
-                            
-                    if is_data_url(full_url) or is_valid_table_link:
-                        if not is_article_figure_url(full_url):
-                            links.add(full_url)
-    except Exception:
-        pass
-
-    return sorted(links)
-
-
-def _extract_pii(url):
-    """Extract PII (Elsevier article ID) from URL."""
-    m = re.search(r"pii/([A-Z]?\d+)", url, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    m = re.search(r"/(\d{4,})[/-]", url)
-    if m:
-        return m.group(1)
     return None
 
 
+def find_supplementary_links(page_or_html, base_url, original_url=None):
+    """
+    Find supplementary data links (backward-compatible wrapper).
+    Returns a sorted list of unique candidate URLs.
+    """
+    if hasattr(page_or_html, "html_content"):
+        html = str(page_or_html.html_content)
+    else:
+        html = str(page_or_html)
+    diag = find_all_candidates(html, base_url, original_url=original_url or base_url)
+    return sorted({c.url for c in diag.candidates})
+
+
 def is_html_file(filepath):
-    """Check if a downloaded file is actually an HTML page (error/Cloudflare/login)."""
-    try:
-        with open(filepath, 'rb') as f:
-            header = f.read(200).strip().lower()
-        return b'<!doctype html' in header or b'<html' in header or b'<body' in header
-    except Exception:
-        return False
+    """Backward-compatible HTML check delegate."""
+    is_valid, _ = validate_downloaded_file(filepath)
+    return not is_valid
 
 
-def download_file(url, output_dir):
-    """Download a single file using HTTP Fetcher (not browser-based). Returns path or None."""
-    fname = os.path.basename(urlparse(url).path)
-    if not fname or fname == "/":
-        fname = f"download_{hash(url) % 100000}.bin"
+def download_file(cand_or_url, output_dir, cookies=None):
+    """
+    Download a single file using HTTP Fetcher (not browser-based).
+    Validates content signatures and HTTP headers, avoiding arbitrary 1 KB threshold.
+    Returns path or None.
+    """
+    if isinstance(cand_or_url, Candidate):
+        url = cand_or_url.url
+        suggested_fname = cand_or_url.filename
+    else:
+        url = cand_or_url
+        suggested_fname = ""
 
+    fname = suggested_fname or extract_filename_from_url(url)
     fname = sanitize_filename(fname)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
-        print(f"  [SKIP] {fname} (already exists)")
-        return filepath
+    # Check if already exists and is valid
+    if os.path.exists(filepath):
+        is_val, _ = validate_downloaded_file(filepath)
+        if is_val:
+            print(f"  [SKIP] {fname} (already exists)")
+            return filepath
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     try:
-        resp = Fetcher.get(url, stealthy_headers=True)
+        get_kwargs = {"stealthy_headers": True, "timeout": 30000}
+        if cookies:
+            get_kwargs["cookies"] = cookies_to_dict(cookies, url)
+
+        resp = Fetcher.get(url, **get_kwargs)
 
         if resp.status >= 400:
             print(f"HTTP {resp.status}")
             return None
 
         # Try to get filename from Content-Disposition
-        cd = resp.headers.get("content-disposition", "")
-        if cd:
-            cd_match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', cd)
-            if cd_match:
-                fname = cd_match.group(1).strip('"\'')
-                fname = sanitize_filename(fname)
-                filepath = os.path.join(output_dir, fname)
-                if os.path.exists(filepath) and os.path.getsize(filepath) > 0 and not is_html_file(filepath):
+        hdr = {k.lower(): v for k, v in (resp.headers or {}).items()}
+        cd = hdr.get("content-disposition", "")
+        cd_name = extract_filename_from_content_disposition(cd)
+        if cd_name:
+            fname = cd_name
+            filepath = os.path.join(output_dir, fname)
+            if os.path.exists(filepath):
+                is_val, _ = validate_downloaded_file(filepath)
+                if is_val:
                     print(f"[SKIP] {fname} (already exists)")
                     return filepath
+
+        # Infer extension if filename has none
+        if "." not in fname:
+            inferred_ext = infer_file_extension(resp.body, hdr.get("content-type", ""))
+            if inferred_ext:
+                fname = f"{fname}{inferred_ext}"
+                filepath = os.path.join(output_dir, fname)
 
         with open(filepath, "wb") as f:
             f.write(resp.body)
 
+        # Validate file based on signature and response headers (Fixing Issue #5)
+        is_valid, reason = validate_downloaded_file(
+            filepath,
+            content_bytes=resp.body,
+            response_status=resp.status,
+            headers=resp.headers,
+        )
+
         size_kb = len(resp.body) / 1024
-        if size_kb > 1.0 and not is_html_file(filepath):
-            print(f"OK ({size_kb:.1f} KB)")
+        if is_valid:
+            print(f"OK ({size_kb:.1f} KB - {reason})")
             return filepath
         else:
             if os.path.exists(filepath):
                 os.remove(filepath)
+            print(f"FAIL: {reason}")
+            return None
 
     except Exception as e:
         if os.path.exists(filepath):
@@ -296,20 +165,17 @@ def download_file(url, output_dir):
         return None
 
 
-def sanitize_filename(name):
-    """Remove or replace problematic filename characters."""
-    name = re.sub(r'[\\/*?:"<>|]', "_", name)
-    name = name.strip(". ")
-    return name or "download"
+def extract_article_title(page_or_html):
+    """Extract article title, sanitized for use as folder name."""
+    if hasattr(page_or_html, "css"):
+        title = page_or_html.css('title::text').get()
+    else:
+        m = re.search(r'<title[^>]*>(.*?)</title>', str(page_or_html), re.IGNORECASE | re.DOTALL)
+        title = m.group(1) if m else None
 
-
-def extract_article_title(page):
-    """Extract article title from the page, sanitized for use as folder name."""
-    title = page.css('title::text').get()
     if not title:
         return "unknown_article"
 
-    # Remove common journal suffixes
     for suffix in [
         " - ScienceDirect", " - SpringerLink", " - Springer",
         " | Nature", " | PNAS", " - Wiley Online Library",
@@ -318,11 +184,9 @@ def extract_article_title(page):
     ]:
         title = title.replace(suffix, "")
 
-    # Trim and sanitize
     title = title.strip()
     title = re.sub(r'[\\/*?:"<>|]', "_", title)
     title = re.sub(r'\s+', ' ', title)
-    # Truncate if too long (macOS max filename ~255 chars, keep it short)
     if len(title) > 120:
         title = title[:120]
     title = title.rstrip(". ")
@@ -330,15 +194,8 @@ def extract_article_title(page):
 
 
 def guess_filename_from_url(url):
-    """Try to derive a readable filename from the URL."""
-    path = urlparse(url).path
-    name = os.path.basename(path)
-    if name and name != "/":
-        return name
-    parts = [p for p in path.split("/") if p]
-    if parts:
-        return parts[-1] + ".bin"
-    return f"download_{abs(hash(url))}.bin"
+    """Derive a readable filename from URL (backward-compatible)."""
+    return extract_filename_from_url(url)
 
 
 def main():
@@ -353,7 +210,7 @@ def main():
   python journal_downloader.py https://example.com --proxy http://user:pass@host:8080
         """,
     )
-    parser.add_argument("url", help="URL of the journal article page")
+    parser.add_argument("url", help="URL or DOI of the journal article page")
     parser.add_argument(
         "-o", "--output-dir", default="./journal_downloads",
         help="Output directory (default: ./journal_downloads)"
@@ -388,12 +245,19 @@ def main():
     )
     parser.add_argument(
         "--list-only", action="store_true",
-        help="Only list found links, don't download"
+        help="Only list found links with diagnostic evidence, don't download"
     )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     solve_cf = not args.no_cloudflare and args.solve_cloudflare
+
+    # Normalize DOI input if needed
+    input_target = args.url.strip()
+    if input_target.startswith("10."):
+        fetch_url = f"https://doi.org/{input_target}"
+    else:
+        fetch_url = input_target
 
     print(f"Target: {args.url}")
     print(f"Output: {os.path.abspath(args.output_dir)}")
@@ -401,23 +265,36 @@ def main():
     print(f"Mode: {'Headful' if args.headful else 'Headless'}")
     if args.proxy:
         print(f"Proxy: {args.proxy}")
+
+    # Load saved cookies if available from login_publishers.py
+    cookies = load_saved_cookies()
+    if cookies:
+        print(f"Loaded {len(cookies)} saved cookies from login wizard profile.")
     print()
 
     # --- Step 1: Fetch the article page ---
     print("[1/3] Fetching article page (bypassing protections)...")
-    page = StealthyFetcher.fetch(
-        args.url,
-        headless=not args.headful,
-        solve_cloudflare=solve_cf,
-        block_webrtc=True,
-        hide_canvas=True,
-        real_chrome=args.real_chrome,
-        network_idle=True,
-        timeout=args.timeout,
-        proxy=args.proxy,
-        wait_selector=args.wait_selector,
-        google_search=False,
-    )
+    fetch_kwargs = {
+        "headless": not args.headful,
+        "solve_cloudflare": solve_cf,
+        "block_webrtc": True,
+        "hide_canvas": True,
+        "real_chrome": args.real_chrome,
+        "network_idle": True,
+        "timeout": args.timeout,
+        "proxy": args.proxy,
+        "wait_selector": args.wait_selector,
+        "google_search": False,
+    }
+    if cookies:
+        fetch_kwargs["cookies"] = cookies
+
+    page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
+
+    # Resolve effective base URL (Fixing Issue #1: DOI redirect resolution)
+    final_url = getattr(page, "url", None) or fetch_url
+    html_content = str(page.html_content)
+    effective_base = extract_effective_base_url(html_content, final_url)
 
     # Extract and sanitize article title for folder name
     raw_title = page.css('title::text').get() or "N/A"
@@ -425,37 +302,54 @@ def main():
     article_dir = os.path.join(args.output_dir, article_dirname)
     os.makedirs(article_dir, exist_ok=True)
 
-    print(f"  Status: {page.status}")
-    print(f"  Title:  {raw_title}")
-    print(f"  Folder: {article_dirname}/")
+    print(f"  Status:    {page.status}")
+    print(f"  Input URL: {args.url}")
+    if final_url != args.url:
+        print(f"  Final URL: {final_url}")
+    if effective_base != final_url:
+        print(f"  Base URL:  {effective_base}")
+    print(f"  Title:     {raw_title}")
+    print(f"  Folder:    {article_dirname}/")
 
     # --- Step 2: Find supplementary links ---
     print("\n[2/3] Scanning for supplementary data links...")
-    links = find_supplementary_links(page, args.url)
+    diag = find_all_candidates(html_content, effective_base, original_url=args.url)
+    candidates = diag.candidates
 
-    if not links:
+    if not candidates:
         print("  No supplementary data links found.")
+        if diag.is_incomplete:
+            print(f"  [Diagnostic] {diag.incomplete_reason}")
+        if diag.excluded_links:
+            print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
         print("  Try running with --headful and --no-cloudflare to debug.")
         return
 
-    print(f"  Found {len(links)} potential supplementary file(s):")
-    for url in links:
-        fname = guess_filename_from_url(url)
-        print(f"    - {fname}")
-        print(f"      {url}")
+    print(f"  Found {len(candidates)} potential supplementary file(s):")
+    for i, cand in enumerate(candidates, 1):
+        print(f"    [{i}] {cand.filename}")
+        print(f"        URL:     {cand.url}")
+        if cand.link_text:
+            print(f"        Text:    {cand.link_text}")
+        print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+
+    if diag.declared_count:
+        print(f"  [Info] Article declares {diag.declared_count} supplementary item(s).")
+    if diag.is_incomplete:
+        print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
 
     if args.list_only:
         return
 
     # --- Step 3: Download files ---
-    print(f"\n[3/3] Downloading {len(links)} file(s)...")
+    print(f"\n[3/3] Downloading {len(candidates)} file(s)...")
     success = 0
-    for url in links:
-        result = download_file(url, article_dir)
+    for cand in candidates:
+        result = download_file(cand, article_dir, cookies=cookies)
         if result:
             success += 1
 
-    print(f"\nDone: {success}/{len(links)} files downloaded to {os.path.abspath(article_dir)}")
+    print(f"\nDone: {success}/{len(candidates)} files downloaded to {os.path.abspath(article_dir)}")
 
 
 if __name__ == "__main__":

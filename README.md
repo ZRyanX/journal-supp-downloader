@@ -166,12 +166,17 @@ python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349" --he
 ```
 journal-supp-downloader/
 ├── README.md                  # 说明文档
+├── SKILL.md                   # 技能规范与详细说明
 ├── requirements.txt           # 依赖清单
 ├── scripts/
-│   ├── journal_downloader.py  # 基础页面分析下载器
-│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/Cookie)
+│   ├── supp_finder.py         # 统一补充附件与表格候选识别、证据链与文件验证模块
+│   ├── journal_downloader.py  # 基础页面分析与轻量下载器 (Scrapling)
+│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/Cookie 多级加速)
+│   ├── login_publishers.py    # 出版社登录与 Cookie 配置向导
 │   ├── test_api.py            # API 认证连通性测试脚本
 │   └── test_fetch.py          # 校园网直连与附件解析测试脚本
+├── tests/
+│   └── test_supp_finder.py    # 自动化单元与回归测试集 (28 tests)
 └── scansci-pdf/               # 内置的核心 PDF 下载与配置引擎
 ```
 
