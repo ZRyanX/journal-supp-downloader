@@ -45,6 +45,9 @@ from supp_finder import (
     MMC_PATTERN,
     is_excluded_url,
     is_article_figure_url,
+    load_download_manifest,
+    save_download_manifest,
+    disambiguate_target_filename,
 )
 
 
@@ -94,12 +97,14 @@ def download_file(cand_or_url, output_dir, cookies=None):
         url = cand_or_url
         suggested_fname = ""
 
+    manifest = load_download_manifest(output_dir)
     fname = suggested_fname or extract_filename_from_url(url)
     fname = sanitize_filename(fname)
+    fname = disambiguate_target_filename(output_dir, fname, url, manifest)
     filepath = os.path.join(output_dir, fname)
 
-    # Check if already exists and is valid
-    if os.path.exists(filepath):
+    # Check if already exists and is valid for this exact URL
+    if os.path.exists(filepath) and manifest.get(fname) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
@@ -122,9 +127,10 @@ def download_file(cand_or_url, output_dir, cookies=None):
         cd = hdr.get("content-disposition", "")
         cd_name = extract_filename_from_content_disposition(cd)
         if cd_name:
-            fname = cd_name
+            target_fname = sanitize_filename(cd_name)
+            fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
-            if os.path.exists(filepath):
+            if os.path.exists(filepath) and manifest.get(fname) == url:
                 is_val, _ = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"[SKIP] {fname} (already exists)")
@@ -135,13 +141,13 @@ def download_file(cand_or_url, output_dir, cookies=None):
             inferred_ext = infer_file_extension(resp.body, hdr.get("content-type", ""))
             if inferred_ext:
                 base = fname[:-4] if fname.endswith(".bin") else fname
-                fname = f"{base}{inferred_ext}"
+                fname = disambiguate_target_filename(output_dir, f"{base}{inferred_ext}", url, manifest)
                 filepath = os.path.join(output_dir, fname)
 
         with open(filepath, "wb") as f:
             f.write(resp.body)
 
-        # Validate file based on signature and response headers (Fixing Issue #5)
+        # Validate file based on signature and response headers (Fixing Issue #5, D1)
         is_valid, reason = validate_downloaded_file(
             filepath,
             content_bytes=resp.body,
@@ -151,6 +157,16 @@ def download_file(cand_or_url, output_dir, cookies=None):
 
         size_kb = len(resp.body) / 1024
         if is_valid:
+            if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
+                base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
+                html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
+                new_path = os.path.join(output_dir, html_name)
+                if filepath != new_path:
+                    os.rename(filepath, new_path)
+                    filepath = new_path
+                    fname = html_name
+            manifest[fname] = url
+            save_download_manifest(output_dir, manifest)
             print(f"OK ({size_kb:.1f} KB - {reason})")
             return filepath
         else:
@@ -316,6 +332,30 @@ def main():
     print("\n[2/3] Scanning for supplementary data links...")
     diag = find_all_candidates(html_content, effective_base, original_url=args.url)
     candidates = diag.candidates
+
+    if diag.is_incomplete and not args.wait_selector:
+        print(f"  [Diagnostic] {diag.incomplete_reason}")
+        print("  Attempting browser retry with supplementary container wait...")
+        retry_kwargs = dict(fetch_kwargs)
+        retry_kwargs["wait_selector"] = "#supplementary-material, .supplementary-material, #extended-data, [data-section='supp-table'], [id*='suppl']"
+        retry_kwargs["timeout"] = min(args.timeout, 30000)
+        try:
+            retry_page = StealthyFetcher.fetch(fetch_url, **retry_kwargs)
+            retry_html = str(retry_page.html_content)
+            retry_diag = find_all_candidates(retry_html, effective_base, original_url=args.url)
+            if retry_diag.candidates:
+                existing_urls = {c.url for c in candidates}
+                new_cands = [c for c in retry_diag.candidates if c.url not in existing_urls]
+                if new_cands or not candidates:
+                    print(f"  [Recovery] Found {len(new_cands) if candidates else len(retry_diag.candidates)} additional candidate(s) after browser retry!")
+                    for c in new_cands:
+                        candidates.append(c)
+                    if not candidates:
+                        candidates = retry_diag.candidates
+                    diag = retry_diag
+                    diag.candidates = candidates
+        except Exception:
+            pass
 
     if not candidates:
         print("  No supplementary data links found.")

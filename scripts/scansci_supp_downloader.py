@@ -68,6 +68,12 @@ from supp_finder import (
     is_excluded_url,
     is_article_figure_url,
     check_data_extension,
+    is_explicit_supp_table,
+    is_table_text_or_attribute,
+    should_match_candidate,
+    load_download_manifest,
+    save_download_manifest,
+    disambiguate_target_filename,
 )
 
 # Try importing scrapling
@@ -195,24 +201,12 @@ def resolve_doi_url(doi_or_url):
     return url
 
 
-def is_data_url(url):
-    """Backward-compatible helper checking if URL points to supplementary/data file."""
-    parsed = urlparse(url)
-    path = parsed.path.lower()
-    if check_data_extension(url):
-        return True
-    if re.search(r'/s\d+/?$', path):
-        return True
-    url_lower = url.lower()
-    if MMC_PATTERN.search(url_lower):
-        return True
-    if SUPP_KEYWORD_PATTERN.search(url_lower):
-        if path.endswith(".pdf") or check_data_extension(url):
-            return True
-    if TABLE_FILENAME_PATTERN.search(url_lower):
-        if path.endswith(".pdf") or check_data_extension(url):
-            return True
-    return False
+def is_data_url(url, text=""):
+    """Check if URL or (URL + text) points to supplementary/data file via unified matcher (F1)."""
+    if not url:
+        return False
+    matched, _ = should_match_candidate(url, text=text)
+    return matched
 
 
 def extract_article_title(html_content, default="unknown_article"):
@@ -660,11 +654,13 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
         url = cand_or_url
         suggested_fname = ""
 
+    manifest = load_download_manifest(output_dir)
     fname = suggested_fname or extract_filename_from_url(url)
     fname = sanitize_filename(fname)
+    fname = disambiguate_target_filename(output_dir, fname, url, manifest)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath):
+    if os.path.exists(filepath) and manifest.get(fname) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
@@ -681,9 +677,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                 cd = hdr.get("content-disposition", "")
                 cd_name = extract_filename_from_content_disposition(cd)
                 if cd_name:
-                    fname = cd_name
+                    target_fname = sanitize_filename(cd_name)
+                    fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath):
+                    if os.path.exists(filepath) and manifest.get(fname) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -701,10 +698,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                     inferred = infer_file_extension(first_chunk, hdr.get("content-type", ""))
                     if inferred:
                         base = fname[:-4] if fname.endswith(".bin") else fname
-                        new_path = os.path.join(output_dir, f"{base}{inferred}")
+                        fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
+                        new_path = os.path.join(output_dir, fname)
                         os.rename(filepath, new_path)
                         filepath = new_path
-                        fname = f"{base}{inferred}"
 
                 is_val, reason = validate_downloaded_file(
                     filepath,
@@ -712,6 +709,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                     headers=resp.headers
                 )
                 if is_val:
+                    if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
+                        base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
+                        html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
+                        new_path = os.path.join(output_dir, html_name)
+                        if filepath != new_path:
+                            os.rename(filepath, new_path)
+                            filepath = new_path
+                            fname = html_name
+                    manifest[fname] = url
+                    save_download_manifest(output_dir, manifest)
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
@@ -734,9 +741,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                 cd = hdr.get("content-disposition", "")
                 cd_name = extract_filename_from_content_disposition(cd)
                 if cd_name:
-                    fname = cd_name
+                    target_fname = sanitize_filename(cd_name)
+                    fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath):
+                    if os.path.exists(filepath) and manifest.get(fname) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -746,7 +754,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                     inferred = infer_file_extension(resp.body, hdr.get("content-type", ""))
                     if inferred:
                         base = fname[:-4] if fname.endswith(".bin") else fname
-                        fname = f"{base}{inferred}"
+                        fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
                         filepath = os.path.join(output_dir, fname)
 
                 with open(filepath, "wb") as f:
@@ -758,6 +766,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                     headers=resp.headers
                 )
                 if is_val:
+                    if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
+                        base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
+                        html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
+                        new_path = os.path.join(output_dir, html_name)
+                        if filepath != new_path:
+                            os.rename(filepath, new_path)
+                            filepath = new_path
+                            fname = html_name
+                    manifest[fname] = url
+                    save_download_manifest(output_dir, manifest)
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath

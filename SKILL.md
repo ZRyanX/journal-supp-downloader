@@ -80,12 +80,14 @@ python scripts/journal_downloader.py "<url>" --wait-selector "#article-body"
   - **scansci-pdf 已存 Cookie**：自动读取 scansci-pdf 已保存的出版商 Cookies、CARSI 凭据与 WebVPN 会话，亦可读取登录向导保存的会话（注：仅读取已保存凭据文件，下载时不克隆正在运行的浏览器配置）。
   - **校园 WebVPN / CARSI**：支持 WebVPN 自动转链与 CARSI SSO 会话凭证注入。
   - **登录向导 Cookies**：自动读取 `scripts/login_publishers.py` 保存的会话。
+  - **动态渲染兜底**：当检测到页面声明的补充文件缺漏或补充容器存在但未提取到候选时，自动触发浏览器多级回退渲染与重试。
 
 ### 2. 轻量版下载器 (`scripts/journal_downloader.py`)
 - **定位**：独立的 Scrapling 极简下载器，无需安装配置复杂的 scansci-pdf 机构网络组件。
-- **支持认证**：
+- **支持认证与动态特性**：
   - **Cloudflare 隐身绕过**：内置 Turnstile/WAF 人机验证绕过。
   - **登录向导 Cookies**：运行 `python scripts/login_publishers.py` 完成出版社登录后，轻量版在页面抓取和文件下载中均会自动注入已保存的 Cookies。
+  - **动态 SPA 占位重试**：当静态抓取发现补充容器未注水（incomplete）时，自动触发补充容器选择器等待并重试；亦可通过 `--wait-selector` 手动指定。
   - *(注：轻量版不读取 scansci-pdf 目录中的 WebVPN/CARSI 凭据，仅支持手动登录向导保存的 Cookies)*。
 
 ### 手动登录向导

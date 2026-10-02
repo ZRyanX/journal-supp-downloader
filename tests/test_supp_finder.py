@@ -18,6 +18,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch, MagicMock
 
 # Ensure scripts directory is on sys.path
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +38,7 @@ from supp_finder import (
     is_result_obviously_incomplete,
     is_excluded_url,
     is_article_figure_url,
+    is_explicit_supp_table,
     TABLE_LABEL_PATTERN,
     TABLE_FILENAME_PATTERN,
 )
@@ -823,6 +825,406 @@ class TestSuppFinder(unittest.TestCase):
                 for unpolled_num in range(10, 30):
                     self.assertFalse(any(f"mmc{unpolled_num}." in u for u in polled_urls),
                                      f"mmc{unpolled_num} was unnecessarily polled!")
+
+    # ── 12. Regression Tests for Boost Detection Fixes (A1-A4, B1-B3, C1-C2, D1-D2, E1-E2, F1-F5) ──
+
+    def test_a1_appendix_and_fulu_table_labels_and_candidates(self):
+        """A1: Standalone Appendix 1, Appendix A, 附录 1, 附录1 recognized without 'Table'."""
+        self.assertTrue(is_explicit_supp_table("Appendix 1"))
+        self.assertTrue(is_explicit_supp_table("Appendix A"))
+        self.assertTrue(is_explicit_supp_table("Appendix 1: Full dataset"))
+        self.assertTrue(is_explicit_supp_table("附录 1"))
+        self.assertTrue(is_explicit_supp_table("附录1"))
+        self.assertTrue(is_explicit_supp_table("附录A"))
+
+        html = """
+        <div>
+            <a href="/dl?id=101">附录 1</a>
+            <a href="/dl?id=102">Appendix 1: Full dataset</a>
+            <a href="/files/appendix_a.xlsx">Appendix A</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/dl?id=101", urls)
+        self.assertIn("https://example.com/dl?id=102", urls)
+        self.assertIn("https://example.com/files/appendix_a.xlsx", urls)
+
+    def test_a2_etable_labels_and_filenames(self):
+        """A2: eTable 1 / eTable1 / eTable1.pdf recognized."""
+        self.assertTrue(is_explicit_supp_table("eTable 1"))
+        self.assertTrue(is_explicit_supp_table("eTable1"))
+        self.assertTrue(is_explicit_supp_table("e-Table 1"))
+
+        self.assertIsNotNone(TABLE_FILENAME_PATTERN.search("eTable1.pdf"))
+        self.assertIsNotNone(TABLE_FILENAME_PATTERN.search("table-s1.pdf"))
+
+        html = """
+        <div>
+            <a href="/files/eTable1.pdf">Download</a>
+            <a href="/dl?id=201">eTable 1</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/files/eTable1.pdf", urls)
+        self.assertIn("https://example.com/dl?id=201", urls)
+
+    def test_a3_supplementary_data_and_dataset(self):
+        """A3: Supplementary Data S1, Data S1, Dataset S1 recognized as candidates."""
+        self.assertTrue(is_explicit_supp_table("Supplementary Data S1"))
+        self.assertTrue(is_explicit_supp_table("Data S1"))
+        self.assertTrue(is_explicit_supp_table("Dataset S1"))
+        self.assertTrue(is_explicit_supp_table("Supplementary Dataset 1"))
+        self.assertTrue(is_explicit_supp_table("Additional file 1"))
+
+        html = """
+        <div>
+            <a href="/dl?id=1">Supplementary Data S1</a>
+            <a href="/dl?id=2">Data S1</a>
+            <a href="/dl?id=3">Dataset S1</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        self.assertEqual(len(diag.candidates), 3)
+
+    def test_a4_table_letter_and_endpoint_boundary(self):
+        """A4: Table A1 admitted only with supp/appendix context; /att/ endpoint recognized."""
+        html = """
+        <div>
+            <!-- Table A1 with pure path endpoint /att/1 but in page body without appendix -> NOT admitted -->
+            <a href="/att/1">Table A1</a>
+            <!-- Table A1 inside container or with appendix path -> admitted -->
+            <a href="/content/appendix/tables/a1">Table A1</a>
+            <!-- Explicit supp table with pure path endpoint /att/2 -> admitted -->
+            <a href="/att/2">附表 1</a>
+            <!-- Standard article table Table 1 with query -> NOT admitted -->
+            <a href="/dl?id=99">Table 1</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/content/appendix/tables/a1", urls)
+        self.assertIn("https://example.com/att/2", urls)
+        self.assertNotIn("https://example.com/att/1", urls)
+        self.assertNotIn("https://example.com/dl?id=99", urls)
+
+    def test_b1_onclick_diverse_syntax(self):
+        """B1: onclick with location.href, window.location, dl, downloadFile recognized."""
+        html = """
+        <div>
+            <button onclick="location.href='/dl?id=10'">附表 1</button>
+            <button onclick="window.location='/dl?id=11'">附表 2</button>
+            <span onclick="dl('/dl?id=12')">Supplementary Table S3</span>
+            <div onclick="downloadFile('/dl?id=13')">Extended Data Table 4</div>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/dl?id=10", urls)
+        self.assertIn("https://example.com/dl?id=11", urls)
+        self.assertIn("https://example.com/dl?id=12", urls)
+        self.assertIn("https://example.com/dl?id=13", urls)
+
+    def test_b2_input_and_table_cell_controls(self):
+        """B2: <input value="附表 1">, <td onclick="...">, iframe, embed controls scanned."""
+        html = """
+        <div id="supplementary">
+            <input type="button" data-url="/dl/t1.xlsx" value="附表 1">
+            <table>
+                <tr>
+                    <td onclick="window.open('/dl/t2.xlsx')">附表 2</td>
+                </tr>
+            </table>
+            <iframe src="/supp/embed_table.html" title="Supplementary Table S3"></iframe>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/dl/t1.xlsx", urls)
+        self.assertIn("https://example.com/dl/t2.xlsx", urls)
+        self.assertIn("https://example.com/supp/embed_table.html", urls)
+
+    def test_b3_embedded_json_relative_urls(self):
+        """B3: Embedded JSON with relative paths, unicode and escaped slashes extracted."""
+        html = """
+        <script type="application/json">
+        {
+            "supp": [
+                "/files/附表1.xlsx",
+                "\\/files\\/Supplementary_Table_S2.xlsx"
+            ]
+        }
+        </script>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/files/附表1.xlsx", urls)
+        self.assertIn("https://example.com/files/Supplementary_Table_S2.xlsx", urls)
+
+    def test_c1_exclude_url_patterns_immunity_for_data_files(self):
+        """C1: elsevier.com and doi.org download endpoints with data files / MMC are not excluded."""
+        url_els_api = "https://api.elsevier.com/content/object/eid/1-s2.0-S123-mmc2.xlsx"
+        url_els_aem = "https://www.elsevier.com/__data/assets/excel/0001/table-s1.xlsx"
+        url_doi_file = "https://doi.org/10.1016/j.test.2023/table-s1.xlsx"
+        url_doi_ref = "https://doi.org/10.1016/j.ref.2020.01"
+
+        self.assertFalse(is_excluded_url(url_els_api))
+        self.assertFalse(is_excluded_url(url_els_aem))
+        self.assertFalse(is_excluded_url(url_doi_file))
+        self.assertTrue(is_excluded_url(url_doi_ref))
+
+    def test_c2_figure_pattern_boundaries_and_data_immunity(self):
+        """C2: /img/gr1_lrg.jpg excluded, but data file table-gr1.xlsx immune from figure exclusion."""
+        self.assertTrue(is_article_figure_url("https://example.com/img/gr1_lrg.jpg"))
+        self.assertFalse(is_article_figure_url("https://example.com/files/table-gr1.xlsx"))
+
+    def test_d1_validate_standalone_html_table_with_bin_extension(self):
+        """D1: Standalone HTML table attachments with .bin extension accepted and not deleted."""
+        with tempfile.NamedTemporaryFile("wb", suffix=".bin", delete=False) as f:
+            html_table = b"<!DOCTYPE html><html><body><table><tr><th>Sample</th><th>Value</th></tr></table></body></html>"
+            f.write(html_table)
+            temp_path = f.name
+
+        try:
+            is_valid, reason = validate_downloaded_file(temp_path, content_bytes=html_table)
+            self.assertTrue(is_valid, f"HTML table with .bin was falsely rejected: {reason}")
+            self.assertIn("HTML table attachment", reason)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_d1_download_html_table_rename(self):
+        """D1: download_file renames HTML table attachment with .bin to .html."""
+        import journal_downloader
+        from supp_finder import Candidate
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {"content-type": "application/octet-stream"}
+        mock_resp.body = b"<!DOCTYPE html><html><body><table><tr><td>Data</td></tr></table></body></html>"
+
+        with patch("journal_downloader.Fetcher.get", return_value=mock_resp):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cand = Candidate(url="https://example.com/table1.bin", filename="table1.bin")
+                res_path = journal_downloader.download_file(cand, tmpdir)
+                self.assertIsNotNone(res_path)
+                self.assertTrue(os.path.exists(res_path))
+                self.assertTrue(res_path.endswith(".html"))
+                self.assertFalse(os.path.exists(os.path.join(tmpdir, "table1.bin")))
+
+    def test_d2_candidate_filename_disambiguation(self):
+        """D2: Distinct URLs with identical filenames disambiguated with _2 suffix."""
+        html = """
+        <div>
+            <a href="https://example.com/part1/table_s1.xlsx">Table S1 (Part 1)</a>
+            <a href="https://example.com/part2/table_s1.xlsx">Table S1 (Part 2)</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        self.assertEqual(len(diag.candidates), 2)
+        fnames = [c.filename for c in diag.candidates]
+        self.assertEqual(len(set(fnames)), 2)
+        self.assertIn("table_s1.xlsx", fnames)
+        self.assertIn("table_s1_2.xlsx", fnames)
+
+    def test_d2_download_cd_collision_disambiguation(self):
+        """D2: download_file disambiguates Content-Disposition collisions without skipping."""
+        import journal_downloader
+        from supp_finder import Candidate
+
+        mock_resp = MagicMock()
+        mock_resp.status = 200
+        mock_resp.headers = {
+            "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "content-disposition": 'attachment; filename="data.xlsx"',
+        }
+        mock_resp.body = b"PK\x03\x04" + b"\x00" * 200
+
+        with patch("journal_downloader.Fetcher.get", return_value=mock_resp):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                cand1 = Candidate(url="https://example.com/part1", filename="part1.bin")
+                cand2 = Candidate(url="https://example.com/part2", filename="part2.bin")
+
+                res1 = journal_downloader.download_file(cand1, tmpdir)
+                self.assertIsNotNone(res1)
+                self.assertEqual(os.path.basename(res1), "data.xlsx")
+
+                res2 = journal_downloader.download_file(cand2, tmpdir)
+                self.assertIsNotNone(res2)
+                self.assertEqual(os.path.basename(res2), "data_2.xlsx")
+
+    def test_e1_declared_count_comprehensive_patterns(self):
+        """E1: detect_declared_supplement_count covers ranges, non-contiguous tables, and lists."""
+        self.assertEqual(detect_declared_supplement_count("Tables S1-S3 in Supplementary Information"), 3)
+        self.assertEqual(detect_declared_supplement_count("Supplementary Table S1 and S2"), 2)
+        self.assertEqual(detect_declared_supplement_count("见附表1至附表6"), 6)
+        self.assertEqual(detect_declared_supplement_count("see Supplementary Tables 2-5"), 4)
+        self.assertEqual(
+            detect_declared_supplement_count("Supplementary Materials and Methods, Figures S1-S3, Tables S1-S4"),
+            4,
+        )
+        self.assertEqual(detect_declared_supplement_count("附表1、附表2和附表3"), 3)
+
+    def test_e2_obviously_incomplete_not_falsely_triggered_by_meta_or_publisher(self):
+        """E2: When meta or publisher extractors yield candidates, don't falsely claim 0 candidates."""
+        from supp_finder import Candidate
+        cands = [
+            Candidate(
+                url="https://example.com/mmc1.xlsx",
+                filename="mmc1.xlsx",
+                section="meta_tags",
+            )
+        ]
+        html_with_supp_div = '<div id="supplementary-material"><p>Placeholder</p></div>'
+        is_inc, reason = is_result_obviously_incomplete(cands, html_with_supp_div, declared_count=1)
+        self.assertFalse(is_inc, f"Falsely marked incomplete: {reason}")
+
+    def test_f1_is_data_url_with_explicit_text(self):
+        """F1: is_data_url recognizes endpoint when accompanied by supplementary text."""
+        import scansci_supp_downloader
+        self.assertTrue(scansci_supp_downloader.is_data_url("/dl?id=1", text="附表 1"))
+        self.assertTrue(scansci_supp_downloader.is_data_url("/dl?id=2", text="Supplementary Table S1"))
+
+    def test_f2_extract_filename_deterministic_hash(self):
+        """F2: Fallback hash filename is deterministic across runs."""
+        fn1 = extract_filename_from_url("https://example.com/download/")
+        fn2 = extract_filename_from_url("https://example.com/download/")
+        self.assertEqual(fn1, fn2)
+        self.assertTrue(fn1.startswith("download_"))
+        self.assertTrue(fn1.endswith(".bin"))
+
+    def test_f3_check_data_extension_multi_part(self):
+        """F3: check_data_extension correctly recognizes .nii.gz instead of .gz."""
+        from supp_finder import check_data_extension
+        ext = check_data_extension("https://example.com/brain.nii.gz")
+        self.assertEqual(ext, ".nii.gz")
+
+    def test_f4_sanitize_filename_url_unquote(self):
+        """F4: sanitize_filename unquotes URL-encoded Chinese characters."""
+        from supp_finder import sanitize_filename
+        fn = sanitize_filename("%E9%99%84%E8%A1%A81.xlsx")
+        self.assertEqual(fn, "附表1.xlsx")
+
+    def test_f5_publisher_extractors_filtered_by_exclusion(self):
+        """F5: Publisher extractors uniformly filter out excluded URLs and figures."""
+        html = """
+        <a data-track-action="download" href="https://scholar.google.com/search?q=foo">Scholar Download</a>
+        <a data-track-action="download" href="https://example.com/article-gr1_lrg.jpg">Figure Download</a>
+        <a data-track-action="download" href="https://example.com/real_data.xlsx">Real Data</a>
+        """
+        diag = find_all_candidates(html, base_url="https://link.springer.com/article/10.1007/test")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/real_data.xlsx", urls)
+        self.assertNotIn("https://scholar.google.com/search?q=foo", urls)
+        self.assertNotIn("https://example.com/article-gr1_lrg.jpg", urls)
+
+    def test_b1_relative_paths_in_onclick(self):
+        """B1: Relative paths without leading slash inside onclick are properly extracted."""
+        from supp_finder import extract_target_url_from_tag
+        from bs4 import BeautifulSoup
+        html = """
+        <div>
+            <a id="a1" onclick="location.href='download.php?id=1'">Link 1</a>
+            <a id="a2" onclick="dl('files/table1.xlsx')">Link 2</a>
+            <a id="a3" onclick="downloadFile('./files/table1.xlsx')">Link 3</a>
+        </div>
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        self.assertEqual(extract_target_url_from_tag(soup.find(id="a1")), "download.php?id=1")
+        self.assertEqual(extract_target_url_from_tag(soup.find(id="a2")), "files/table1.xlsx")
+        self.assertEqual(extract_target_url_from_tag(soup.find(id="a3")), "./files/table1.xlsx")
+
+    def test_b3_relative_paths_and_inline_scripts_json(self):
+        """B3: JSON script extracts relative paths without leading slash and inline script data."""
+        html = """
+        <script type="application/json">
+        {"supp": ["files/附表1.xlsx", "Supplementary_Table_S2.xlsx", "table1.csv"]}
+        </script>
+        <script>
+        window.__INITIAL_STATE__ = {"supp": ["/files/table_s3.xlsx"]};
+        </script>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper/")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/paper/files/附表1.xlsx", urls)
+        self.assertIn("https://example.com/paper/Supplementary_Table_S2.xlsx", urls)
+        self.assertIn("https://example.com/paper/table1.csv", urls)
+        self.assertIn("https://example.com/files/table_s3.xlsx", urls)
+
+    def test_c1_pdf_and_doc_immunity_on_elsevier_and_doi(self):
+        """C1: PDFs, DOCXs, and data files on Elsevier / DOI endpoints are immune from exclusion."""
+        self.assertFalse(is_excluded_url("https://api.elsevier.com/content/object/eid/1-s2.0-S123/supplementary-tables.pdf"))
+        self.assertFalse(is_excluded_url("https://www.elsevier.com/__data/assets/pdf/0001/table-s1.pdf"))
+        self.assertFalse(is_excluded_url("https://doi.org/10.1016/j.cell/appendix1.pdf"))
+        # Bare citation DOIs and non-file Elsevier URLs remain excluded
+        self.assertTrue(is_excluded_url("https://doi.org/10.1016/j.cell.2023.01.001"))
+        self.assertTrue(is_excluded_url("https://www.elsevier.com/about"))
+
+    def test_d1_html_table_with_large_head_section(self):
+        """D1: Standalone HTML table attachment with large head (>2KB) is valid and preserved."""
+        with tempfile.NamedTemporaryFile("wb", suffix=".bin", delete=False) as f:
+            large_html = b"<!DOCTYPE html><html><head><style>" + b"body { margin: 0; }\n" * 150 + b"</style></head><body><table><tr><th>Sample</th><th>Value</th></tr></table></body></html>"
+            f.write(large_html)
+            temp_path = f.name
+
+        try:
+            is_valid, reason = validate_downloaded_file(temp_path)
+            self.assertTrue(is_valid, f"HTML table with large head falsely rejected: {reason}")
+            self.assertIn("HTML table attachment", reason)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def test_d2_download_distinct_urls_same_filename_not_skipped(self):
+        """D2: Distinct URLs with identical filenames are not skipped and are disambiguated."""
+        import journal_downloader
+        mock_resp1 = MagicMock(status=200, headers={}, body=b"PK\x03\x04file1_content")
+        mock_resp2 = MagicMock(status=200, headers={}, body=b"PK\x03\x04file2_content")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("journal_downloader.Fetcher.get", side_effect=[mock_resp1, mock_resp2]):
+                f1 = journal_downloader.download_file("https://example.com/part1/table_s1.xlsx", tmpdir)
+                f2 = journal_downloader.download_file("https://example.com/part2/table_s1.xlsx", tmpdir)
+                self.assertIsNotNone(f1)
+                self.assertIsNotNone(f2)
+                self.assertNotEqual(f1, f2)
+                self.assertTrue(f1.endswith("table_s1.xlsx"))
+                self.assertTrue(f2.endswith("table_s1_2.xlsx"))
+                with open(f1, "rb") as fp1, open(f2, "rb") as fp2:
+                    self.assertEqual(fp1.read(), b"PK\x03\x04file1_content")
+                    self.assertEqual(fp2.read(), b"PK\x03\x04file2_content")
+
+    def test_e1_declared_count_appendix_data_oxford(self):
+        """E1: detect_declared_supplement_count covers standalone Appendix, Data ranges, and Oxford commas."""
+        self.assertEqual(detect_declared_supplement_count("Tables S1, S2, and S3"), 3)
+        self.assertEqual(detect_declared_supplement_count("see Appendix 1-4"), 4)
+        self.assertEqual(detect_declared_supplement_count("Appendix 1 to 5"), 5)
+        self.assertEqual(detect_declared_supplement_count("Data S1-S3"), 3)
+        self.assertEqual(detect_declared_supplement_count("Supplementary Data S1-S4"), 4)
+        self.assertEqual(detect_declared_supplement_count("见附录 1-4"), 4)
+        self.assertEqual(detect_declared_supplement_count("附录1至附录5"), 5)
+
+    def test_a1_appendix_variations_and_chinese_numerals(self):
+        """A1: is_explicit_supp_table covers Appendix without space and Chinese numerals."""
+        self.assertTrue(is_explicit_supp_table("Appendix1"))
+        self.assertTrue(is_explicit_supp_table("Appendix-1"))
+        self.assertTrue(is_explicit_supp_table("Appendix_1"))
+        self.assertTrue(is_explicit_supp_table("附录一"))
+        self.assertTrue(is_explicit_supp_table("附录二"))
+
+    def test_f1_unified_is_data_url_rejects_main_text_table(self):
+        """F1: is_data_url unified with should_match_candidate rejects bare main-text Table 1."""
+        import scansci_supp_downloader
+        self.assertFalse(scansci_supp_downloader.is_data_url("https://example.com/article/tables/1", text="Table 1"))
+        self.assertTrue(scansci_supp_downloader.is_data_url("https://example.com/dl?id=1", text="附表 1"))
+
+    def test_f3_compound_archive_extensions(self):
+        """F3: check_data_extension recognizes compound archive extensions."""
+        from supp_finder import check_data_extension
+        self.assertEqual(check_data_extension("https://example.com/data.tar.gz"), ".tar.gz")
+        self.assertEqual(check_data_extension("https://example.com/data.tgz"), ".tgz")
+        self.assertEqual(check_data_extension("https://example.com/data.tar.bz2"), ".tar.bz2")
 
 
 if __name__ == "__main__":

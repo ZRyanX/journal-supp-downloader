@@ -5,6 +5,7 @@ Shared candidate extraction, pattern matching, diagnostics, and file validation
 for both journal_downloader.py (lightweight) and scansci_supp_downloader.py (integrated).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -19,11 +20,14 @@ from bs4 import BeautifulSoup
 # rather than as generic blind extensions to prevent grabbing main article PDFs/pages.
 DATA_EXTENSIONS = {
     ".xlsx", ".xls", ".csv", ".tsv", ".zip", ".gz", ".tar", ".7z", ".rar",
+    ".tar.gz", ".tgz", ".tar.bz2",
     ".txt", ".json", ".xml", ".r", ".py", ".ipynb", ".m", ".nb",
     ".cif", ".pdb", ".mol", ".sdf", ".xyz", ".fasta", ".fa", ".gb",
     ".nii", ".nii.gz", ".dcm", ".h5", ".hdf5", ".mat", ".pkl", ".rda", ".sav",
     ".docx", ".doc", ".pptx", ".ppt",
 }
+# Sort extensions by length descending so multi-part extensions like .nii.gz match before .gz (F3)
+SORTED_DATA_EXTENSIONS = tuple(sorted(DATA_EXTENSIONS, key=len, reverse=True))
 
 # ── Publisher Patterns ───────────────────────────────────────────────────────
 MMC_PATTERN = re.compile(r"mmc\d+", re.IGNORECASE)
@@ -34,34 +38,53 @@ SUPP_KEYWORD_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ── Broadened Table Patterns (Fixing Issue #2) ──────────────────────────────
+# ── Broadened Table & Supplementary Patterns (Fixing Issue #2, A1, A2, A3) ────
 # Matches labels in anchor text, aria-label, title, caption, nearby headings, etc.
-# Covers Table S1, Tab. S1, Supplementary Table 1, Supplementary Tables S1-S4, Extended Data Table 1, 补充表 S1, 附表 1, etc.
+# Covers Table S1, Tab. S1, Supplementary Table 1, Supplementary Tables S1-S4,
+# Extended Data Table 1, 补充表 S1, 附表 1, Appendix 1, 附录 1, eTable 1, Data S1, etc.
 TABLE_LABEL_PATTERN = re.compile(
     r"(?:"
-    # Branch 1: Explicit supplementary prefix (number is optional, e.g. Supplementary Table, Supplementary Tables S1-S4)
+    # Branch 1: Explicit supplementary prefix (number is optional, e.g. Supplementary Table, Supplementary Data S1, Supplementary Tables S1-S4)
     r"(?:(?:supplementary|supporting|extended\s*data|ext\s*data|additional|appendix|online|suppl?\.?)\s+"
-    r"(?:tables?|tabs?\.?|tbls?\.?|表格?)(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?|[a-zA-Z]\b))?)"
+    r"(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?|表格?|数据|文件)(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?|[a-zA-Z]\b))?)"
     r"|"
-    # Branch 2: Chinese supplementary table terms (number optional, e.g. 附表 1, 补充表格 1, 附表 1-5)
-    r"(?:(?:补充|附录|附加)?(?:附表|补充表|附录表|附加表|表格)(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?))?)"
+    # Branch 1b: Standalone Appendix with identifier (e.g. Appendix 1, Appendix-1, Appendix A, Appendix 1-3)
+    r"(?:\bappendix[-_\s]*(?:tables?|tabs?\.?|tbls?\.?|[a-zA-Z0-9]+(?:\s*(?:[-–至]|to)\s*[a-zA-Z0-9]+)?)\b)"
+    r"|"
+    # Branch 1c: eTable format (e.g. eTable 1, eTable1, e-Table S1)
+    r"(?:\be[-_]?(?:tables?|tabs?\.?|tbls?\.?)(?:\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?)?\b)"
+    r"|"
+    # Branch 2: Chinese supplementary table/data terms (e.g. 附表 1, 补充表格 1, 附录 1, 补充数据 1, 附表 1-5)
+    r"(?:(?:补充|附录|附加)?(?:附表|补充表|附录表|附加表|补充数据|附录数据|补充文件|表格)(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?))?)"
+    r"|"
+    r"(?:附录\s*[a-zA-Z0-9一二三四五六七八九十]+(?:\s*(?:[-–至]|to)\s*[a-zA-Z0-9一二三四五六七八九十]+)?)"
     r"|"
     # Branch 3: Standard Table/Tab with identifier (S1, 1, A1, etc.) or range (S1-S4, 1-5)
     r"(?:(?:tables?|tabs?\.?|tbls?\.?)\s+(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?))"
+    r"|"
+    # Branch 4: Data S1, Dataset S1, File S1
+    r"(?:(?:datasets?|data|files?)\s+s\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*s?\d+[a-zA-Z]?)?\b)"
     r")",
     re.IGNORECASE,
 )
 
-# Matches table filenames (including hyphens and ranges)
-# e.g., table-s1.pdf, table_s1.xlsx, supp_table_1.csv, supp_tables.pdf, extended-data-table-2.pdf, tbl_s2.pdf
+# Matches table filenames (including hyphens, ranges, eTable, appendix, and Chinese)
+# e.g., table-s1.pdf, table_s1.xlsx, supp_table_1.csv, supp_tables.pdf,
+# extended-data-table-2.pdf, tbl_s2.pdf, eTable1.pdf, appendix1.pdf, 附录1.xlsx
 TABLE_FILENAME_PATTERN = re.compile(
     r"(?:^|[\W_])"
     r"(?:"
     r"(?:(?:supplementary|supporting|extended[-_]?data|ext[-_]?data|appendix|online|suppl?)[-_.]*(?:tables?|tbls?|tabs?|附表|补充表|附录表|附加表|表格)(?:[-_.]*[a-z]?[-_.]?\d+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z]?[-_.]?\d+)?)?)"
     r"|"
-    r"(?:(?:附表|补充表|附录表|附加表)(?:[-_.]*[a-z]?[-_.]?\d+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z]?[-_.]?\d+)?)?)"
+    r"(?:e[-_]?(?:tables?|tbls?|tabs?)[-_.]*[a-z]?[-_.]?\d+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z]?[-_.]?\d+)?)"
+    r"|"
+    r"(?:appendix[-_.]*(?:tables?|tbls?|tabs?)?[-_.]*[a-z0-9]+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z0-9]+)?)"
+    r"|"
+    r"(?:(?:附表|补充表|附录表|附加表|附录)(?:[-_.]*[a-z]?[-_.]?\d+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z]?[-_.]?\d+)?)?)"
     r"|"
     r"(?:(?:tables?|tbls?|tabs?)[-_.]*[a-z]?[-_.]?\d+(?:[-_.]*(?:to|[-–至])[-_.]*[a-z]?[-_.]?\d+)?)"
+    r"|"
+    r"(?:(?:datasets?|data|files?)[-_.]*s\d+)"
     r")"
     r"(?:[\W_]|$)",
     re.IGNORECASE,
@@ -70,21 +93,34 @@ TABLE_FILENAME_PATTERN = re.compile(
 
 def is_explicit_supp_table(label: str) -> bool:
     """
-    Check if a table label explicitly indicates a supplementary or extended table.
+    Check if a table or data label explicitly indicates a supplementary or extended item.
     e.g. 'Extended Data Table 1', 'Supplementary Table S1', 'Supporting Table 1',
-         'Table S1', 'Tab. S2', '附表 1', '补充表 S1', etc.
-    Excludes bare primary article table labels like 'Table 1', 'Table 2', 'Tab 1'.
+         'Table S1', 'Tab. S2', '附表 1', '补充表 S1', 'Appendix 1', '附录 1',
+         'eTable 1', 'Supplementary Data S1', 'Data S1', 'Dataset S1', etc.
+    Excludes bare primary article table labels like 'Table 1', 'Table 2', 'Tab 1', 'Table A1'.
     """
     if not label:
         return False
-    # Check for supplementary/extended prefix
-    if re.search(r'(?:supplementary|supporting|extended\s*data|ext\s*data|additional|appendix|online|suppl?\.?)\s+(?:tables?|tabs?\.?|tbls?\.?|表格?)', label, re.IGNORECASE):
+    # Check for supplementary/extended prefix with table/data/file
+    if re.search(
+        r'(?:supplementary|supporting|extended\s*data|ext\s*data|additional|online|suppl?\.?)\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?|表格?|数据|文件)',
+        label,
+        re.IGNORECASE,
+    ):
         return True
-    # Check Chinese terms
-    if re.search(r'(?:(?:补充|附录|附加)?(?:附表|补充表|附录表|附加表))', label, re.IGNORECASE):
+    # Check Appendix Table or standalone Appendix with identifier (Appendix 1, Appendix-1, Appendix A)
+    if re.search(r'\bappendix[-_\s]*(?:tables?|tabs?\.?|tbls?\.?|[a-z0-9])', label, re.IGNORECASE):
         return True
-    # Check if table number has 'S' (e.g. Table S1, Tab. S2)
-    if re.search(r'(?:tables?|tabs?\.?|tbls?\.?)\s+s\d+', label, re.IGNORECASE):
+    # Check eTable / e-Table
+    if re.search(r'\be[-_]?(?:tables?|tabs?\.?|tbls?\.?)', label, re.IGNORECASE):
+        return True
+    # Check Chinese terms (附表, 补充表, 附录表, 附加表, 附录 1, 补充数据 1, etc.)
+    if re.search(r'(?:(?:补充|附录|附加)?(?:附表|补充表|附录表|附加表|补充数据|附录数据|补充文件|附加文件))', label, re.IGNORECASE):
+        return True
+    if re.search(r'附录\s*[a-z0-9一二三四五六七八九十]', label, re.IGNORECASE):
+        return True
+    # Check if table/data/dataset has 'S' numbering (e.g. Table S1, Tab. S2, Data S1, Dataset S1, File S1)
+    if re.search(r'(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?)\s+s\d+', label, re.IGNORECASE):
         return True
     return False
 
@@ -113,9 +149,9 @@ EXCLUDE_URL_PATTERNS = [
     r"doi\.org/10\.\d+/",  # DOI links to other articles (references)
 ]
 
-# Article figures to exclude (gr1, fx1, ga1, etc.)
+# Article figures to exclude (gr1, ga1, fx1, etc.) (C2)
 ARTICLE_FIGURE_PATTERN = re.compile(
-    r"-(?:gr|ga|fx)\d+[a-z]?_(?:lrg|sml)?",
+    r"(?:^|[\W_])(?:gr|ga|fx)\d+[a-z]?(?:[-_](?:lrg|sml|large|small|preview|highres)|\.(?:jpe?g|png|gif|tif|tiff|webp|svg)|$|\?)",
     re.IGNORECASE,
 )
 
@@ -185,19 +221,46 @@ def is_excluded_url(url: str, base_url: str = "") -> bool:
         return True
     if base_url and is_same_page_fragment(url, base_url):
         return True
+
+    # Immunity (C1): Never exclude explicit MMC URLs or genuine data/document file downloads
+    # (e.g. api.elsevier.com/.../mmc2.xlsx, www.elsevier.com/__data/assets/excel/.../table-s1.xlsx,
+    # or doi.org/10.../table-s1.xlsx, or supplementary-tables.pdf)
+    is_data_or_supp_file = bool(
+        check_data_extension(url)
+        or MMC_PATTERN.search(url)
+        or TABLE_FILENAME_PATTERN.search(url)
+        or re.search(r'\.(?:xlsx|xls|csv|tsv|zip|gz|tar|tgz|tar\.gz|7z|rar|pdf|docx|doc|bin|nii|nii\.gz|h5)(?:[?#]|$)', url, re.IGNORECASE)
+    )
+
     for pattern in EXCLUDE_URL_PATTERNS:
+        if pattern == r"doi\.org/10\.\d+/":
+            # Only exclude DOI links when they are article reference links without a data/file extension
+            if is_data_or_supp_file:
+                continue
+        elif "elsevier" in pattern:
+            # Do not exclude elsevier download endpoints that point to data files or MMC
+            if is_data_or_supp_file:
+                continue
         if re.search(pattern, url, re.IGNORECASE):
             return True
     return False
 
 
 def is_article_figure_url(url: str) -> bool:
-    """Check if a URL is an article figure (gr1, ga1, fx1, etc.)."""
+    """Check if a URL is an article figure (gr1, ga1, fx1, etc.). Never flags data files (C2)."""
+    if not url:
+        return False
+    # Supplementary data files, MMCs, or table files are never article figures
+    if check_data_extension(url) or MMC_PATTERN.search(url) or TABLE_FILENAME_PATTERN.search(url):
+        return False
     return bool(ARTICLE_FIGURE_PATTERN.search(url))
 
 
 def sanitize_filename(name: str) -> str:
-    """Remove or replace problematic filename characters."""
+    """Remove or replace problematic filename characters, unquoting URL encoding (F4)."""
+    if not name:
+        return "download"
+    name = urllib.parse.unquote(name)
     name = re.sub(r'[\\/*?:"<>|]', "_", name)
     name = name.strip(". ")
     return name or "download"
@@ -205,7 +268,7 @@ def sanitize_filename(name: str) -> str:
 
 GENERIC_PATH_BASENAMES = {
     "file", "download", "downloadsupplement", "asset", "assets", "get", "attachment",
-    "content", "supp", "supplement", "supplementary", "fetch", "view", "stream",
+    "content", "supp", "supplement", "supplementary", "fetch", "view", "stream", "att",
 }
 
 
@@ -226,8 +289,8 @@ def extract_filename_from_url(url: str, default_name: str = "") -> str:
                 if val and "." in val:
                     return sanitize_filename(os.path.basename(val))
 
-    # 2. Check path basename
-    path = parsed.path
+    # 2. Check path basename (F4: unquote path)
+    path = urllib.parse.unquote(parsed.path)
     fname = os.path.basename(path.rstrip("/"))
     fname_lower = fname.lower()
 
@@ -267,8 +330,9 @@ def extract_filename_from_url(url: str, default_name: str = "") -> str:
     if fname and fname_lower not in GENERIC_PATH_BASENAMES:
         return sanitize_filename(fname)
 
-    # 6. Fallback
-    return f"download_{abs(hash(url)) % 100000}.bin"
+    # 6. Fallback (F2: stable deterministic hash across runs)
+    h = hashlib.md5(url.encode("utf-8")).hexdigest()[:8]
+    return f"download_{h}.bin"
 
 
 def extract_filename_from_content_disposition(cd_header: str) -> Optional[str]:
@@ -321,10 +385,16 @@ def infer_file_extension(content_bytes: bytes, content_type: str = "") -> str:
         return ".7z"
     if content_bytes.startswith(b"Rar!\x1a\x07"):
         return ".rar"
+    if content_bytes.startswith(b"\x89HDF\r\n\x1a\n"):
+        return ".h5"
     if "csv" in ct:
         return ".csv"
     if "tab-separated" in ct or "tsv" in ct:
         return ".tsv"
+    # Infer .html if HTML content with table structure is returned (D1)
+    if "text/html" in ct or b"<html" in content_bytes[:200].lower() or b"<!doctype html" in content_bytes[:200].lower():
+        if b"<table" in content_bytes[:4096].lower() or b"<tr" in content_bytes[:4096].lower() or b"<th" in content_bytes[:4096].lower():
+            return ".html"
     return ""
 
 
@@ -376,24 +446,24 @@ def extract_effective_base_url(html_content: str, response_url: str) -> str:
 # ── Pattern Matchers ─────────────────────────────────────────────────────────
 
 def check_data_extension(path_or_url: str) -> Optional[str]:
-    """Check if the string ends with or contains a known data extension."""
+    """Check if the string ends with or contains a known data extension. Checks longer extensions first (F3)."""
     parsed = urllib.parse.urlparse(path_or_url)
     path = parsed.path.lower()
-    for ext in DATA_EXTENSIONS:
+    for ext in SORTED_DATA_EXTENSIONS:
         if path.endswith(ext):
             return ext
 
     # Check query params for extension
     if parsed.query:
         query_lower = parsed.query.lower()
-        for ext in DATA_EXTENSIONS:
+        for ext in SORTED_DATA_EXTENSIONS:
             pattern = re.escape(ext) + r'(?:[&;#"\'\s]|$)'
             if re.search(pattern, query_lower):
                 return ext
 
     # Strict boundary check on full URL
     url_lower = path_or_url.lower()
-    for ext in DATA_EXTENSIONS:
+    for ext in SORTED_DATA_EXTENSIONS:
         pattern = re.escape(ext) + r'(?:[^a-z0-9]|$)'
         if re.search(pattern, url_lower):
             return ext
@@ -439,7 +509,7 @@ def is_table_text_or_attribute(text: str, attrs: Optional[Dict[str, str]] = None
     """Check if link text, aria-label, title, download attributes, or nearby context indicate a table."""
     candidates_to_check = [text]
     if attrs:
-        for attr_key in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption"]:
+        for attr_key in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption", "value"]:
             val = attrs.get(attr_key)
             if val:
                 candidates_to_check.append(val)
@@ -527,7 +597,7 @@ def is_supplementary_container(tag) -> bool:
 def extract_target_url_from_tag(tag) -> Optional[str]:
     """
     Extract target URL from <a>, <button>, or other controls.
-    Covers href, data-*, and onclick handlers (Issue #6).
+    Covers href, data-*, and onclick handlers (Issue #6, B1).
     Excludes in-page hash anchors like #tbl1, #m0001, etc.
     """
     # 1. Standard attributes
@@ -554,17 +624,171 @@ def extract_target_url_from_tag(tag) -> Optional[str]:
             if val_clean and not val_clean.startswith("#"):
                 return val_clean
 
-    # 2. Inspect onclick handlers
+    # 2. Inspect onclick handlers (B1)
     onclick = tag.get("onclick")
     if onclick and isinstance(onclick, str):
-        # Look for window.open('...'), location.href='...', download('...')
-        m = re.search(r'''(?:open|href|download)\s*\(?\s*['"](https?://[^'"]+|/[^'"]+)['"]''', onclick, re.IGNORECASE)
+        # Match location.href, window.location, window.open, dl(...), downloadFile(...)
+        # Allow relative paths without leading slash!
+        m = re.search(
+            r'''(?:location\.href|window\.location(?:\.href)?|window\.open|location|open|dl|download\w*)\s*[=(]\s*['"]([^'"]+)['"]''',
+            onclick,
+            re.IGNORECASE,
+        )
         if m:
             val = m.group(1).strip()
-            if not val.startswith("#"):
+            if val and not val.startswith("#") and not val.startswith("javascript:"):
                 return val
 
+        # Fallback: scan any quoted URL/path inside onclick with download/query/data/table characteristics
+        for qm in re.finditer(r'''['"]([^'"]+)['"]''', onclick):
+            val = qm.group(1).strip()
+            if val and not val.startswith("#") and not val.startswith("javascript:"):
+                val_lower = val.lower()
+                if (
+                    "?" in val or
+                    check_data_extension(val) or
+                    TABLE_FILENAME_PATTERN.search(val) or
+                    val_lower.endswith(".pdf") or
+                    any(k in val_lower for k in ["/dl", "/download", "/get", "/att/", "/fetch", "table", "supp", "mmc"])
+                ):
+                    return val
+
     return None
+
+
+# ── Manifest & Collision Management (D2) ────────────────────────────────────
+
+def load_download_manifest(output_dir: str) -> Dict[str, str]:
+    """Load download manifest mapping filename -> URL (D2)."""
+    manifest_path = os.path.join(output_dir, ".download_manifest.json")
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_download_manifest(output_dir: str, manifest: Dict[str, str]):
+    """Save download manifest mapping filename -> URL (D2)."""
+    manifest_path = os.path.join(output_dir, ".download_manifest.json")
+    try:
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, str]) -> str:
+    """
+    Ensure fname does not collide with an existing file on disk downloaded for a different URL (D2).
+    """
+    target = fname
+    base, ext = os.path.splitext(target)
+    idx = 2
+    while os.path.exists(os.path.join(output_dir, target)):
+        # If this exact file on disk was downloaded for this exact URL, no rename needed
+        if manifest.get(target) == url:
+            break
+        target = f"{base}_{idx}{ext}"
+        idx += 1
+    return target
+
+
+# ── Unified Candidate Matcher (F1) ──────────────────────────────────────────
+
+def should_match_candidate(
+    url: str,
+    text: str = "",
+    attrs: Optional[Dict[str, str]] = None,
+    is_supp_section: bool = False,
+    tag_name: str = "a",
+    tag=None,
+) -> Tuple[bool, str]:
+    """
+    Unified candidate matching logic (F1).
+    Evaluates whether a given URL, link text, attributes, and context match
+    a supplementary data/table file.
+    Returns (matched: bool, rule: str).
+    """
+    if not url:
+        return False, ""
+
+    attrs = attrs or {}
+    url_lower = url.lower()
+    parsed = urllib.parse.urlparse(url)
+    path_lower = parsed.path.lower()
+    fname = attrs.get("download") or extract_filename_from_url(url)
+    data_ext = check_data_extension(url)
+    is_table, table_rule = is_table_text_or_attribute(text, attrs, tag=tag)
+    is_table_filename = bool(TABLE_FILENAME_PATTERN.search(fname)) or bool(TABLE_FILENAME_PATTERN.search(path_lower))
+
+    # Case A: Elsevier MMC link
+    if MMC_PATTERN.search(url_lower):
+        return True, "mmc_pattern"
+
+    # Case B: Standard data extension (.xlsx, .csv, .zip, etc.)
+    if data_ext:
+        return True, f"data_extension:{data_ext}"
+
+    # Case C: Table label detected in text, attributes, or nearby heading (Issue #2, #3, A3, A4)
+    if is_table:
+        is_explicit_supp = is_explicit_supp_table(text) or any(is_explicit_supp_table(v) for v in attrs.values())
+        if not is_explicit_supp and ":" in table_rule:
+            is_explicit_supp = is_explicit_supp_table(table_rule.split(":", 1)[1])
+
+        check_label = (text or "") + " " + (table_rule or "")
+        is_letter_table = bool(re.search(r'\b(?:tables?|tabs?\.?|tbls?\.?)\s+[A-Z]\d+\b', check_label, re.IGNORECASE))
+        has_appendix_context = "appendix" in url_lower or "supp" in url_lower
+
+        path_basename = os.path.basename(path_lower.rstrip("/"))
+        has_query_or_endpoint = (
+            bool(parsed.query) or
+            path_basename in GENERIC_PATH_BASENAMES or
+            any(seg in path_lower for seg in ["/fetch", "/stream", "/export", "/api/", "/assets/", "/files/", "/download", "/att/", "/get/", "/attachment/"]) or
+            tag_name in ["button", "input"] or
+            (tag is not None and (tag.has_attr("data-url") or tag.has_attr("onclick")))
+        )
+
+        is_html = any(path_lower.endswith(h_ext) for h_ext in HTML_EXTENSIONS)
+        if is_html:
+            if is_supp_section or is_explicit_supp or is_table_filename or "download" in attrs:
+                return True, f"html_table_attachment ({table_rule})"
+        elif data_ext or path_lower.endswith(".pdf") or is_supp_section or "download" in attrs or is_table_filename:
+            if not is_explicit_supp and not is_supp_section and not data_ext and not is_table_filename:
+                if is_letter_table and has_appendix_context:
+                    return True, table_rule
+            else:
+                return True, table_rule
+        elif not any(path_lower.endswith(h) for h in HTML_EXTENSIONS):
+            if is_explicit_supp or is_supp_section:
+                return True, f"table_endpoint ({table_rule})"
+            elif is_letter_table and has_appendix_context and has_query_or_endpoint:
+                return True, f"table_endpoint ({table_rule})"
+
+    # Case D: Table filename pattern (e.g. table-s1.pdf, tbl_s2.xlsx)
+    if is_table_filename:
+        return True, "table_filename_pattern"
+
+    # Case E: PDF in supplementary context or with supp keywords (Issue #3)
+    if path_lower.endswith(".pdf"):
+        if SUPP_KEYWORD_PATTERN.search(url_lower):
+            return True, "pdf_with_supplementary_keyword"
+        if is_supp_section:
+            return True, "pdf_in_supplementary_section"
+
+    # Case F: Control inside supplementary section with download indicator
+    if is_supp_section:
+        if "download" in attrs or any(kw in text.lower() for kw in ["download", "pdf", "file", "table"]):
+            if not any(path_lower.endswith(h_ext) for h_ext in HTML_EXTENSIONS) or "table" in text.lower():
+                return True, "download_control_in_supplementary_section"
+
+    # Case G: MDPI style /s1, /s2
+    if re.search(r'/s\d+/?$', path_lower):
+        return True, "mdpi_supp_path"
+
+    return False, ""
 
 
 # ── Core Candidate Scanner ───────────────────────────────────────────────────
@@ -596,9 +820,16 @@ def find_all_candidates(
 
     def add_candidate(cand: Candidate):
         norm_url = cand.url.split("#")[0].strip()
-        if norm_url and norm_url not in seen_urls:
-            seen_urls.add(norm_url)
-            candidates.append(cand)
+        if not norm_url or norm_url in seen_urls:
+            return
+        if is_excluded_url(norm_url, base_url=effective_base):
+            diag.excluded_links.append((norm_url, "excluded_url_pattern"))
+            return
+        if is_article_figure_url(norm_url):
+            diag.excluded_links.append((norm_url, "article_figure_pattern"))
+            return
+        seen_urls.add(norm_url)
+        candidates.append(cand)
 
     # ── Strategy 1: Targeted Meta & Link Tags (Highwire, Nature, etc.) ────
     for meta in soup.find_all(["meta", "link"]):
@@ -611,19 +842,18 @@ def find_all_candidates(
             target = meta.get("content") or meta.get("href")
             if target:
                 full_url = urllib.parse.urljoin(effective_base, target.strip())
-                if not is_excluded_url(full_url, base_url=effective_base) and not is_article_figure_url(full_url):
-                    fname = extract_filename_from_url(full_url)
-                    add_candidate(Candidate(
-                        url=full_url,
-                        filename=fname,
-                        link_text=name,
-                        section="meta_tags",
-                        match_rule="meta_supplementary_tag",
-                        source_tag=meta.name,
-                    ))
+                fname = extract_filename_from_url(full_url)
+                add_candidate(Candidate(
+                    url=full_url,
+                    filename=fname,
+                    link_text=name,
+                    section="meta_tags",
+                    match_rule="meta_supplementary_tag",
+                    source_tag=meta.name,
+                ))
 
-    # ── Strategy 2: Scan all clickable controls (<a>, <button>, etc.) ─────
-    controls = soup.find_all(["a", "button", "div", "span"])
+    # ── Strategy 2: Scan all clickable controls (<a>, <button>, <input>, etc.) (B2) ──
+    controls = soup.find_all(["a", "button", "div", "span", "input", "li", "td", "th", "iframe", "embed", "object", "area"])
     for tag in controls:
         target_raw = extract_target_url_from_tag(tag)
         if not target_raw:
@@ -637,99 +867,33 @@ def find_all_candidates(
             diag.excluded_links.append((full_url, "article_figure_pattern"))
             continue
 
-        link_text = tag.get_text(separator=" ", strip=True)
-        attrs = {k: tag[k] for k in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption"] if tag.has_attr(k)}
+        link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
+        attrs = {k: tag[k] for k in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption", "value"] if tag.has_attr(k)}
         fname = attrs.get("download") or extract_filename_from_url(full_url)
         parsed = urllib.parse.urlparse(full_url)
         path_lower = parsed.path.lower()
         url_lower = full_url.lower()
 
         is_supp_section = is_supplementary_container(tag)
-        data_ext = check_data_extension(full_url)
         is_table, table_rule = is_table_text_or_attribute(link_text, attrs, tag=tag)
-        is_table_filename = bool(TABLE_FILENAME_PATTERN.search(fname)) or bool(TABLE_FILENAME_PATTERN.search(path_lower))
+
+        matched, rule = should_match_candidate(
+            full_url,
+            text=link_text,
+            attrs=attrs,
+            is_supp_section=is_supp_section,
+            tag_name=tag.name,
+            tag=tag,
+        )
 
         # If matched via table rule and fname is generic, derive a clean name from the table rule
-        if is_table:
+        if matched and is_table:
             if fname.startswith("download_") or fname in GENERIC_PATH_BASENAMES or "." not in fname or fname.startswith("attachment_") or fname.startswith("endpoint_"):
                 matched_label = table_rule.split(":", 1)[1] if ":" in table_rule else table_rule
                 ext_part = os.path.splitext(path_lower)[1] or ".bin"
                 fname = sanitize_filename(f"{matched_label}{ext_part}")
 
-        matched = False
-        rule = ""
         section = "supplementary_section" if is_supp_section else "page_body"
-
-        # Case A: Elsevier MMC link
-        if MMC_PATTERN.search(url_lower):
-            matched = True
-            rule = "mmc_pattern"
-
-        # Case B: Standard data extension (.xlsx, .csv, .zip, etc.)
-        elif data_ext:
-            matched = True
-            rule = f"data_extension:{data_ext}"
-
-        # Case C: Table label detected in text, attributes, or nearby heading (Issue #2 & #3)
-        elif is_table:
-            # Check if table label is explicitly supplementary (Extended Data Table, Supplementary Table, Table S1, 附表, etc.)
-            is_explicit_supp = is_explicit_supp_table(link_text) or any(is_explicit_supp_table(v) for v in attrs.values())
-            if not is_explicit_supp and ":" in table_rule:
-                is_explicit_supp = is_explicit_supp_table(table_rule.split(":", 1)[1])
-
-            # Check if URL looks like an endpoint (query params, generic path, button control, etc.)
-            path_basename = os.path.basename(path_lower.rstrip("/"))
-            has_query_or_endpoint = (
-                bool(parsed.query) or
-                path_basename in GENERIC_PATH_BASENAMES or
-                any(seg in path_lower for seg in ["/fetch", "/stream", "/export", "/api/", "/assets/", "/files/", "/download"]) or
-                tag.name == "button" or
-                tag.has_attr("data-url") or
-                tag.has_attr("onclick")
-            )
-
-            # Check if it's an HTML table attachment vs normal webpage
-            is_html = any(path_lower.endswith(h_ext) for h_ext in HTML_EXTENSIONS)
-            if is_html:
-                if is_supp_section or is_explicit_supp or is_table_filename or tag.has_attr("download"):
-                    # Valid standalone HTML table attachment!
-                    matched = True
-                    rule = f"html_table_attachment ({table_rule})"
-            elif data_ext or path_lower.endswith(".pdf") or is_supp_section or tag.has_attr("download") or is_table_filename:
-                matched = True
-                rule = table_rule
-            elif not any(path_lower.endswith(h) for h in HTML_EXTENSIONS) and (is_explicit_supp or is_supp_section or has_query_or_endpoint):
-                # Generic download endpoints (e.g. /assets/fetch?id=7, /api/data?id=1, /download?id=...)
-                matched = True
-                rule = f"table_endpoint ({table_rule})"
-
-        # Case D: Table filename pattern (e.g. table-s1.pdf, tbl_s2.xlsx)
-        elif is_table_filename:
-            matched = True
-            rule = "table_filename_pattern"
-
-        # Case E: PDF in supplementary context or with supp keywords (Issue #3)
-        elif path_lower.endswith(".pdf"):
-            if SUPP_KEYWORD_PATTERN.search(url_lower):
-                matched = True
-                rule = "pdf_with_supplementary_keyword"
-            elif is_supp_section:
-                # Inside supplementary section and is PDF (e.g. S1.pdf, button "Download PDF")
-                matched = True
-                rule = "pdf_in_supplementary_section"
-
-        # Case F: Control inside supplementary section with download indicator
-        elif is_supp_section:
-            if tag.has_attr("download") or any(kw in link_text.lower() for kw in ["download", "pdf", "file", "table"]):
-                # Don't grab non-file HTML navigation links
-                if not any(path_lower.endswith(h_ext) for h_ext in HTML_EXTENSIONS) or "table" in link_text.lower():
-                    matched = True
-                    rule = "download_control_in_supplementary_section"
-
-        # Case G: MDPI style /s1, /s2
-        elif re.search(r'/s\d+/?$', path_lower):
-            matched = True
-            rule = "mdpi_supp_path"
 
         if matched:
             add_candidate(Candidate(
@@ -761,6 +925,22 @@ def find_all_candidates(
 
     # Embedded JSON data structures (Next.js / Nuxt / Publisher JSON payloads)
     _extract_embedded_json_candidates(soup, effective_base, add_candidate)
+
+    # Disambiguate identical filenames across different candidates (D2)
+    # Use case-insensitive tracking to prevent collisions on case-insensitive filesystems (macOS/Windows)
+    seen_fnames_lower: Set[str] = set()
+    for cand in candidates:
+        fn = cand.filename
+        fn_lower = fn.lower()
+        if fn_lower in seen_fnames_lower:
+            base_fn, ext_fn = os.path.splitext(fn)
+            idx = 2
+            while f"{base_fn}_{idx}{ext_fn}".lower() in seen_fnames_lower:
+                idx += 1
+            cand.filename = f"{base_fn}_{idx}{ext_fn}"
+            seen_fnames_lower.add(cand.filename.lower())
+        else:
+            seen_fnames_lower.add(fn_lower)
 
     # ── Diagnostics & Completeness Check (Issue #4) ────────────────────────
     diag.candidates = candidates
@@ -797,28 +977,26 @@ def _extract_springer_nature_candidates(soup: BeautifulSoup, base_url: str, add_
         href = a.get("href")
         if href:
             full_url = urllib.parse.urljoin(base_url, href)
-            if not is_excluded_url(full_url, base_url=base_url):
-                add_func(Candidate(
-                    url=full_url,
-                    filename=extract_filename_from_url(full_url),
-                    link_text=a.get_text(strip=True),
-                    section="springer_nature_download",
-                    match_rule="springer_data_track_download",
-                ))
+            add_func(Candidate(
+                url=full_url,
+                filename=extract_filename_from_url(full_url),
+                link_text=a.get_text(strip=True),
+                section="springer_nature_download",
+                match_rule="springer_data_track_download",
+            ))
 
     # Nature supplementary file links
     for a in soup.find_all("a", attrs={"data-test": "supplementary-file-link"}):
         href = a.get("href")
         if href:
             full_url = urllib.parse.urljoin(base_url, href)
-            if not is_excluded_url(full_url, base_url=base_url):
-                add_func(Candidate(
-                    url=full_url,
-                    filename=extract_filename_from_url(full_url),
-                    link_text=a.get_text(strip=True),
-                    section="nature_supplementary",
-                    match_rule="nature_data_test_supp_link",
-                ))
+            add_func(Candidate(
+                url=full_url,
+                filename=extract_filename_from_url(full_url),
+                link_text=a.get_text(strip=True),
+                section="nature_supplementary",
+                match_rule="nature_data_test_supp_link",
+            ))
 
 
 def _extract_wiley_candidates(soup: BeautifulSoup, base_url: str, add_func):
@@ -854,15 +1032,34 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
 
 
 def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func):
-    """Extract supplementary URLs embedded inside <script> JSON or LD-JSON."""
-    for script in soup.find_all("script", attrs={"type": re.compile(r"json", re.IGNORECASE)}):
+    """Extract supplementary URLs embedded inside <script> JSON, LD-JSON, or inline scripts (B3)."""
+    for script in soup.find_all("script"):
+        stype = (script.get("type") or "").lower()
+        if stype and not any(t in stype for t in ["json", "javascript", "ecmascript"]):
+            continue
+
         content = script.string or ""
         if not content or len(content) > 5000000:
             continue
-        
-        if "mmc" in content or "supplement" in content or ".xlsx" in content or "table" in content:
-            for m in re.finditer(r'''https?://[^\s"'<>]+(?:\.xlsx|\.xls|\.csv|\.tsv|\.zip|mmc\d+\.\w+)''', content, re.IGNORECASE):
-                cand_url = m.group(0)
+
+        # Unescape slashes for JSON strings (\/ -> /)
+        content_unescaped = content.replace(r"\/", "/")
+
+        if any(kw in content_unescaped.lower() for kw in ["mmc", "supplement", "supp", "table", "dataset", "attached", "asset", "附表", "附录"]):
+            # Match data files, supplementary PDFs, or paths with mmc/table/supp indicators
+            pattern = re.compile(
+                r'''["']('''
+                r'''[^"'\s<>]+\.(?:xlsx|xls|csv|tsv|zip|gz|tar|tgz|tar\.gz|7z|rar|docx|nii|nii\.gz|h5|bin)'''
+                r'''|'''
+                r'''[^"'\s<>]*(?:supp|table|appendix|附表|附录|esm|mmc)[^"'\s<>]+\.pdf'''
+                r'''|'''
+                r'''(?:https?://|/|\./|[^"'\s<>]*/)[^"'\s<>]*(?:mmc\d+|supp|table|附表|附录)[^"'\s<>]*'''
+                r''')["']''',
+                re.IGNORECASE,
+            )
+            for m in pattern.finditer(content_unescaped):
+                cand_raw = m.group(1).strip()
+                cand_url = urllib.parse.urljoin(base_url, cand_raw)
                 if not is_excluded_url(cand_url, base_url=base_url) and not is_article_figure_url(cand_url):
                     add_func(Candidate(
                         url=cand_url,
@@ -878,9 +1075,11 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
 
 def detect_declared_supplement_count(html_content: str) -> Optional[int]:
     """
-    Detect whether the article page declares a specific count of supplementary files.
-    e.g., '4 Supplementary Files', 'Supplementary Tables 1–5', 'Supporting Information (3)',
-    '共 4 个补充文件', '附表 1-5', '4 个附表'.
+    Detect whether the article page declares a specific count of supplementary files (E1).
+    e.g., '4 Supplementary Files', 'Supplementary Tables S1-S5', 'Supporting Information (3)',
+    '共 4 个补充文件', '附表 1-5', '附表1至附表6', '附录 1-4', 'Supplementary Table S1 and S2',
+    'Tables S1-S3 in Supplementary Information', 'see Supplementary Tables 2-5',
+    'Appendix 1-4', 'Data S1-S3', 'Tables S1, S2, and S3'.
     """
     if not html_content:
         return None
@@ -905,15 +1104,67 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 3: 'Supplementary Tables S?1-S?(\d+)' / 'Supplementary Tables 1 to 5'
-    m = re.search(r'(?:Supplementary|Supporting|Extended Data)\s+Tables?\s+S?0?1\s*(?:[-–至]|to)\s*S?0?(\d{1,2})', html_content, re.IGNORECASE)
+    # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables 1 to 4', 'Tables S1-S4' (E1)
+    m = re.search(
+        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+)?tables?\s+s?0?(\d{1,2})\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        html_content,
+        re.IGNORECASE,
+    )
     if m:
         try:
-            return int(m.group(1))
+            start_num = int(m.group(1))
+            end_num = int(m.group(2))
+            if end_num >= start_num:
+                return end_num - start_num + 1
         except ValueError:
             pass
 
-    # Pattern 4: Chinese counts: '共 4 个补充文件', '4 个附表', '3个附件'
+    # Pattern 3b: Standalone Appendix range: 'Appendix 1-4', 'Appendix 1 to 5' (A1, E1)
+    m = re.search(
+        r'\bappendix\s+0?(\d{1,2})\s*(?:[-–至~到]|to)\s*0?(\d{1,2})\b',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            start_num = int(m.group(1))
+            end_num = int(m.group(2))
+            if end_num >= start_num:
+                return end_num - start_num + 1
+        except ValueError:
+            pass
+
+    # Pattern 3c: Data/Dataset range: 'Data S1-S3', 'Supplementary Data S1-S4', 'Dataset 1 to 4' (A3, E1)
+    m = re.search(
+        r'(?:(?:supplementary|supporting)\s+)?(?:datasets?|data|files?)\s+s?0?(\d{1,2})\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            start_num = int(m.group(1))
+            end_num = int(m.group(2))
+            if end_num >= start_num:
+                return end_num - start_num + 1
+        except ValueError:
+            pass
+
+    # Pattern 4: Chinese range: '附表 1-5', '附表1至附表6', '补充表 S1-S6', '附录 1-4' (A1, E1)
+    m = re.search(
+        r'(?:附表|补充表|附录表|补充表格|附录)\s*s?0?(\d{1,2})\s*(?:[-–至~到]|to)\s*(?:附表|补充表|附录表|补充表格|附录)?\s*s?0?(\d{1,2})',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m:
+        try:
+            start_num = int(m.group(1))
+            end_num = int(m.group(2))
+            if end_num >= start_num:
+                return end_num - start_num + 1
+        except ValueError:
+            pass
+
+    # Pattern 5: Chinese counts: '共 4 个补充文件', '4 个附表', '3个附件', '含 5 个附表'
     m = re.search(r'(?:共|含|包括)?\s*(\d{1,2})\s*个?(?:补充|附录|附加)?(?:文件|材料|表格|数据|附件|附表|补充表)', html_content)
     if m:
         try:
@@ -921,13 +1172,37 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 5: Chinese range: '附表 1-5', '附表 1 至 5', '补充表 S1-S6'
-    m = re.search(r'(?:附表|补充表|补充表格)\s*S?0?1\s*(?:[-–至]|to)\s*S?0?(\d{1,2})', html_content, re.IGNORECASE)
-    if m:
-        try:
-            return int(m.group(1))
-        except ValueError:
-            pass
+    # Pattern 6a: List of tables: 'Supplementary Table S1 and S2', 'Tables S1, S2 and S3', 'Tables S1, S2, and S3' (E1)
+    m_list = re.search(
+        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+)?tables?\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?(\d{1,2})\b',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m_list:
+        nums = re.findall(r'\d{1,2}', m_list.group(0))
+        if nums:
+            return len(nums)
+
+    # Pattern 6b: List of data files: 'Data S1 and S2', 'Supplementary Data S1, S2, and S3' (E1)
+    m_data_list = re.search(
+        r'(?:(?:supplementary|supporting)\s+)?(?:datasets?|data|files?)\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?(\d{1,2})\b',
+        html_content,
+        re.IGNORECASE,
+    )
+    if m_data_list:
+        nums = re.findall(r'\d{1,2}', m_data_list.group(0))
+        if nums:
+            return len(nums)
+
+    # Pattern 7: Chinese table/appendix list: '附表1、附表2和附表3', '附录1、附录2及附录3' (E1)
+    m_cn_list = re.search(
+        r'(?:附表|补充表|附录)\s*\d{1,2}(?:[、,，]\s*(?:附表|补充表|附录)?\s*\d{1,2})*\s*(?:和|及|与)\s*(?:附表|补充表|附录)?\s*(\d{1,2})',
+        html_content,
+    )
+    if m_cn_list:
+        nums = re.findall(r'\d{1,2}', m_cn_list.group(0))
+        if nums:
+            return len(nums)
 
     return None
 
@@ -947,7 +1222,7 @@ def is_result_obviously_incomplete(
     if not html_content:
         return bool(not candidates), "Empty page content"
 
-    # Check if a supplementary section exists, but no candidates came from it
+    # Check if a supplementary section exists, but no candidates came from it (E2)
     soup = BeautifulSoup(html_content, "html.parser")
     supp_keywords = [
         "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
@@ -959,7 +1234,7 @@ def is_result_obviously_incomplete(
         for kw in supp_keywords
     ))
     if supp_sections:
-        cands_in_section = [c for c in candidates if c.section in ["supplementary_section", "table_caption"]]
+        cands_in_section = [c for c in candidates if c.section not in ["page_body", ""]]
         if not cands_in_section:
             return True, "Supplementary container found in HTML but 0 candidates extracted from it"
 
@@ -1075,11 +1350,20 @@ def validate_downloaded_file(
             if indicator in header_lower:
                 return False, f"HTML error/challenge/login page detected: {indicator.decode('latin1')}"
 
-        # If it's an HTML file and NOT an error page, check if it contains a table structure
-        if ext in HTML_EXTENSIONS or not ext:
-            if b"<table" in header_lower or b"<tr" in header_lower or b"<th" in header_lower:
+        # If it's an HTML file and NOT an error page, check if it contains a table structure (D1)
+        if ext in HTML_EXTENSIONS or ext == ".bin" or not ext:
+            html_sample = content_bytes[:65536] if content_bytes is not None else b""
+            if not html_sample and os.path.exists(filepath):
+                try:
+                    with open(filepath, "rb") as f:
+                        html_sample = f.read(65536)
+                except Exception:
+                    html_sample = header_bytes
+            sample_lower = html_sample.lower()
+            if b"<table" in sample_lower or b"<tr" in sample_lower or b"<th" in sample_lower:
                 return True, f"Valid standalone HTML table attachment ({file_size} bytes)"
-            return False, f"Received HTML document without table structure ({file_size} bytes)"
+            if ext in HTML_EXTENSIONS:
+                return False, f"Received HTML document without table structure ({file_size} bytes)"
 
         return False, f"Expected data file but received HTML document ({file_size} bytes)"
 
