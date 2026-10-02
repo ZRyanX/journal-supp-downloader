@@ -6,9 +6,9 @@ Interactive wizard that opens browser windows for logging into publisher sites
 and saves cookies for use with journal_downloader.py / scansci_supp_downloader.py.
 
 Run this when:
-  - You use Safari/Firefox and the scripts can't auto-clone your Chrome session
-  - You're on a headless server and need to generate a portable cookies.json
-  - Auto-cloning of Chrome/Edge cookies failed
+  - You need to log into publisher sites (Elsevier, Springer, Nature, Wiley) to access restricted supplements
+  - You're on a headless server or outside campus and need to generate a saved cookies.json
+  - You need to capture an authenticated session for subscription or paywalled downloads
 
 Usage:
   python scripts/login_publishers.py
@@ -95,12 +95,9 @@ def main():
     print("=" * 50)
     print()
     print("[IMPORTANT]")
-    print("  If you use Chrome/Edge as your daily browser, the downloader scripts")
-    print("  automatically clone your session — no login needed.")
-    print("  This wizard is only needed when:")
-    print("    - You use Safari/Firefox (Chrome session isn't available)")
-    print("    - System security blocks Chrome profile access")
-    print("    - Running in a headless/server environment")
+    print("  The downloader scripts read saved session cookies from ~/.journal_supp_downloader_profile/cookies.json")
+    print("  or scansci-pdf credentials. They do not clone running browser sessions during download.")
+    print("  This wizard lets you log into publisher websites interactively and save credentials.")
     print("=" * 50)
     print()
     print("Choose operation:")

@@ -67,6 +67,28 @@ TABLE_FILENAME_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+
+def is_explicit_supp_table(label: str) -> bool:
+    """
+    Check if a table label explicitly indicates a supplementary or extended table.
+    e.g. 'Extended Data Table 1', 'Supplementary Table S1', 'Supporting Table 1',
+         'Table S1', 'Tab. S2', '附表 1', '补充表 S1', etc.
+    Excludes bare primary article table labels like 'Table 1', 'Table 2', 'Tab 1'.
+    """
+    if not label:
+        return False
+    # Check for supplementary/extended prefix
+    if re.search(r'(?:supplementary|supporting|extended\s*data|ext\s*data|additional|appendix|online|suppl?\.?)\s+(?:tables?|tabs?\.?|tbls?\.?|表格?)', label, re.IGNORECASE):
+        return True
+    # Check Chinese terms
+    if re.search(r'(?:(?:补充|附录|附加)?(?:附表|补充表|附录表|附加表))', label, re.IGNORECASE):
+        return True
+    # Check if table number has 'S' (e.g. Table S1, Tab. S2)
+    if re.search(r'(?:tables?|tabs?\.?|tbls?\.?)\s+s\d+', label, re.IGNORECASE):
+        return True
+    return False
+
+
 # ── URL Patterns to EXCLUDE ──────────────────────────────────────────────────
 EXCLUDE_URL_PATTERNS = [
     r"scholar\.google\.com",
@@ -182,8 +204,8 @@ def sanitize_filename(name: str) -> str:
 
 
 GENERIC_PATH_BASENAMES = {
-    "file", "download", "downloadsupplement", "asset", "get", "attachment",
-    "content", "supp", "supplement", "supplementary",
+    "file", "download", "downloadsupplement", "asset", "assets", "get", "attachment",
+    "content", "supp", "supplement", "supplementary", "fetch", "view", "stream",
 }
 
 
@@ -286,11 +308,11 @@ def infer_file_extension(content_bytes: bytes, content_type: str = "") -> str:
     if content_bytes.startswith(b"%PDF"):
         return ".pdf"
     if content_bytes.startswith(b"PK\x03\x04") or content_bytes.startswith(b"PK\x05\x06"):
-        if "spreadsheet" in ct or "excel" in ct:
+        if "spreadsheet" in ct or "excel" in ct or b"xl/" in content_bytes[:2048] or b"worksheets" in content_bytes[:2048]:
             return ".xlsx"
-        if "word" in ct or "document" in ct:
+        if "word" in ct or "document" in ct or b"word/" in content_bytes[:2048]:
             return ".docx"
-        if "presentation" in ct or "powerpoint" in ct:
+        if "presentation" in ct or "powerpoint" in ct or b"ppt/" in content_bytes[:2048]:
             return ".pptx"
         return ".zip"
     if content_bytes.startswith(b"\x1f\x8b"):
@@ -448,23 +470,51 @@ def is_table_text_or_attribute(text: str, attrs: Optional[Dict[str, str]] = None
 
 def is_supplementary_container(tag) -> bool:
     """Check if an HTML element is or is within a supplementary material container."""
+    heading_keywords = [
+        "supplement", "suppl", "appendix", "supporting information",
+        "supporting info", "additional file", "additional material",
+        "additional data", "extended data", "extended table",
+        "extended data table", "extended data tables", "extended tables",
+        "supplementary table", "supplementary tables",
+        "supplemental table", "补充材料", "附表", "附录", "附加材料",
+        "支撑材料", "补充表格"
+    ]
+    supp_attr_keywords = [
+        "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
+        "esm", "extended-data", "extended_data", "extendeddata",
+        "additional-file", "additional-material", "additional-data",
+        "data-availability", "supp-table", "supplementary-table",
+        "补充", "附表", "附录", "附加", "支撑材料"
+    ]
+
     curr = tag
     steps = 0
     while curr and steps < 6:
-        # Check tag name or attributes
-        tag_id = (curr.get("id") or "").lower() if hasattr(curr, "get") else ""
-        tag_cls = " ".join(curr.get("class", [])).lower() if hasattr(curr, "get") else ""
-        tag_data = (curr.get("data-component") or "").lower() if hasattr(curr, "get") else ""
+        # Check all tag attributes (id, class, data-*, role, aria-label, etc.)
+        if hasattr(curr, "attrs") and isinstance(curr.attrs, dict):
+            for k, v in curr.attrs.items():
+                val_str = " ".join(v) if isinstance(v, list) else str(v)
+                combined = f"{k} {val_str}".lower()
+                if any(kw in combined for kw in supp_attr_keywords):
+                    return True
 
-        for s in [tag_id, tag_cls, tag_data]:
-            if any(kw in s for kw in ["supplement", "suppl", "appendix", "supporting-info", "esm"]):
+        # Check headings inside curr if it's a sectioning container
+        if hasattr(curr, "name") and curr.name in ["section", "div", "aside", "details", "figure"]:
+            for h in curr.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "caption", "figcaption"], limit=3):
+                if any(kw in h.get_text().lower() for kw in heading_keywords):
+                    return True
+
+        # Check previous sibling heading
+        if hasattr(curr, "find_previous_sibling"):
+            prev_h = curr.find_previous_sibling(["h1", "h2", "h3", "h4", "h5", "h6", "caption", "figcaption"])
+            if prev_h and any(kw in prev_h.get_text().lower() for kw in heading_keywords):
                 return True
 
-        # Check nearby heading if curr has parent
+        # Check nearby headings in parent
         if curr.parent:
-            for sibling in curr.parent.find_all(["h2", "h3", "h4", "h5", "caption", "figcaption"], limit=5):
+            for sibling in curr.parent.find_all(["h1", "h2", "h3", "h4", "h5", "h6", "caption", "figcaption"], limit=5):
                 heading_text = sibling.get_text().lower()
-                if any(kw in heading_text for kw in ["supplement", "suppl", "appendix", "supporting information", "additional file"]):
+                if any(kw in heading_text for kw in heading_keywords):
                     return True
 
         curr = curr.parent
@@ -599,10 +649,10 @@ def find_all_candidates(
         is_table, table_rule = is_table_text_or_attribute(link_text, attrs, tag=tag)
         is_table_filename = bool(TABLE_FILENAME_PATTERN.search(fname)) or bool(TABLE_FILENAME_PATTERN.search(path_lower))
 
-        # If matched via nearby heading context and fname is generic, derive a clean name from the table rule
-        if is_table and table_rule.startswith("nearby_context:"):
+        # If matched via table rule and fname is generic, derive a clean name from the table rule
+        if is_table:
             if fname.startswith("download_") or fname in GENERIC_PATH_BASENAMES or "." not in fname or fname.startswith("attachment_") or fname.startswith("endpoint_"):
-                matched_label = table_rule.split("nearby_context:", 1)[1]
+                matched_label = table_rule.split(":", 1)[1] if ":" in table_rule else table_rule
                 ext_part = os.path.splitext(path_lower)[1] or ".bin"
                 fname = sanitize_filename(f"{matched_label}{ext_part}")
 
@@ -622,18 +672,36 @@ def find_all_candidates(
 
         # Case C: Table label detected in text, attributes, or nearby heading (Issue #2 & #3)
         elif is_table:
+            # Check if table label is explicitly supplementary (Extended Data Table, Supplementary Table, Table S1, 附表, etc.)
+            is_explicit_supp = is_explicit_supp_table(link_text) or any(is_explicit_supp_table(v) for v in attrs.values())
+            if not is_explicit_supp and ":" in table_rule:
+                is_explicit_supp = is_explicit_supp_table(table_rule.split(":", 1)[1])
+
+            # Check if URL looks like an endpoint (query params, generic path, button control, etc.)
+            path_basename = os.path.basename(path_lower.rstrip("/"))
+            has_query_or_endpoint = (
+                bool(parsed.query) or
+                path_basename in GENERIC_PATH_BASENAMES or
+                any(seg in path_lower for seg in ["/fetch", "/stream", "/export", "/api/", "/assets/", "/files/", "/download"]) or
+                tag.name == "button" or
+                tag.has_attr("data-url") or
+                tag.has_attr("onclick")
+            )
+
             # Check if it's an HTML table attachment vs normal webpage
             is_html = any(path_lower.endswith(h_ext) for h_ext in HTML_EXTENSIONS)
             if is_html:
-                # Valid standalone HTML table attachment!
-                matched = True
-                rule = f"html_table_attachment ({table_rule})"
+                if is_supp_section or is_explicit_supp or is_table_filename or tag.has_attr("download"):
+                    # Valid standalone HTML table attachment!
+                    matched = True
+                    rule = f"html_table_attachment ({table_rule})"
             elif data_ext or path_lower.endswith(".pdf") or is_supp_section or tag.has_attr("download") or is_table_filename:
                 matched = True
                 rule = table_rule
-            elif not any(path_lower.endswith(h) for h in HTML_EXTENSIONS) and ("download" in full_url.lower() or "attachment" in full_url.lower() or "supp" in full_url.lower() or "table" in full_url.lower()):
+            elif not any(path_lower.endswith(h) for h in HTML_EXTENSIONS) and (is_explicit_supp or is_supp_section or has_query_or_endpoint):
+                # Generic download endpoints (e.g. /assets/fetch?id=7, /api/data?id=1, /download?id=...)
                 matched = True
-                rule = f"download_table_endpoint ({table_rule})"
+                rule = f"table_endpoint ({table_rule})"
 
         # Case D: Table filename pattern (e.g. table-s1.pdf, tbl_s2.xlsx)
         elif is_table_filename:
@@ -881,7 +949,11 @@ def is_result_obviously_incomplete(
 
     # Check if a supplementary section exists, but no candidates came from it
     soup = BeautifulSoup(html_content, "html.parser")
-    supp_keywords = ["supplement", "suppl", "appendix", "supporting-info", "supporting_info", "esm", "additional-file", "supplementary-material", "supplementary-data"]
+    supp_keywords = [
+        "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
+        "esm", "additional-file", "supplementary-material", "supplementary-data",
+        "extended-data", "extended_data", "补充", "附表", "附录", "支撑材料",
+    ]
     supp_sections = soup.find_all(lambda el: el.name in ["section", "div"] and any(
         kw in (el.get("id", "") + " " + " ".join(el.get("class", []))).lower()
         for kw in supp_keywords

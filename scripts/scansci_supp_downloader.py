@@ -430,14 +430,15 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         if ext in valid_exts:
             mmc_files.add((int(num), ext))
 
+    detected_mmcs = set()
+    for m in re.finditer(r"mmc(\d+)", original_text, re.IGNORECASE):
+        detected_mmcs.add(int(m.group(1)))
+
     if not mmc_files:
-        mmc_nums = set()
-        for m in re.finditer(r"mmc(\d+)", original_text, re.IGNORECASE):
-            mmc_nums.add(int(m.group(1)))
-        if mmc_nums:
-            print(f"  Found mmc references without extensions: {sorted(mmc_nums)}")
+        if detected_mmcs:
+            print(f"  Found mmc references without extensions: {sorted(detected_mmcs)}")
             print(f"  Falling through to CDN brute-force for extension detection.")
-        return []
+        return [], detected_mmcs
 
     mmc_sorted = sorted(mmc_files)
     print(f"  Found {len(mmc_sorted)} supplement(s) from API: {['mmc'+str(n)+'.'+e for n,e in mmc_sorted]}")
@@ -502,17 +503,25 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         print(f"  [Tier A] ✓ {len(found_files)} file(s) downloaded in {total_time:.1f}s (API + CDN).")
     else:
         print(f"  [Tier A] No files downloaded.")
-    return found_files
+    return found_files, detected_mmcs
 
 
 # ── Tier 0: Elsevier CDN Brute-Force ────────────────────────────────────────
 
-def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
+def try_elsevier_cdn_brute_force(
+    pii,
+    output_dir,
+    max_mmc=25,
+    max_consecutive_misses=4,
+    known_mmcs=None,
+):
     """
     Elsevier hosts supplement files on a public CDN at:
       https://ars.els-cdn.com/content/image/1-s2.0-{PII}-mmc{N}.{ext}
     No authentication is required. Tracks probe diagnostics and does not
     discard small files under 1 KB.
+    Probes sequential MMC numbers, handles gaps without redundant requests,
+    and directly targets known MMC numbers beyond default limits.
     """
     if not pii:
         return []
@@ -520,17 +529,17 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
     base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
     exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt"]
     found_files = []
-    consecutive_misses = 0
-    scanned_count = 0
-    stop_reason = ""
+    probed_mmcs = set()
 
-    print(f"\n[Tier 0] Scanning Elsevier CDN for PII={pii} (max={max_mmc}) ...")
+    known_set = set(known_mmcs) if known_mmcs else set()
+    valid_known = {int(m) for m in known_set if isinstance(m, (int, str)) and str(m).isdigit() and 1 <= int(m) <= 999}
+
+    print(f"\n[Tier 0] Scanning Elsevier CDN for PII={pii} (max={max_mmc}, max_misses={max_consecutive_misses}) ...")
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
-    for i in range(1, max_mmc + 1):
-        scanned_count = i
-        found_this_mmc = False
+    def _probe_single_mmc(i: int) -> bool:
+        probed_mmcs.add(i)
         for ext in exts:
             url = f"{base}-mmc{i}.{ext}"
             try:
@@ -545,8 +554,7 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
                         if is_val:
                             print(f"  [SKIP] {fname} (already exists)")
                             found_files.append(filepath)
-                            found_this_mmc = True
-                            break
+                            return True
 
                     # Download the file
                     print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
@@ -575,8 +583,7 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
                             actual_size = os.path.getsize(filepath)
                             print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
                             found_files.append(filepath)
-                            found_this_mmc = True
-                            break
+                            return True
                         else:
                             if os.path.exists(filepath):
                                 os.remove(filepath)
@@ -587,19 +594,49 @@ def try_elsevier_cdn_brute_force(pii, output_dir, max_mmc=15):
                 continue
             except Exception:
                 continue
+        return False
 
-        if found_this_mmc:
+    # Phase 1: Sequential scan from 1 up to max_mmc
+    consecutive_misses = 0
+    scanned_count = 0
+    stop_reason = ""
+
+    for i in range(1, max_mmc + 1):
+        scanned_count = i
+        hit = _probe_single_mmc(i)
+        if hit:
             consecutive_misses = 0
         else:
             consecutive_misses += 1
-            if consecutive_misses >= 3:
-                stop_reason = f"3 consecutive misses after mmc{i}"
+            if consecutive_misses >= max_consecutive_misses:
+                stop_reason = f"{max_consecutive_misses} consecutive misses after mmc{i}"
                 break
 
     if not stop_reason:
         stop_reason = f"reached scan limit (max_mmc={max_mmc})"
 
-    print(f"  [Tier 0 Diagnostic] Probed mmc1..mmc{scanned_count} (limit: {max_mmc}). Hits: {len(found_files)}. Stopped: {stop_reason}.")
+    # Phase 2: Probe any known MMCs that weren't reached or were skipped
+    remaining_known = sorted(k for k in valid_known if k not in probed_mmcs)
+    for k in remaining_known:
+        if k in probed_mmcs:
+            continue
+        print(f"  [Tier 0] Probing known MMC mmc{k} ...")
+        hit = _probe_single_mmc(k)
+        if hit:
+            follow_misses = 0
+            cur = k + 1
+            while follow_misses < max_consecutive_misses and cur <= 999:
+                if cur in probed_mmcs:
+                    break
+                follow_hit = _probe_single_mmc(cur)
+                if follow_hit:
+                    follow_misses = 0
+                else:
+                    follow_misses += 1
+                cur += 1
+
+    total_probed = len(probed_mmcs)
+    print(f"  [Tier 0 Diagnostic] Probed mmc1..mmc{scanned_count} ({total_probed} total, limit: {max_mmc}). Hits: {len(found_files)}. Stopped: {stop_reason}.")
     if found_files:
         print(f"  [Tier 0] Found {len(found_files)} file(s) via CDN.")
     else:
@@ -660,13 +697,14 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                                 first_chunk = chunk
                             f.write(chunk)
 
-                if "." not in fname:
+                if "." not in fname or fname.endswith(".bin"):
                     inferred = infer_file_extension(first_chunk, hdr.get("content-type", ""))
                     if inferred:
-                        new_path = f"{filepath}{inferred}"
+                        base = fname[:-4] if fname.endswith(".bin") else fname
+                        new_path = os.path.join(output_dir, f"{base}{inferred}")
                         os.rename(filepath, new_path)
                         filepath = new_path
-                        fname = f"{fname}{inferred}"
+                        fname = f"{base}{inferred}"
 
                 is_val, reason = validate_downloaded_file(
                     filepath,
@@ -704,10 +742,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
 
-                if "." not in fname:
+                if "." not in fname or fname.endswith(".bin"):
                     inferred = infer_file_extension(resp.body, hdr.get("content-type", ""))
                     if inferred:
-                        fname = f"{fname}{inferred}"
+                        base = fname[:-4] if fname.endswith(".bin") else fname
+                        fname = f"{base}{inferred}"
                         filepath = os.path.join(output_dir, fname)
 
                 with open(filepath, "wb") as f:
@@ -959,6 +998,28 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
                 download_file(cand, article_dir, session, play_cookies)
         else:
             print("    No additional supplements found beyond CDN files.")
+
+        # Check if page mentions MMC files that were not caught by HTML links or CDN
+        pii = extract_pii_from_url(url_to_use) or extract_pii_from_url(url)
+        if pii and not getattr(args, "skip_cdn", False):
+            page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+            downloaded_mmcs = set()
+            if os.path.exists(article_dir):
+                for f in os.listdir(article_dir):
+                    m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                    if m_f:
+                        downloaded_mmcs.add(int(m_f.group(1)))
+            missing_mmcs = page_mmcs - downloaded_mmcs
+            if missing_mmcs:
+                print(f"    Page mentions additional MMC file(s) {sorted(missing_mmcs)}; probing CDN...")
+                extra_cdn_files = try_elsevier_cdn_brute_force(
+                    pii, article_dir,
+                    max_mmc=getattr(args, "max_mmc", 25),
+                    max_consecutive_misses=getattr(args, "max_misses", 4),
+                    known_mmcs=missing_mmcs,
+                )
+                if extra_cdn_files:
+                    existing_files.extend(extra_cdn_files)
     except Exception as e:
         print(f"    Page scrape error: {e}")
 
@@ -974,7 +1035,8 @@ def main():
     parser.add_argument("--no-api", action="store_true", help="Skip Elsevier API campus-IP tier")
     parser.add_argument("--headful", action="store_true", help="Show browser window during scraping")
     parser.add_argument("--skip-cdn", action="store_true", help="Skip CDN brute-force (Tier 0)")
-    parser.add_argument("--max-mmc", type=int, default=15, help="Max mmc number to scan in CDN brute-force")
+    parser.add_argument("--max-mmc", type=int, default=25, help="Max mmc number to scan in CDN brute-force (default: 25)")
+    parser.add_argument("--max-misses", type=int, default=4, help="Max consecutive misses before stopping CDN probe (default: 4)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     args = parser.parse_args()
 
@@ -997,8 +1059,10 @@ def main():
     os.makedirs(article_dir, exist_ok=True)
 
     api_files = []
+    known_mmcs = set()
     if not args.no_api and not args.list_only and "10.1016" in (doi if doi.startswith("10.") else url):
-        api_files = try_elsevier_api_campus(doi, pii, article_dir, config)
+        api_files, detected_mmcs = try_elsevier_api_campus(doi, pii, article_dir, config)
+        known_mmcs.update(detected_mmcs)
 
     if api_files:
         _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config)
@@ -1007,7 +1071,12 @@ def main():
     # ── Step 3: Tier 0 — CDN Brute-Force (fast, no auth) ─────────────────
     cdn_files = []
     if pii and not args.skip_cdn and not args.list_only:
-        cdn_files = try_elsevier_cdn_brute_force(pii, article_dir, args.max_mmc)
+        cdn_files = try_elsevier_cdn_brute_force(
+            pii, article_dir,
+            max_mmc=args.max_mmc,
+            max_consecutive_misses=args.max_misses,
+            known_mmcs=known_mmcs,
+        )
 
     if cdn_files:
         _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config)
@@ -1107,6 +1176,29 @@ def main():
                     print(f"  Updated Folder: {article_dir}")
 
     if not candidates:
+        if pii and not args.skip_cdn and not args.list_only:
+            page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+            if page_mmcs:
+                print(f"  Page text/components reference MMC file(s) {sorted(page_mmcs)}. Probing CDN...")
+                cdn_extras = try_elsevier_cdn_brute_force(
+                    pii, article_dir,
+                    max_mmc=args.max_mmc,
+                    max_consecutive_misses=args.max_misses,
+                    known_mmcs=page_mmcs,
+                )
+                if cdn_extras:
+                    try:
+                        title = _quick_title_lookup(doi, url)
+                        if title and title != "supplements":
+                            new_dir = os.path.join(args.output_dir, sanitize_filename(title))
+                            if not os.path.exists(new_dir):
+                                os.rename(article_dir, new_dir)
+                                article_dir = new_dir
+                    except Exception:
+                        pass
+                    print(f"\n✓ Done: {len(cdn_extras)} files downloaded via targeted CDN probe to {os.path.abspath(article_dir)}")
+                    return
+
         print("  No supplementary links found in HTML.")
         if diag.incomplete_reason:
             print(f"  [Diagnostic] {diag.incomplete_reason}")
@@ -1140,7 +1232,40 @@ def main():
         if res:
             success_count += 1
 
-    print(f"\n✓ Done: {success_count}/{len(candidates)} files downloaded to {os.path.abspath(article_dir)}")
+    # Check if page text references additional MMCs not in candidate URLs
+    extra_cdn_files = []
+    if pii and not args.skip_cdn and not args.list_only:
+        page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+        downloaded_mmcs = set()
+        if os.path.exists(article_dir):
+            for f in os.listdir(article_dir):
+                m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                if m_f:
+                    downloaded_mmcs.add(int(m_f.group(1)))
+        missing_mmcs = page_mmcs - downloaded_mmcs
+        if missing_mmcs:
+            print(f"  Page text mentions additional MMC file(s) {sorted(missing_mmcs)}; probing CDN...")
+            extra_cdn_files = try_elsevier_cdn_brute_force(
+                pii, article_dir,
+                max_mmc=args.max_mmc,
+                max_consecutive_misses=args.max_misses,
+                known_mmcs=missing_mmcs,
+            )
+            if extra_cdn_files:
+                success_count += len(extra_cdn_files)
+
+    try:
+        title = _quick_title_lookup(doi, url)
+        if title and title != "supplements":
+            new_dir = os.path.join(args.output_dir, sanitize_filename(title))
+            if not os.path.exists(new_dir):
+                os.rename(article_dir, new_dir)
+                article_dir = new_dir
+    except Exception:
+        pass
+
+    total_target = len(candidates) + len(extra_cdn_files)
+    print(f"\n✓ Done: {success_count}/{total_target} files downloaded to {os.path.abspath(article_dir)}")
 
 
 if __name__ == "__main__":

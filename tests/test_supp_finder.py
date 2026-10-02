@@ -557,6 +557,273 @@ class TestSuppFinder(unittest.TestCase):
         direct = "https://www.sciencedirect.com/science/article/pii/S12345"
         self.assertEqual(resolve_doi_url(direct), direct)
 
+    # ── 11. Regression Tests for Boost Gaps (Table Endpoints, Cookies, CDN) ─
+
+    def test_table_label_with_generic_endpoint(self):
+        """Extended Data Table 1 pointing to /assets/fetch?id=7 must be discovered as a candidate."""
+        html = """
+        <div>
+            <a href="/assets/fetch?id=7">Extended Data Table 1</a>
+            <a href="/api/v1/content?item_id=99" aria-label="Supplementary Table S2">Download Dataset</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper/12345")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/assets/fetch?id=7", urls)
+        self.assertIn("https://example.com/api/v1/content?item_id=99", urls)
+
+        cand_map = {c.url: c for c in diag.candidates}
+        self.assertEqual(cand_map["https://example.com/assets/fetch?id=7"].filename, "Extended Data Table 1.bin")
+        self.assertEqual(cand_map["https://example.com/api/v1/content?item_id=99"].filename, "Supplementary Table S2.bin")
+
+    def test_extended_data_containers_and_headings(self):
+        """Elements within extended data sections and headings must be marked as supplementary_section."""
+        html = """
+        <section id="extended-data">
+            <h2>Extended Data</h2>
+            <div class="table-entry">
+                <a href="/files/stream?id=42">Extended Data Table 1: Kinetic Measurements</a>
+            </div>
+        </section>
+        <div class="c-article-section" data-section="supp-table">
+            <button data-url="/export/table_3">附表 3</button>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        self.assertEqual(len(diag.candidates), 2)
+        for c in diag.candidates:
+            self.assertEqual(c.section, "supplementary_section")
+
+    def test_skill_markdown_cookie_description_accurate(self):
+        """SKILL.md must accurately describe reading saved cookies and not overclaim live Chrome/Edge cloning."""
+        skill_path = os.path.join(repo_root, "SKILL.md")
+        with open(skill_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertNotIn("自动克隆本地 Chrome/Edge 的登录态", content)
+        self.assertIn("已保存", content)
+
+    def test_elsevier_cdn_brute_force_discontinuous_and_known_mmcs(self):
+        """Elsevier CDN probe handles discontinuous numbers (gap of 3) and known MMCs beyond default limit."""
+        from scansci_supp_downloader import try_elsevier_cdn_brute_force
+        from unittest.mock import MagicMock, patch
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Case 1: Discontinuous numbering (mmc1 exists, mmc2..4 miss, mmc5 exists)
+            # Default max_misses=4 must NOT abort before mmc5!
+            def fake_head(url, timeout=10, allow_redirects=True):
+                resp = MagicMock()
+                if "mmc1.xlsx" in url or "mmc5.xlsx" in url:
+                    resp.status_code = 200
+                    resp.headers = {"content-length": "2048"}
+                else:
+                    resp.status_code = 404
+                    resp.headers = {}
+                return resp
+
+            def fake_get(url, timeout=30, stream=True):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.headers = {"content-disposition": ""}
+                resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"x" * 200])
+                return resp
+
+            with patch("requests.Session.head", side_effect=fake_head), \
+                 patch("requests.Session.get", side_effect=fake_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files = try_elsevier_cdn_brute_force("S12345", tmpdir, max_mmc=10, max_consecutive_misses=4)
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("mmc1.xlsx", basenames)
+                self.assertIn("mmc5.xlsx", basenames)
+                self.assertEqual(len(files), 2)
+
+            # Case 2: Known MMC beyond max_mmc limit (e.g. known_mmcs={30}, max_mmc=15)
+            def fake_head_known(url, timeout=10, allow_redirects=True):
+                resp = MagicMock()
+                if "mmc30.xlsx" in url:
+                    resp.status_code = 200
+                    resp.headers = {"content-length": "4096"}
+                else:
+                    resp.status_code = 404
+                    resp.headers = {}
+                return resp
+
+            with patch("requests.Session.head", side_effect=fake_head_known), \
+                 patch("requests.Session.get", side_effect=fake_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files = try_elsevier_cdn_brute_force("S12345", tmpdir, max_mmc=15, max_consecutive_misses=4, known_mmcs={30})
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("mmc30.xlsx", basenames)
+
+    def test_table_endpoint_edge_cases(self):
+        """Button controls, onclick, fragments, and Chinese table terms with endpoints."""
+        html = """
+        <div>
+            <!-- button with data-url -->
+            <button data-url="/assets/fetch?id=7" aria-label="Extended Data Table 1">Download</button>
+            <!-- link with hash fragment on endpoint -->
+            <a href="/assets/fetch?id=8#section-data">Extended Data Table 2</a>
+            <!-- button with onclick -->
+            <button onclick="window.open('/assets/fetch?id=9')">Supplementary Table S3</button>
+            <!-- Chinese label with generic API endpoint -->
+            <a href="/data/export?item=1">附表 1</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper/test")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/assets/fetch?id=7", urls)
+        self.assertIn("https://example.com/assets/fetch?id=8#section-data", urls)
+        self.assertIn("https://example.com/assets/fetch?id=9", urls)
+        self.assertIn("https://example.com/data/export?item=1", urls)
+        self.assertEqual(len(diag.candidates), 4)
+
+    def test_page_scrape_supplements_recovers_missing_mmcs(self):
+        """_try_page_scrape_supplements probes CDN for unlinked MMC mentions on the page."""
+        from scansci_supp_downloader import _try_page_scrape_supplements
+        from unittest.mock import MagicMock, patch
+
+        html_with_unlinked_mmc = """
+        <html>
+        <body>
+            <p>Raw kinetic data are provided in mmc7 (see supplementary materials).</p>
+        </body>
+        </html>
+        """
+        args = MagicMock()
+        args.no_cookies = True
+        args.headful = False
+        args.skip_cdn = False
+        args.max_misses = 4
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing_files = [os.path.join(tmpdir, "mmc1.xlsx")]
+            with open(existing_files[0], "wb") as f:
+                f.write(b"data")
+
+            def fake_fetch_page(url, session, cookies, headful, force_browser=False):
+                return html_with_unlinked_mmc, 200, url
+
+            with patch("scansci_supp_downloader.fetch_page_html", side_effect=fake_fetch_page), \
+                 patch("scansci_supp_downloader.try_elsevier_cdn_brute_force") as mock_cdn:
+                mock_cdn.return_value = [os.path.join(tmpdir, "mmc7.xlsx")]
+                _try_page_scrape_supplements(
+                    "https://www.sciencedirect.com/science/article/pii/S12345",
+                    tmpdir,
+                    {},
+                    args,
+                    existing_files,
+                )
+                self.assertTrue(mock_cdn.called)
+                call_args = mock_cdn.call_args
+                self.assertEqual(call_args[0][0], "S12345")
+                self.assertIn(7, call_args[1]["known_mmcs"])
+
+    def test_main_text_table_not_falsely_matched(self):
+        """Primary article inline tables (e.g. Table 1, Table 2) must not be treated as supplementary downloads."""
+        html = """
+        <html>
+        <body>
+            <p>Demographic characteristics are summarized in <a href="/articles/s41586-021-03819-2/tables/1">Table 1</a>.</p>
+            <p>Outcomes are reported in <a href="/content/100/2/tables/2">Table 2</a>.</p>
+            <p>Supplementary kinetic data are listed in <a href="/assets/fetch?id=7">Extended Data Table 1</a>.</p>
+        </body>
+        </html>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/assets/fetch?id=7", urls)
+        self.assertNotIn("https://example.com/articles/s41586-021-03819-2/tables/1", urls)
+        self.assertNotIn("https://example.com/content/100/2/tables/2", urls)
+        self.assertEqual(len(diag.candidates), 1)
+
+    def test_bin_extension_inferred_during_download(self):
+        """Files with .bin candidate filename must have their real extension inferred upon download."""
+        from scansci_supp_downloader import download_file
+        from supp_finder import Candidate
+        from unittest.mock import MagicMock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cand = Candidate(
+                url="https://example.com/assets/fetch?id=7",
+                filename="Extended Data Table 1.bin",
+                link_text="Extended Data Table 1",
+            )
+            # Fake requests session returning an XLSX file
+            fake_session = MagicMock()
+            fake_resp = MagicMock()
+            fake_resp.status_code = 200
+            fake_resp.headers = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
+            fake_resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"xl/worksheets" + b"0" * 200])
+            fake_session.get.return_value = fake_resp
+
+            res = download_file(cand, tmpdir, session=fake_session)
+            self.assertIsNotNone(res)
+            self.assertTrue(res.endswith("Extended Data Table 1.xlsx"))
+            self.assertTrue(os.path.exists(res))
+            self.assertFalse(os.path.exists(os.path.join(tmpdir, "Extended Data Table 1.bin")))
+
+    def test_page_scrape_spaced_and_hyphenated_mmcs(self):
+        """Regex recovers 'MMC 2', 'MMC-3', and 'mmc_4' from article text."""
+        from scansci_supp_downloader import _try_page_scrape_supplements
+        from unittest.mock import MagicMock, patch
+
+        html_content = "<p>Refer to MMC 2, MMC-3, and mmc_4 for details.</p>"
+        args = MagicMock()
+        args.no_cookies = True
+        args.headful = False
+        args.skip_cdn = False
+        args.max_misses = 4
+        args.max_mmc = 25
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("scansci_supp_downloader.fetch_page_html", return_value=(html_content, 200, "https://example.com/pii/S99999")), \
+                 patch("scansci_supp_downloader.try_elsevier_cdn_brute_force") as mock_cdn:
+                mock_cdn.return_value = []
+                _try_page_scrape_supplements("https://example.com/pii/S99999", tmpdir, {}, args, [])
+                self.assertTrue(mock_cdn.called)
+                known = mock_cdn.call_args[1]["known_mmcs"]
+                self.assertIn(2, known)
+                self.assertIn(3, known)
+                self.assertIn(4, known)
+
+    def test_cdn_targeted_known_mmc_skips_intermediate_gap(self):
+        """When known_mmcs has a high number (e.g. mmc30), intermediate numbers (mmc6..29) are not polled after consecutive misses."""
+        from scansci_supp_downloader import try_elsevier_cdn_brute_force
+        from unittest.mock import MagicMock, patch
+
+        polled_urls = []
+
+        def track_head(url, timeout=10, allow_redirects=True):
+            polled_urls.append(url)
+            resp = MagicMock()
+            if "mmc1.xlsx" in url or "mmc30.xlsx" in url:
+                resp.status_code = 200
+                resp.headers = {"content-length": "2048"}
+            else:
+                resp.status_code = 404
+                resp.headers = {}
+            return resp
+
+        def fake_get(url, timeout=30, stream=True):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {"content-disposition": ""}
+            resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"x" * 200])
+            return resp
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("requests.Session.head", side_effect=track_head), \
+                 patch("requests.Session.get", side_effect=fake_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files = try_elsevier_cdn_brute_force("S12345", tmpdir, max_mmc=10, max_consecutive_misses=4, known_mmcs={30})
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("mmc1.xlsx", basenames)
+                self.assertIn("mmc30.xlsx", basenames)
+                
+                # Verify that mmc10..mmc29 were NEVER polled!
+                for unpolled_num in range(10, 30):
+                    self.assertFalse(any(f"mmc{unpolled_num}." in u for u in polled_urls),
+                                     f"mmc{unpolled_num} was unnecessarily polled!")
+
 
 if __name__ == "__main__":
     unittest.main()

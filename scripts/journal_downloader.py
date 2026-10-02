@@ -130,11 +130,12 @@ def download_file(cand_or_url, output_dir, cookies=None):
                     print(f"[SKIP] {fname} (already exists)")
                     return filepath
 
-        # Infer extension if filename has none
-        if "." not in fname:
+        # Infer extension if filename has none or is generic .bin
+        if "." not in fname or fname.endswith(".bin"):
             inferred_ext = infer_file_extension(resp.body, hdr.get("content-type", ""))
             if inferred_ext:
-                fname = f"{fname}{inferred_ext}"
+                base = fname[:-4] if fname.endswith(".bin") else fname
+                fname = f"{base}{inferred_ext}"
                 filepath = os.path.join(output_dir, fname)
 
         with open(filepath, "wb") as f:

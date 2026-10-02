@@ -77,7 +77,7 @@ python scripts/journal_downloader.py "<url>" --wait-selector "#article-body"
 - **定位**：深度集成 `scansci-pdf` 的高校与科研机构多级下载器。
 - **支持认证**：
   - **机构 IP 识别（Tier A）**：校园网下直连 Elsevier Article API，秒级提取全部 MMC 并走 CDN 下载。
-  - **日常浏览器克隆**：自动克隆本地 Chrome/Edge 的登录态与机构访问 Cookies。
+  - **scansci-pdf 已存 Cookie**：自动读取 scansci-pdf 已保存的出版商 Cookies、CARSI 凭据与 WebVPN 会话，亦可读取登录向导保存的会话（注：仅读取已保存凭据文件，下载时不克隆正在运行的浏览器配置）。
   - **校园 WebVPN / CARSI**：支持 WebVPN 自动转链与 CARSI SSO 会话凭证注入。
   - **登录向导 Cookies**：自动读取 `scripts/login_publishers.py` 保存的会话。
 
@@ -86,11 +86,11 @@ python scripts/journal_downloader.py "<url>" --wait-selector "#article-body"
 - **支持认证**：
   - **Cloudflare 隐身绕过**：内置 Turnstile/WAF 人机验证绕过。
   - **登录向导 Cookies**：运行 `python scripts/login_publishers.py` 完成出版社登录后，轻量版在页面抓取和文件下载中均会自动注入已保存的 Cookies。
-  - *(注：轻量版不自动克隆 Chrome 本地目录，亦不包含 WebVPN/CARSI 代理)*。
+  - *(注：轻量版不读取 scansci-pdf 目录中的 WebVPN/CARSI 凭据，仅支持手动登录向导保存的 Cookies)*。
 
 ### 手动登录向导
 
-若需要保存出版社登录授权会话（如校外访问、Safari/Firefox 用户或无头服务器）：
+若需要保存出版社登录授权会话（如校外访问、未配置机构 WebVPN/CARSI 或无头服务器环境）：
 
 ```bash
 python scripts/login_publishers.py
