@@ -1,9 +1,18 @@
 #!/usr/bin/env python3
 """Explore Elsevier API 'objects' field for supplement download URLs."""
+import os
+import sys
 import requests
 import json
 
-api_key = "66e68474293c31b16c0e4f5f7e092bf0"
+api_key = os.environ.get("ELSEVIER_API_KEY", "").strip()
+if not api_key:
+    print("Error: ELSEVIER_API_KEY environment variable is not set.")
+    print("Please set your Elsevier API key before running this script:")
+    print("  Linux/macOS: export ELSEVIER_API_KEY=\"your_key_here\"")
+    print("  Windows:     $env:ELSEVIER_API_KEY=\"your_key_here\"")
+    sys.exit(1)
+
 doi = "10.1016/j.oregeorev.2026.107349"
 
 r = requests.get(

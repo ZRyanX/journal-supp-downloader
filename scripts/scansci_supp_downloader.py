@@ -74,7 +74,13 @@ from supp_finder import (
     load_download_manifest,
     save_download_manifest,
     disambiguate_target_filename,
+    extract_article_title,
 )
+
+try:
+    from playwright_utils import normalize_playwright_cookies
+except ImportError:
+    normalize_playwright_cookies = lambda c: c
 
 # Try importing scrapling
 try:
@@ -102,23 +108,32 @@ except ImportError as e:
 
 
 def load_saved_cookies_standalone():
-    """Load cookies in standalone mode from login wizard profile or local cookies.json."""
+    """Load cookies in standalone mode from local cookies.json and login wizard profile."""
     paths = [
-        os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json"),
         os.path.abspath("cookies.json"),
+        os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json"),
     ]
+    all_cookies = []
+    seen_keys = set()
     for p in paths:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
                     cdata = json.load(f)
-                    if isinstance(cdata, list) and cdata:
-                        return cdata
-                    elif isinstance(cdata, dict) and cdata:
-                        return [{"name": k, "value": v, "domain": "", "path": "/"} for k, v in cdata.items()]
+                items = []
+                if isinstance(cdata, list):
+                    items = cdata
+                elif isinstance(cdata, dict):
+                    items = [{"name": k, "value": v, "path": "/"} for k, v in cdata.items()]
+                for c in items:
+                    if isinstance(c, dict) and c.get("name"):
+                        k = (c.get("domain", ""), c.get("name", ""), c.get("path", "/"))
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            all_cookies.append(c)
             except Exception:
                 pass
-    return []
+    return all_cookies
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -207,26 +222,6 @@ def is_data_url(url, text=""):
         return False
     matched, _ = should_match_candidate(url, text=text)
     return matched
-
-
-def extract_article_title(html_content, default="unknown_article"):
-    m = re.search(r'<title[^>]*>(.*?)</title>', html_content, re.IGNORECASE | re.DOTALL)
-    if not m:
-        return default
-    title = m.group(1).strip()
-    for suffix in [
-        " - ScienceDirect", " - SpringerLink", " - Springer",
-        " | Nature", " | PNAS", " - Wiley Online Library",
-        " - PubMed", " - PubMed Central", " - PMC",
-        " | Oxford Academic", " - IEEE Xplore",
-    ]:
-        title = title.replace(suffix, "")
-    title = title.strip()
-    title = re.sub(r'[\\/*?:"<>|]', "_", title)
-    title = re.sub(r'\s+', ' ', title)
-    if len(title) > 120:
-        title = title[:120]
-    return title.rstrip(". ") or default
 
 
 def extract_pii_from_url(url):
@@ -343,11 +338,11 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     (including correct extensions), then download directly from CDN.
     """
     if not config.get("is_campus_network") and not config.get("elsevier_insttoken"):
-        return []
+        return [], set()
 
     api_key = config.get("elsevier_api_key", "")
     if not api_key:
-        return []
+        return [], set()
 
     print(f"\n[Tier A] Elsevier API campus-IP access (DOI: {doi}) ...")
     t0 = time.time()
@@ -368,14 +363,14 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
             doi_clean = m.group(0)
         else:
             print("  [Tier A] Cannot extract DOI, skipping.")
-            return []
+            return [], set()
 
     api_url = f"https://api.elsevier.com/content/article/doi/{doi_clean}"
     try:
         resp = requests.get(api_url, headers=headers, timeout=30)
     except Exception as e:
         print(f"  [Tier A] API request failed: {e}")
-        return []
+        return [], set()
 
     if resp.status_code != 200:
         if resp.status_code == 401:
@@ -386,7 +381,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
             print(f"  [Tier A] HTTP 404 — Article not in API index yet.")
         else:
             print(f"  [Tier A] HTTP {resp.status_code}")
-        return []
+        return [], set()
 
     elapsed_api = time.time() - t0
     print(f"  API responded in {elapsed_api:.1f}s")
@@ -396,7 +391,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         article = data.get("full-text-retrieval-response", {})
     except Exception:
         print("  [Tier A] Failed to parse API JSON response.")
-        return []
+        return [], set()
 
     if not pii:
         core = article.get("coredata", {})
@@ -407,7 +402,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
 
     if not pii:
         print("  [Tier A] Cannot determine PII, skipping CDN download.")
-        return []
+        return [], set()
 
     original_text = article.get("originalText", "")
     if isinstance(original_text, dict):
@@ -700,7 +695,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                         base = fname[:-4] if fname.endswith(".bin") else fname
                         fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
                         new_path = os.path.join(output_dir, fname)
-                        os.rename(filepath, new_path)
+                        os.replace(filepath, new_path)
                         filepath = new_path
 
                 is_val, reason = validate_downloaded_file(
@@ -714,7 +709,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
                         new_path = os.path.join(output_dir, html_name)
                         if filepath != new_path:
-                            os.rename(filepath, new_path)
+                            os.replace(filepath, new_path)
                             filepath = new_path
                             fname = html_name
                     manifest[fname] = url
@@ -771,7 +766,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
                         new_path = os.path.join(output_dir, html_name)
                         if filepath != new_path:
-                            os.rename(filepath, new_path)
+                            os.replace(filepath, new_path)
                             filepath = new_path
                             fname = html_name
                     manifest[fname] = url
@@ -798,6 +793,13 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
             )
             session_stealth.start()
             context = session_stealth.context
+            if cookies:
+                normalized_c = normalize_playwright_cookies(cookies, default_url=url)
+                if normalized_c:
+                    try:
+                        context.add_cookies(normalized_c)
+                    except Exception:
+                        pass
             page = context.new_page()
 
             parsed = urlparse(url)
@@ -807,7 +809,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
             except Exception:
                 pass
 
-            with page.expect_download(timeout=60000) as download_info:
+            with page.expect_download(timeout=10000) as download_info:
                 try:
                     page.goto(url, wait_until="commit")
                 except Exception as e:
@@ -891,7 +893,7 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
                 "timeout": 60000,
             }
             if play_cookies:
-                sc_args["cookies"] = play_cookies
+                sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
             page = StealthyFetcher.fetch(url, **sc_args)
             html_content = str(page.html_content)
             final_url = getattr(page, "url", None) or url
@@ -912,7 +914,7 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config):
         if title and title != "supplements":
             new_dir = os.path.join(args.output_dir, sanitize_filename(title))
             if not os.path.exists(new_dir):
-                os.rename(article_dir, new_dir)
+                os.replace(article_dir, new_dir)
                 article_dir = new_dir
                 print(f"  Renamed to: {os.path.abspath(article_dir)}")
     except Exception:
@@ -940,7 +942,7 @@ def _quick_title_lookup(doi, url):
                 data = resp.json()
                 titles = data.get("message", {}).get("title", [])
                 if titles:
-                    title = titles[0]
+                    title = html.unescape(titles[0])
                     title = re.sub(r'[\\/*?:"<>|]', "_", title)
                     title = re.sub(r'\s+', ' ', title).strip()
                     if len(title) > 120:
@@ -971,7 +973,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
             for c in play_cookies:
                 session.cookies.set(
                     c.get("name", ""), c.get("value", ""),
-                    domain=c.get("domain", ""), path=c.get("path", "/"),
+                    domain=c.get("domain") or None, path=c.get("path", "/"),
                 )
         else:
             play_cookies = []
@@ -1059,6 +1061,13 @@ def main():
     args = parser.parse_args()
 
     config = load_config() if HAS_SCANSCI else {}
+    if os.environ.get("ELSEVIER_API_KEY"):
+        config["elsevier_api_key"] = os.environ["ELSEVIER_API_KEY"].strip()
+    if os.environ.get("IS_CAMPUS_NETWORK"):
+        val = os.environ["IS_CAMPUS_NETWORK"].strip().lower()
+        config["is_campus_network"] = val in ("1", "true", "yes", "y")
+    if os.environ.get("ELSEVIER_INSTTOKEN"):
+        config["elsevier_insttoken"] = os.environ["ELSEVIER_INSTTOKEN"].strip()
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
@@ -1131,7 +1140,7 @@ def main():
             for c in play_cookies:
                 session.cookies.set(
                     c.get("name", ""), c.get("value", ""),
-                    domain=c.get("domain", ""), path=c.get("path", "/"),
+                    domain=c.get("domain") or None, path=c.get("path", "/"),
                 )
     else:
         play_cookies = []
@@ -1210,7 +1219,7 @@ def main():
                         if title and title != "supplements":
                             new_dir = os.path.join(args.output_dir, sanitize_filename(title))
                             if not os.path.exists(new_dir):
-                                os.rename(article_dir, new_dir)
+                                os.replace(article_dir, new_dir)
                                 article_dir = new_dir
                     except Exception:
                         pass
@@ -1277,7 +1286,7 @@ def main():
         if title and title != "supplements":
             new_dir = os.path.join(args.output_dir, sanitize_filename(title))
             if not os.path.exists(new_dir):
-                os.rename(article_dir, new_dir)
+                os.replace(article_dir, new_dir)
                 article_dir = new_dir
     except Exception:
         pass

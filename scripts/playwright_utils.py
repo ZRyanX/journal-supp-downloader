@@ -1,6 +1,7 @@
 import sys
 import os
 import glob
+import urllib.parse
 
 
 def find_playwright_chromium():
@@ -88,3 +89,76 @@ def find_playwright_chromium():
                     return exe_path
 
     return None
+
+
+def normalize_playwright_cookies(cookies, default_url=None):
+    """
+    Normalizes a list of cookies (or dicts) for Playwright:
+    - Supports list of cookie dicts or key-value mapping dict {name: value}.
+    - Fixes or removes invalid sameSite values (must be 'Strict', 'Lax', or 'None').
+    - Removes empty string domains (domain: ""). If default_url is provided and cookie
+      lacks a domain and url, derives domain or url from default_url.
+    - If cookie has url, removes path and domain to avoid Playwright 'either url or path' error.
+    - Drops cookies that lack both domain and url (when no default_url is provided).
+    - Ensures each cookie has required fields (name, value).
+    """
+    if not cookies:
+        return []
+    if isinstance(cookies, dict):
+        if "name" in cookies and "value" in cookies:
+            cookies = [cookies]
+        else:
+            cookies = [{"name": k, "value": str(v)} for k, v in cookies.items()]
+
+    normalized = []
+    for item in cookies:
+        if not isinstance(item, dict):
+            continue
+        c = dict(item)
+        if not c.get("name") or c.get("value") is None:
+            continue
+
+        c["name"] = str(c["name"])
+        c["value"] = str(c["value"])
+
+        # Handle domain: Playwright throws error if domain is empty string
+        domain = c.get("domain")
+        if domain == "" or domain is None:
+            c.pop("domain", None)
+            if not c.get("url"):
+                if default_url:
+                    host = urllib.parse.urlsplit(default_url).hostname
+                    if host:
+                        c["domain"] = host
+                        c["path"] = c.get("path") or "/"
+                    else:
+                        c["url"] = default_url
+                else:
+                    continue
+
+        # Playwright rule: Cookie should have either url or domain/path pair, not both
+        if c.get("url"):
+            c.pop("domain", None)
+            c.pop("path", None)
+        else:
+            if not c.get("path"):
+                c["path"] = "/"
+
+        # Handle sameSite: Playwright only accepts "Strict", "Lax", or "None"
+        if "sameSite" in c:
+            ss = c["sameSite"]
+            if isinstance(ss, str):
+                ss_norm = ss.strip().lower()
+                if ss_norm == "strict":
+                    c["sameSite"] = "Strict"
+                elif ss_norm == "lax":
+                    c["sameSite"] = "Lax"
+                elif ss_norm in ("none", "no_restriction"):
+                    c["sameSite"] = "None"
+                else:
+                    c.pop("sameSite", None)
+            else:
+                c.pop("sameSite", None)
+
+        normalized.append(c)
+    return normalized

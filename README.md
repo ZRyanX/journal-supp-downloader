@@ -92,7 +92,7 @@ python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349" --he
 2. 注册或登录您的 Elsevier 账号。
 3. 点击导航栏中的 **"My API Key"**，然后点击 **"Create API Key"**。
 4. 在申请表单中填入任意的 Label（如 `MyPaperDownloader`）和您的个人/机构网址（如学校官网），勾选同意协议并提交。
-5. 系统将立即为您生成一串 32 位的 API Key（例如 `66e68474293c31b16c0...`）。
+5. 系统将立即为您生成一串 32 位的 API Key（例如 `a1b2c3d4e5f67890abcdef1234567890...`）。
 
 #### 环境变量配置：
 将申请到的 Key 写入系统环境变量：
@@ -176,7 +176,7 @@ journal-supp-downloader/
 │   ├── test_api.py            # API 认证连通性测试脚本
 │   └── test_fetch.py          # 校园网直连与附件解析测试脚本
 ├── tests/
-│   └── test_supp_finder.py    # 自动化单元与回归测试集 (28 tests)
+│   └── test_supp_finder.py    # 自动化单元与回归测试集 (83 tests)
 └── scansci-pdf/               # 内置的核心 PDF 下载与配置引擎
 ```
 

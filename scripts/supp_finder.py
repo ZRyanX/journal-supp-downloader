@@ -6,6 +6,7 @@ for both journal_downloader.py (lightweight) and scansci_supp_downloader.py (int
 """
 
 import hashlib
+import html
 import json
 import os
 import re
@@ -34,7 +35,27 @@ MMC_PATTERN = re.compile(r"mmc\d+", re.IGNORECASE)
 
 # Keywords indicating supplementary material
 SUPP_KEYWORD_PATTERN = re.compile(
-    r"(?:suppl?e?m?e?n?t?(?:ary)?|supporting[-_ ]?info(?:rmation)?|additional[-_ ]?file|appendix|esm|esm[-_]?\d+|si[-_ ]?file)",
+    r"(?:"
+    r"suppl?e?m?e?n?t?(?:ary|al)?"
+    r"|supporting[-_ ]?info(?:rmation)?"
+    r"|supporting[-_ ]?material(?:s)?"
+    r"|supporting[-_ ]?document(?:s)?"
+    r"|supplementary[-_ ]?material(?:s)?"
+    r"|supplemental[-_ ]?material(?:s)?"
+    r"|supplementary[-_ ]?file(?:s)?"
+    r"|supplemental[-_ ]?file(?:s)?"
+    r"|supplementary[-_ ]?data"
+    r"|supplemental[-_ ]?data"
+    r"|additional[-_ ]?file(?:s)?"
+    r"|additional[-_ ]?info(?:rmation)?"
+    r"|appendix"
+    r"|esm"
+    r"|esm[-_]?\d+"
+    r"|si[-_ ]?file(?:s)?"
+    r"|extended[-_ ]?data"
+    r"|online[-_ ]?suppl?e?m?e?n?t?(?:ary|al)?"
+    r"|附录|补充材料|补充文件|附加文件|补充信息|补充数据"
+    r")",
     re.IGNORECASE,
 )
 
@@ -302,6 +323,14 @@ def extract_filename_from_url(url: str, default_name: str = "") -> str:
     # If path basename has a non-generic extension like .xlsx, .pdf, .zip, etc.
     if fname and "." in fname and fname_lower not in {"file.php", "download.php", "index.html", "index.php"}:
         return sanitize_filename(fname)
+
+    # 2.5 If default_name has a valid data or document extension (e.g. Table S1.xlsx, supp.pdf),
+    # prioritize it over extensionless query-parameter disambiguation (attachment_1001)
+    if default_name:
+        clean_def = re.sub(r'\s*\((pdf|xlsx|xls|docx|doc|csv|zip|tar\.gz|gz|tsv)\)\s*$', r'.\1', default_name, flags=re.IGNORECASE)
+        def_ext = check_data_extension(clean_def) or (".pdf" if clean_def.lower().endswith(".pdf") else None)
+        if def_ext:
+            return sanitize_filename(clean_def)
 
     # 3. Disambiguate generic endpoints with query parameters (Wiley, PLOS, etc.)
     if parsed.query:
@@ -772,11 +801,23 @@ def should_match_candidate(
         return True, "table_filename_pattern"
 
     # Case E: PDF in supplementary context or with supp keywords (Issue #3)
-    if path_lower.endswith(".pdf"):
+    # Also support Wiley direct download links (even without .pdf extension) via anchor text or supp keywords
+    is_pdf = path_lower.endswith(".pdf")
+    is_wiley_dl = (
+        "downloadsupplement" in path_lower
+        or "downloadsupplement" in url_lower
+        or ("wiley.com" in url_lower and not any(path_lower.endswith(h) for h in HTML_EXTENSIONS))
+    )
+
+    if is_pdf or is_wiley_dl:
+        attrs_text = " ".join(str(v) for v in attrs.values() if isinstance(v, (str, list)))
+        check_supp_text = f"{text} {attrs_text}"
         if SUPP_KEYWORD_PATTERN.search(url_lower):
-            return True, "pdf_with_supplementary_keyword"
+            return True, "pdf_with_supplementary_keyword" if is_pdf else "wiley_supp_link"
+        if SUPP_KEYWORD_PATTERN.search(check_supp_text):
+            return True, "pdf_with_supplementary_keyword" if is_pdf else "wiley_supp_link"
         if is_supp_section:
-            return True, "pdf_in_supplementary_section"
+            return True, "pdf_in_supplementary_section" if is_pdf else "wiley_supp_link"
 
     # Case F: Control inside supplementary section with download indicator
     if is_supp_section:
@@ -820,13 +861,31 @@ def find_all_candidates(
 
     def add_candidate(cand: Candidate):
         norm_url = cand.url.split("#")[0].strip()
-        if not norm_url or norm_url in seen_urls:
+        if not norm_url:
             return
         if is_excluded_url(norm_url, base_url=effective_base):
             diag.excluded_links.append((norm_url, "excluded_url_pattern"))
             return
         if is_article_figure_url(norm_url):
             diag.excluded_links.append((norm_url, "article_figure_pattern"))
+            return
+        if norm_url in seen_urls:
+            # Upgrade existing candidate if this one has a more specific filename
+            for i, existing in enumerate(candidates):
+                if existing.url.split("#")[0].strip() == norm_url:
+                    is_existing_generic = (
+                        existing.filename.endswith(".bin")
+                        or existing.filename.startswith("download_")
+                        or existing.filename.startswith("attachment_")
+                    )
+                    is_cand_specific = not (
+                        cand.filename.endswith(".bin")
+                        or cand.filename.startswith("download_")
+                        or cand.filename.startswith("attachment_")
+                    )
+                    if is_existing_generic and is_cand_specific:
+                        candidates[i] = cand
+                    break
             return
         seen_urls.add(norm_url)
         candidates.append(cand)
@@ -869,7 +928,8 @@ def find_all_candidates(
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
         attrs = {k: tag[k] for k in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption", "value"] if tag.has_attr(k)}
-        fname = attrs.get("download") or extract_filename_from_url(full_url)
+        default_candidate_name = attrs.get("data-filename") or attrs.get("title") or link_text
+        fname = attrs.get("download") or extract_filename_from_url(full_url, default_name=default_candidate_name)
         parsed = urllib.parse.urlparse(full_url)
         path_lower = parsed.path.lower()
         url_lower = full_url.lower()
@@ -890,7 +950,11 @@ def find_all_candidates(
         if matched and is_table:
             if fname.startswith("download_") or fname in GENERIC_PATH_BASENAMES or "." not in fname or fname.startswith("attachment_") or fname.startswith("endpoint_"):
                 matched_label = table_rule.split(":", 1)[1] if ":" in table_rule else table_rule
-                ext_part = os.path.splitext(path_lower)[1] or ".bin"
+                clean_def = re.sub(r'\s*\((pdf|xlsx|xls|docx|doc|csv|zip|tar\.gz|gz|tsv)\)\s*$', r'.\1', default_candidate_name, flags=re.IGNORECASE)
+                inferred_ext = check_data_extension(clean_def) or (
+                    ".pdf" if clean_def.lower().endswith(".pdf") else ""
+                )
+                ext_part = os.path.splitext(path_lower)[1] or inferred_ext or ".bin"
                 fname = sanitize_filename(f"{matched_label}{ext_part}")
 
         section = "supplementary_section" if is_supp_section else "page_body"
@@ -977,10 +1041,18 @@ def _extract_springer_nature_candidates(soup: BeautifulSoup, base_url: str, add_
         href = a.get("href")
         if href:
             full_url = urllib.parse.urljoin(base_url, href)
+            url_lower = full_url.lower()
+            link_text = a.get_text(strip=True)
+            text_lower = link_text.lower()
+            # Exclude main article PDF: /content/pdf/ without /esm/, or text containing 'download article pdf'
+            if "/content/pdf/" in url_lower and "/esm/" not in url_lower:
+                continue
+            if "download article pdf" in text_lower or text_lower == "download pdf":
+                continue
             add_func(Candidate(
                 url=full_url,
-                filename=extract_filename_from_url(full_url),
-                link_text=a.get_text(strip=True),
+                filename=extract_filename_from_url(full_url, default_name=link_text),
+                link_text=link_text,
                 section="springer_nature_download",
                 match_rule="springer_data_track_download",
             ))
@@ -1020,6 +1092,9 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
     for a in soup.find_all("a", href=re.compile(r"/article/file\?id=", re.IGNORECASE)):
         href = a.get("href")
         full_url = urllib.parse.urljoin(base_url, href)
+        # Exclude printable/main article PDF
+        if "type=printable" in full_url.lower():
+            continue
         link_text = a.get_text(strip=True)
         fname = extract_filename_from_url(full_url, default_name=link_text)
         add_func(Candidate(
@@ -1060,6 +1135,10 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
             for m in pattern.finditer(content_unescaped):
                 cand_raw = m.group(1).strip()
                 cand_url = urllib.parse.urljoin(base_url, cand_raw)
+                cand_path = urllib.parse.urlsplit(cand_url).path.lower()
+                # Exclude frontend static bundled code (.js, .css, .map, .svg, .json, .html, .htm)
+                if any(cand_path.endswith(ext) for ext in [".js", ".css", ".map", ".svg", ".json", ".html", ".htm"]):
+                    continue
                 if not is_excluded_url(cand_url, base_url=base_url) and not is_article_figure_url(cand_url):
                     add_func(Candidate(
                         url=cand_url,
@@ -1104,16 +1183,17 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables 1 to 4', 'Tables S1-S4' (E1)
+    # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables S1 to S4' (E1)
+    # Modifier and 'S' cannot both be omitted (e.g. 'Tables 1 to 3' is main text, not supplementary)
     m = re.search(
-        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+)?tables?\s+s?0?(\d{1,2})\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+tables?\s+s?0?(\d{1,2})|tables?\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
         html_content,
         re.IGNORECASE,
     )
     if m:
         try:
-            start_num = int(m.group(1))
-            end_num = int(m.group(2))
+            start_num = int(m.group(1) or m.group(2))
+            end_num = int(m.group(3))
             if end_num >= start_num:
                 return end_num - start_num + 1
         except ValueError:
@@ -1136,14 +1216,14 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
 
     # Pattern 3c: Data/Dataset range: 'Data S1-S3', 'Supplementary Data S1-S4', 'Dataset 1 to 4' (A3, E1)
     m = re.search(
-        r'(?:(?:supplementary|supporting)\s+)?(?:datasets?|data|files?)\s+s?0?(\d{1,2})\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        r'(?:(?:supplementary|supporting)\s+(?:datasets?|data|files?)\s+s?0?(\d{1,2})|(?:datasets?|data|files?)\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
         html_content,
         re.IGNORECASE,
     )
     if m:
         try:
-            start_num = int(m.group(1))
-            end_num = int(m.group(2))
+            start_num = int(m.group(1) or m.group(2))
+            end_num = int(m.group(3))
             if end_num >= start_num:
                 return end_num - start_num + 1
         except ValueError:
@@ -1174,7 +1254,8 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
 
     # Pattern 6a: List of tables: 'Supplementary Table S1 and S2', 'Tables S1, S2 and S3', 'Tables S1, S2, and S3' (E1)
     m_list = re.search(
-        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+)?tables?\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?(\d{1,2})\b',
+        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+tables?\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
+        r'|tables?\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
         html_content,
         re.IGNORECASE,
     )
@@ -1185,7 +1266,8 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
 
     # Pattern 6b: List of data files: 'Data S1 and S2', 'Supplementary Data S1, S2, and S3' (E1)
     m_data_list = re.search(
-        r'(?:(?:supplementary|supporting)\s+)?(?:datasets?|data|files?)\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?(\d{1,2})\b',
+        r'(?:(?:supplementary|supporting)\s+(?:datasets?|data|files?)\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
+        r'|(?:datasets?|data|files?)\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
         html_content,
         re.IGNORECASE,
     )
@@ -1380,3 +1462,44 @@ def validate_downloaded_file(
 
     # 4. General non-empty file
     return True, f"Non-empty binary/text file ({file_size} bytes)"
+
+
+# ── Title Extraction & Sanitization ──────────────────────────────────────────
+
+def extract_article_title(page_or_html, default: str = "unknown_article") -> str:
+    """Extract article title, unescape HTML entities, and sanitize for use as folder name."""
+    if page_or_html is None:
+        return default
+
+    title = None
+    if hasattr(page_or_html, "css"):
+        try:
+            title = page_or_html.css('title::text').get()
+        except Exception:
+            title = None
+
+    if not title:
+        m = re.search(r'<title[^>]*>(.*?)</title>', str(page_or_html), re.IGNORECASE | re.DOTALL)
+        title = m.group(1) if m else None
+
+    if not title:
+        return default
+
+    # Unescape HTML entities (e.g. &amp; -> &, &quot; -> ", &#39; -> ')
+    title = html.unescape(title)
+
+    for suffix in [
+        " - ScienceDirect", " - SpringerLink", " - Springer",
+        " | Nature", " | PNAS", " - Wiley Online Library",
+        " - PubMed", " - PubMed Central", " - PMC",
+        " | Oxford Academic", " - IEEE Xplore",
+    ]:
+        title = title.replace(suffix, "")
+
+    title = title.strip()
+    title = re.sub(r'[\\/*?:"<>|]', "_", title)
+    title = re.sub(r'\s+', ' ', title)
+    if len(title) > 120:
+        title = title[:120]
+    title = title.rstrip(". ")
+    return title or default

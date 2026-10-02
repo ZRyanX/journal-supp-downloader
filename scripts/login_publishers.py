@@ -26,9 +26,60 @@ if scripts_dir not in sys.path:
     sys.path.append(scripts_dir)
 
 try:
-    from playwright_utils import find_playwright_chromium
+    from playwright_utils import find_playwright_chromium, normalize_playwright_cookies
 except ImportError:
     find_playwright_chromium = lambda: None
+    normalize_playwright_cookies = lambda c: c
+
+
+def save_merged_cookies(new_cookies, output_path):
+    """
+    Merge newly captured cookies with existing cookies by (domain, name, path),
+    then save the result to output_path (and local cookies.json if present).
+    """
+    existing_cookies = []
+    # Check output_path and optionally local cookies.json
+    paths_to_read = [output_path]
+    local_path = os.path.abspath("cookies.json")
+    if os.path.exists(local_path) and os.path.abspath(output_path) != local_path:
+        paths_to_read.append(local_path)
+
+    for p in paths_to_read:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        existing_cookies.extend(data)
+                    elif isinstance(data, dict):
+                        existing_cookies.extend([{"name": k, "value": v, "path": "/"} for k, v in data.items()])
+            except Exception:
+                pass
+
+    cookie_dict = {}
+    for c in existing_cookies:
+        if isinstance(c, dict) and c.get("name"):
+            key = (c.get("domain", ""), c.get("name", ""), c.get("path", "/"))
+            cookie_dict[key] = c
+
+    for c in (new_cookies or []):
+        if isinstance(c, dict) and c.get("name"):
+            key = (c.get("domain", ""), c.get("name", ""), c.get("path", "/"))
+            cookie_dict[key] = c
+
+    merged = list(cookie_dict.values())
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(merged, f, indent=2, ensure_ascii=False)
+
+    if os.path.exists(local_path) and os.path.abspath(output_path) != local_path:
+        try:
+            with open(local_path, "w", encoding="utf-8") as f:
+                json.dump(merged, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    return merged
 
 PUBLISHERS = {
     "A": ("Elsevier / ScienceDirect", "https://www.sciencedirect.com/"),
@@ -163,11 +214,9 @@ def main():
                         break
 
                 # Save cookies
-                os.makedirs(default_profile_dir, exist_ok=True)
                 cookies_path = os.path.join(default_profile_dir, "cookies.json")
-                with open(cookies_path, "w", encoding="utf-8") as f:
-                    json.dump(last_valid_cookies, f, indent=2, ensure_ascii=False)
-                print(f"Saved {len(last_valid_cookies)} cookies to: {cookies_path}")
+                merged = save_merged_cookies(last_valid_cookies, cookies_path)
+                print(f"Saved {len(last_valid_cookies)} captured cookies (total {len(merged)} stored) to: {cookies_path}")
                 print("Login session saved successfully!")
             except Exception as e:
                 print(f"CDP connection error: {e}")
@@ -185,11 +234,9 @@ def main():
                     print("Error: No cookies captured. Make sure sites are open in Chrome.")
                     return
 
-                os.makedirs(default_profile_dir, exist_ok=True)
                 cookies_path = os.path.join(default_profile_dir, "cookies.json")
-                with open(cookies_path, "w", encoding="utf-8") as f:
-                    json.dump(cookies, f, indent=2, ensure_ascii=False)
-                print(f"Exported {len(cookies)} cookies to: {cookies_path}")
+                merged = save_merged_cookies(cookies, cookies_path)
+                print(f"Exported {len(cookies)} cookies (total {len(merged)} stored) to: {cookies_path}")
                 print("Scripts will now reuse your login session automatically!")
             except Exception as e:
                 print(f"Connection failed: {e}")
@@ -256,20 +303,31 @@ def main():
             )
 
         # Inject saved cookies if present
-        cookies_json = os.path.join(default_profile_dir, "cookies.json")
-        if os.path.exists(cookies_json):
-            try:
-                with open(cookies_json, "r", encoding="utf-8") as f:
-                    c_list = json.load(f)
-                if c_list:
-                    for c in c_list:
-                        try:
-                            context.add_cookies([c])
-                        except Exception:
-                            pass
-                    print(f"Restored {len(c_list)} session cookies from cookies.json")
-            except Exception as e:
-                print(f"Warning: Failed to load cookies: {e}")
+        restore_paths = [
+            os.path.abspath("cookies.json"),
+            os.path.join(default_profile_dir, "cookies.json"),
+        ]
+        all_to_restore = []
+        for c_path in restore_paths:
+            if os.path.exists(c_path):
+                try:
+                    with open(c_path, "r", encoding="utf-8") as f:
+                        c_list = json.load(f)
+                    if isinstance(c_list, list):
+                        all_to_restore.extend(c_list)
+                    elif isinstance(c_list, dict):
+                        all_to_restore.extend([{"name": k, "value": v, "path": "/"} for k, v in c_list.items()])
+                except Exception as e:
+                    print(f"Warning: Failed to load cookies from {c_path}: {e}")
+
+        if all_to_restore:
+            norm_list = normalize_playwright_cookies(all_to_restore)
+            for c in norm_list:
+                try:
+                    context.add_cookies([c])
+                except Exception:
+                    pass
+            print(f"Restored {len(norm_list)} session cookies from cookies.json")
 
         # Open pages
         for i, url in enumerate(urls):
@@ -301,7 +359,9 @@ def main():
             except Exception:
                 break
 
-        print(f"\nCaptured {len(last_valid_cookies)} cookies.")
+        cookies_path = os.path.join(default_profile_dir, "cookies.json")
+        merged = save_merged_cookies(last_valid_cookies, cookies_path)
+        print(f"\nCaptured {len(last_valid_cookies)} cookies (total {len(merged)} stored in {cookies_path}).")
         print("Login session saved. You can now run journal_downloader.py / scansci_supp_downloader.py.")
 
 

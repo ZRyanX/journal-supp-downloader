@@ -1227,5 +1227,353 @@ class TestSuppFinder(unittest.TestCase):
         self.assertEqual(check_data_extension("https://example.com/data.tar.bz2"), ".tar.bz2")
 
 
+class TestCodebaseAuditFixes(unittest.TestCase):
+    """Regression tests verifying all fixes from DeepInvestigator codebase audit."""
+
+    def test_p0_try_elsevier_api_campus_unpack_safety(self):
+        """P0: try_elsevier_api_campus returns (list, set) on all early exits, preventing ValueError unpack crash."""
+        from scansci_supp_downloader import try_elsevier_api_campus
+        from unittest.mock import patch, MagicMock
+
+        # 1. No campus network & no insttoken
+        files, mmcs = try_elsevier_api_campus("10.1016/test", "S123", "/tmp", {})
+        self.assertEqual(files, [])
+        self.assertEqual(mmcs, set())
+
+        # 2. No API key
+        files, mmcs = try_elsevier_api_campus("10.1016/test", "S123", "/tmp", {"is_campus_network": True})
+        self.assertEqual(files, [])
+        self.assertEqual(mmcs, set())
+
+        # 3. Invalid DOI
+        files, mmcs = try_elsevier_api_campus("invalid_doi", "S123", "/tmp", {"is_campus_network": True, "elsevier_api_key": "dummy"})
+        self.assertEqual(files, [])
+        self.assertEqual(mmcs, set())
+
+        # 4. HTTP error / failed request
+        with patch("requests.get", side_effect=Exception("network error")):
+            files, mmcs = try_elsevier_api_campus("10.1016/test", "S123", "/tmp", {"is_campus_network": True, "elsevier_api_key": "dummy"})
+            self.assertEqual(files, [])
+            self.assertEqual(mmcs, set())
+
+        # 5. Non-200 HTTP status
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        with patch("requests.get", return_value=mock_resp):
+            files, mmcs = try_elsevier_api_campus("10.1016/test", "S123", "/tmp", {"is_campus_network": True, "elsevier_api_key": "dummy"})
+            self.assertEqual(files, [])
+            self.assertEqual(mmcs, set())
+
+        # 6. JSON parse failure
+        mock_resp.status_code = 200
+        mock_resp.json.side_effect = Exception("json err")
+        with patch("requests.get", return_value=mock_resp):
+            files, mmcs = try_elsevier_api_campus("10.1016/test", "S123", "/tmp", {"is_campus_network": True, "elsevier_api_key": "dummy"})
+            self.assertEqual(files, [])
+            self.assertEqual(mmcs, set())
+
+        # 7. No PII
+        mock_resp.json.side_effect = None
+        mock_resp.json.return_value = {"full-text-retrieval-response": {"coredata": {}}}
+        with patch("requests.get", return_value=mock_resp):
+            files, mmcs = try_elsevier_api_campus("10.1016/test", "", "/tmp", {"is_campus_network": True, "elsevier_api_key": "dummy"})
+            self.assertEqual(files, [])
+            self.assertEqual(mmcs, set())
+
+    def test_p0_login_publishers_save_merged_cookies(self):
+        """P0: login_publishers merges cookies by (domain, name, path) without overwriting existing publisher sessions."""
+        import tempfile
+        from login_publishers import save_merged_cookies
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cookie_file = os.path.join(tmpdir, "cookies.json")
+            # Session 1: Elsevier cookies
+            c1 = [
+                {"name": "els_session", "value": "els123", "domain": ".sciencedirect.com", "path": "/"},
+                {"name": "common_pref", "value": "v1", "domain": ".example.com", "path": "/"},
+            ]
+            save_merged_cookies(c1, cookie_file)
+
+            # Session 2: Springer cookies + updated common_pref
+            c2 = [
+                {"name": "springer_session", "value": "sp456", "domain": ".springer.com", "path": "/"},
+                {"name": "common_pref", "value": "v2", "domain": ".example.com", "path": "/"},
+            ]
+            merged = save_merged_cookies(c2, cookie_file)
+
+            # Verification: All domains preserved, common_pref updated
+            self.assertEqual(len(merged), 3)
+            cookie_dict = {(c["domain"], c["name"]): c["value"] for c in merged}
+            self.assertEqual(cookie_dict[(".sciencedirect.com", "els_session")], "els123")
+            self.assertEqual(cookie_dict[(".springer.com", "springer_session")], "sp456")
+            self.assertEqual(cookie_dict[(".example.com", "common_pref")], "v2")
+
+    def test_p1_normalize_playwright_cookies(self):
+        """P1: normalize_playwright_cookies fixes sameSite casing, removes invalid values, and drops empty domains."""
+        from playwright_utils import normalize_playwright_cookies
+
+        raw = [
+            # Valid cookies
+            {"name": "c1", "value": "v1", "domain": ".test.com", "sameSite": "lax"},
+            {"name": "c2", "value": "v2", "domain": ".test.com", "sameSite": "STRICT"},
+            {"name": "c3", "value": "v3", "domain": ".test.com", "sameSite": "no_restriction"},
+            # Invalid sameSite -> removed
+            {"name": "c4", "value": "v4", "domain": ".test.com", "sameSite": "unspecified"},
+            {"name": "c5", "value": "v5", "domain": ".test.com", "sameSite": None},
+            # Empty domain without url -> dropped
+            {"name": "c6", "value": "v6", "domain": ""},
+            # Empty domain with url -> domain stripped, url retained
+            {"name": "c7", "value": "v7", "domain": "", "url": "https://test.com"},
+            # Missing name/value -> dropped
+            {"name": "", "value": "v8", "domain": ".test.com"},
+            {"name": "c9", "domain": ".test.com"},
+        ]
+        norm = normalize_playwright_cookies(raw)
+        names = {c["name"]: c for c in norm}
+
+        self.assertEqual(names["c1"]["sameSite"], "Lax")
+        self.assertEqual(names["c2"]["sameSite"], "Strict")
+        self.assertEqual(names["c3"]["sameSite"], "None")
+        self.assertNotIn("sameSite", names["c4"])
+        self.assertNotIn("sameSite", names["c5"])
+        self.assertNotIn("c6", names)
+        self.assertIn("c7", names)
+        self.assertNotIn("domain", names["c7"])
+        self.assertNotIn("c9", names)
+
+    def test_p1_supp_keywords_and_case_e_wiley(self):
+        """P1: supp_finder recognizes broadened keywords and Case E matches text/attrs & Wiley extensionless links."""
+        from supp_finder import SUPP_KEYWORD_PATTERN, should_match_candidate
+
+        # Keywords pattern
+        self.assertTrue(SUPP_KEYWORD_PATTERN.search("Supporting Information"))
+        self.assertTrue(SUPP_KEYWORD_PATTERN.search("Additional file 1"))
+        self.assertTrue(SUPP_KEYWORD_PATTERN.search("Supplementary Material"))
+        self.assertTrue(SUPP_KEYWORD_PATTERN.search("补充数据"))
+
+        # Case E: PDF matched by anchor text even if URL has no supp keyword
+        is_cand, rule = should_match_candidate("https://example.com/asset/12345.pdf", text="Supporting Information")
+        self.assertTrue(is_cand)
+        self.assertEqual(rule, "pdf_with_supplementary_keyword")
+
+        # Case E: Wiley direct download link without .pdf
+        wiley_dl = "https://onlinelibrary.wiley.com/action/downloadSupplement?doi=10.1002%2Fanie.202300000&file=suppl1"
+        is_cand, rule = should_match_candidate(wiley_dl, text="Supporting Information")
+        self.assertTrue(is_cand)
+        self.assertEqual(rule, "wiley_supp_link")
+
+    def test_p1_detect_declared_count_rejects_main_text_tables(self):
+        """P1: detect_declared_supplement_count rejects bare 'Tables 1 to 3' but matches 'Tables S1-S3'."""
+        from supp_finder import detect_declared_supplement_count
+
+        # Bare main text tables MUST return None
+        self.assertIsNone(detect_declared_supplement_count("As seen in Tables 1 to 3, the results indicate..."))
+        self.assertIsNone(detect_declared_supplement_count("Tables 1, 2, and 3 describe the primary cohort."))
+
+        # Supplementary tables with S or modifier MUST match
+        self.assertEqual(detect_declared_supplement_count("See Tables S1-S3 for raw data."), 3)
+        self.assertEqual(detect_declared_supplement_count("Supplementary Tables 1 to 4 provide details."), 4)
+        self.assertEqual(detect_declared_supplement_count("Tables S1, S2, and S3 list the antibodies."), 3)
+
+    def test_p1_exclude_main_article_pdf_springer_and_plos(self):
+        """P1: _extract_springer_nature_candidates excludes main article PDF and _extract_plos_candidates excludes printable."""
+        from supp_finder import find_all_candidates
+
+        # Springer article with both main PDF and supplementary ESM PDF
+        springer_html = '''
+        <html><body>
+          <a data-track-action="download" href="/content/pdf/10.1007/s00126-020-00999-x.pdf">Download article PDF</a>
+          <a data-track-action="download" href="/content/pdf/10.1007/s00126-020-00999-x/esm/table-s1.pdf">Supplementary Table S1 (PDF)</a>
+        </body></html>
+        '''
+        diag = find_all_candidates(springer_html, "https://link.springer.com/article/10.1007/s00126-020-00999-x")
+        urls = [c.url for c in diag.candidates]
+        self.assertNotIn("https://link.springer.com/content/pdf/10.1007/s00126-020-00999-x.pdf", urls)
+        self.assertIn("https://link.springer.com/content/pdf/10.1007/s00126-020-00999-x/esm/table-s1.pdf", urls)
+
+        # PLOS article with printable main PDF and supplementary file
+        plos_html = '''
+        <html><body>
+          <a href="/article/file?id=10.1371/journal.pone.0298123&type=printable">Download printable PDF</a>
+          <a href="/article/file?id=10.1371/journal.pone.0298123.s001&type=supplementary">S1 Table. (XLSX)</a>
+        </body></html>
+        '''
+        diag_plos = find_all_candidates(plos_html, "https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0298123")
+        plos_urls = [c.url for c in diag_plos.candidates]
+        self.assertNotIn("https://journals.plos.org/article/file?id=10.1371/journal.pone.0298123&type=printable", plos_urls)
+        self.assertIn("https://journals.plos.org/article/file?id=10.1371/journal.pone.0298123.s001&type=supplementary", plos_urls)
+
+    def test_p2_embedded_json_excludes_static_assets(self):
+        """P2: _extract_embedded_json_candidates excludes .js, .css, .map, .svg, .json, .html."""
+        from supp_finder import find_all_candidates
+
+        html = '''
+        <script type="application/json">
+        {
+          "supplements": [
+            "/static/js/supp-bundle.min.js",
+            "/styles/table-styles.css",
+            "/assets/supp_table_1.xlsx",
+            "/assets/supp_data.pdf",
+            "/source/map.js.map",
+            "/icons/table.svg"
+          ]
+        }
+        </script>
+        '''
+        diag = find_all_candidates(html, "https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/assets/supp_table_1.xlsx", urls)
+        self.assertIn("https://example.com/assets/supp_data.pdf", urls)
+        self.assertNotIn("https://example.com/static/js/supp-bundle.min.js", urls)
+        self.assertNotIn("https://example.com/styles/table-styles.css", urls)
+        self.assertNotIn("https://example.com/source/map.js.map", urls)
+        self.assertNotIn("https://example.com/icons/table.svg", urls)
+
+    def test_p2_extract_filename_preserves_default_name_extension(self):
+        """P2: extract_filename_from_url preserves default_name with extension over extensionless query param."""
+        from supp_finder import extract_filename_from_url
+
+        url = "https://onlinelibrary.wiley.com/action/downloadSupplement?doi=10.1002%2Fanie.202300000&attachmentId=1001"
+        # Without default_name -> disambiguates as attachment_1001
+        self.assertEqual(extract_filename_from_url(url), "attachment_1001")
+
+        # With default_name containing valid extension -> preserves default_name
+        self.assertEqual(extract_filename_from_url(url, default_name="Table S1.xlsx"), "Table S1.xlsx")
+        self.assertEqual(extract_filename_from_url(url, default_name="Supplementary Data.pdf"), "Supplementary Data.pdf")
+
+    def test_p2_extract_article_title_unescape(self):
+        """P2: extract_article_title unescapes HTML entities like &amp;, &#39; and avoids &amp; in folder names."""
+        from supp_finder import extract_article_title
+
+        html = "<title>Geology &amp; Mineralogy: Gold &amp; Copper Deposits - ScienceDirect</title>"
+        title = extract_article_title(html)
+        self.assertNotIn("&amp;", title)
+        self.assertIn("&", title)
+        self.assertEqual(title, "Geology & Mineralogy_ Gold & Copper Deposits")
+
+    def test_p1_journal_downloader_load_cookies_local(self):
+        import json
+        import tempfile
+        from unittest.mock import patch
+        from journal_downloader import load_saved_cookies
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_cookies = os.path.join(tmpdir, "cookies.json")
+            with open(local_cookies, "w", encoding="utf-8") as f:
+                json.dump([{"name": "test_cookie", "value": "val123"}], f)
+
+            with patch("os.path.abspath", return_value=local_cookies), \
+                 patch("os.path.expanduser", return_value="/nonexistent/cookies.json"):
+                cookies = load_saved_cookies()
+                self.assertIsNotNone(cookies)
+                self.assertEqual(cookies[0]["name"], "test_cookie")
+
+    def test_p1_scansci_env_vars_injection(self):
+        """P1: scansci_supp_downloader main() injects ELSEVIER_API_KEY, IS_CAMPUS_NETWORK, ELSEVIER_INSTTOKEN into config."""
+        from unittest.mock import patch
+        env = {
+            "ELSEVIER_API_KEY": "test_key_123",
+            "IS_CAMPUS_NETWORK": "true",
+            "ELSEVIER_INSTTOKEN": "test_token_456",
+        }
+        with patch.dict(os.environ, env):
+            # Simulate the config initialization from main()
+            config = {}
+            if os.environ.get("ELSEVIER_API_KEY"):
+                config["elsevier_api_key"] = os.environ["ELSEVIER_API_KEY"].strip()
+            if os.environ.get("IS_CAMPUS_NETWORK"):
+                val = os.environ["IS_CAMPUS_NETWORK"].strip().lower()
+                config["is_campus_network"] = val in ("1", "true", "yes", "y")
+            if os.environ.get("ELSEVIER_INSTTOKEN"):
+                config["elsevier_insttoken"] = os.environ["ELSEVIER_INSTTOKEN"].strip()
+
+            self.assertEqual(config["elsevier_api_key"], "test_key_123")
+            self.assertTrue(config["is_campus_network"])
+            self.assertEqual(config["elsevier_insttoken"], "test_token_456")
+
+    def test_p1_test_api_env_handling(self):
+        """P1: test_api.py exits with error message if ELSEVIER_API_KEY is unset."""
+        import subprocess
+        # Run test_api.py in a clean environment without ELSEVIER_API_KEY
+        env = {k: v for k, v in os.environ.items() if k != "ELSEVIER_API_KEY"}
+        script_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts", "test_api.py")
+        res = subprocess.run([sys.executable, script_path], env=env, capture_output=True, text=True)
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("ELSEVIER_API_KEY environment variable is not set", res.stdout)
+
+    def test_p2_method_3_expect_download_configuration(self):
+        """P2: Verify scansci_supp_downloader Method 3 uses 10s timeout and injects cookies."""
+        import inspect
+        import scansci_supp_downloader
+        src = inspect.getsource(scansci_supp_downloader.download_file)
+        self.assertIn("timeout=10000", src)
+        self.assertIn("normalize_playwright_cookies(cookies", src)
+        self.assertIn("context.add_cookies(normalized_c)", src)
+
+    def test_find_all_candidates_wiley_preserves_extensions(self):
+        """Verify find_all_candidates preserves .xlsx and (XLSX) in Wiley download links instead of .bin."""
+        from supp_finder import find_all_candidates
+        html = '''
+        <html><body>
+          <div class="article-row">
+            <a href="/action/downloadSupplement?doi=10.1002%2Fanie.202300000&attachmentId=1001">Table S1.xlsx</a>
+            <a href="/action/downloadSupplement?doi=10.1002%2Fanie.202300000&attachmentId=1002">Supplementary Dataset 2 (XLSX)</a>
+          </div>
+        </body></html>
+        '''
+        diag = find_all_candidates(html, "https://onlinelibrary.wiley.com/doi/10.1002/anie.202300000")
+        fnames = {c.filename for c in diag.candidates}
+        self.assertIn("Table S1.xlsx", fnames)
+        self.assertIn("Supplementary Dataset 2.XLSX", fnames)
+        self.assertFalse(any(f.endswith(".bin") for f in fnames))
+
+    def test_normalize_playwright_cookies_dict_and_strip_path(self):
+        """Verify normalize_playwright_cookies handles dict format and strips path when url is present."""
+        from playwright_utils import normalize_playwright_cookies
+
+        # 1. Key-value mapping dict
+        mapping = {"session_token": "abc123xyz", "logged_in": "true"}
+        norm = normalize_playwright_cookies(mapping, default_url="https://example.com/test")
+        self.assertEqual(len(norm), 2)
+        by_name = {c["name"]: c for c in norm}
+        self.assertEqual(by_name["session_token"]["value"], "abc123xyz")
+        self.assertEqual(by_name["session_token"]["domain"], "example.com")
+
+        # 2. Cookie with both url and path (must strip path to avoid Playwright either url or path error)
+        c_both = [{"name": "auth", "value": "val", "url": "https://example.com", "path": "/"}]
+        norm_both = normalize_playwright_cookies(c_both)
+        self.assertIn("url", norm_both[0])
+        self.assertNotIn("path", norm_both[0])
+        self.assertNotIn("domain", norm_both[0])
+
+    def test_load_saved_cookies_merges_local_and_profile_and_supports_dict(self):
+        """Verify journal_downloader load_saved_cookies supports dicts and merges local + profile."""
+        import tempfile
+        import json
+        from unittest.mock import patch
+        from journal_downloader import load_saved_cookies
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "local_cookies.json")
+            profile_path = os.path.join(tmpdir, "profile_cookies.json")
+
+            # Local cookies as dict
+            with open(local_path, "w", encoding="utf-8") as f:
+                json.dump({"local_cookie": "local_val"}, f)
+
+            # Profile cookies as list
+            with open(profile_path, "w", encoding="utf-8") as f:
+                json.dump([{"name": "profile_cookie", "value": "profile_val", "domain": "example.com"}], f)
+
+            with patch("os.path.abspath", return_value=local_path), \
+                 patch("os.path.expanduser", return_value=profile_path):
+                cookies = load_saved_cookies()
+                self.assertIsNotNone(cookies)
+                names = {c["name"] for c in cookies}
+                self.assertIn("local_cookie", names)
+                self.assertIn("profile_cookie", names)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -48,21 +48,43 @@ from supp_finder import (
     load_download_manifest,
     save_download_manifest,
     disambiguate_target_filename,
+    extract_article_title,
 )
 
 
+try:
+    from playwright_utils import normalize_playwright_cookies
+except ImportError:
+    normalize_playwright_cookies = lambda c, default_url=None: c
+
+
 def load_saved_cookies():
-    """Load saved cookies from login_publishers.py profile if present."""
-    cookie_file = os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json")
-    if os.path.exists(cookie_file):
-        try:
-            with open(cookie_file, "r", encoding="utf-8") as f:
-                cookies = json.load(f)
-                if cookies and isinstance(cookies, list):
-                    return cookies
-        except Exception:
-            pass
-    return None
+    """Load saved cookies from local cookies.json and login_publishers.py profile."""
+    candidates = [
+        os.path.abspath("cookies.json"),
+        os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json"),
+    ]
+    all_cookies = []
+    seen_keys = set()
+    for cookie_file in candidates:
+        if os.path.exists(cookie_file):
+            try:
+                with open(cookie_file, "r", encoding="utf-8") as f:
+                    cookies = json.load(f)
+                items = []
+                if isinstance(cookies, list):
+                    items = cookies
+                elif isinstance(cookies, dict):
+                    items = [{"name": k, "value": v, "path": "/"} for k, v in cookies.items()]
+                for c in items:
+                    if isinstance(c, dict) and c.get("name"):
+                        k = (c.get("domain", ""), c.get("name", ""), c.get("path", "/"))
+                        if k not in seen_keys:
+                            seen_keys.add(k)
+                            all_cookies.append(c)
+            except Exception:
+                pass
+    return all_cookies if all_cookies else None
 
 
 def find_supplementary_links(page_or_html, base_url, original_url=None):
@@ -162,7 +184,7 @@ def download_file(cand_or_url, output_dir, cookies=None):
                 html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
                 new_path = os.path.join(output_dir, html_name)
                 if filepath != new_path:
-                    os.rename(filepath, new_path)
+                    os.replace(filepath, new_path)
                     filepath = new_path
                     fname = html_name
             manifest[fname] = url
@@ -180,34 +202,6 @@ def download_file(cand_or_url, output_dir, cookies=None):
             os.remove(filepath)
         print(f"FAIL: {e}")
         return None
-
-
-def extract_article_title(page_or_html):
-    """Extract article title, sanitized for use as folder name."""
-    if hasattr(page_or_html, "css"):
-        title = page_or_html.css('title::text').get()
-    else:
-        m = re.search(r'<title[^>]*>(.*?)</title>', str(page_or_html), re.IGNORECASE | re.DOTALL)
-        title = m.group(1) if m else None
-
-    if not title:
-        return "unknown_article"
-
-    for suffix in [
-        " - ScienceDirect", " - SpringerLink", " - Springer",
-        " | Nature", " | PNAS", " - Wiley Online Library",
-        " - PubMed", " - PubMed Central", " - PMC",
-        " | Oxford Academic", " - IEEE Xplore",
-    ]:
-        title = title.replace(suffix, "")
-
-    title = title.strip()
-    title = re.sub(r'[\\/*?:"<>|]', "_", title)
-    title = re.sub(r'\s+', ' ', title)
-    if len(title) > 120:
-        title = title[:120]
-    title = title.rstrip(". ")
-    return title or "unknown_article"
 
 
 def guess_filename_from_url(url):
@@ -304,7 +298,7 @@ def main():
         "google_search": False,
     }
     if cookies:
-        fetch_kwargs["cookies"] = cookies
+        fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
 
     page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
 

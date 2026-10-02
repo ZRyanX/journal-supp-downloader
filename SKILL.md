@@ -27,11 +27,15 @@ scrapling install
 
 ## 使用方法
 
+### 1. 轻量版下载器 (`scripts/journal_downloader.py`)
+
+适用于单篇快速抓取与 Cloudflare 绕过：
+
 ```bash
 python scripts/journal_downloader.py <url_or_doi> [-o output_dir] [options]
 ```
 
-### 基本示例
+#### 基本示例
 
 ```bash
 # 使用 DOI
@@ -47,10 +51,11 @@ python scripts/journal_downloader.py "<doi>" -o ./my_data
 python scripts/journal_downloader.py "<doi>" --list-only
 ```
 
-### 高级选项
+#### 常用参数
 
 | 参数 | 说明 |
 |------|------|
+| `-o`, `--output-dir` | 保存补充附件的输出目录（默认 `./downloads`） |
 | `--headful` | 显示浏览器窗口（非无头模式），用于调试 |
 | `--no-cloudflare` | 禁用 Cloudflare 绕过（对于无防护的网站） |
 | `--real-chrome` | 使用系统安装的 Chrome，而非 Chromium |
@@ -59,7 +64,7 @@ python scripts/journal_downloader.py "<doi>" --list-only
 | `--wait-selector` | 等待特定 CSS 选择器出现后再抓取 |
 | `--list-only` | 仅列出候选文件、URL、区块及匹配规则证据，不下载 |
 
-### 调试示例
+#### 调试示例
 
 ```bash
 # 显示浏览器窗口排查问题
@@ -68,6 +73,42 @@ python scripts/journal_downloader.py "<url>" --headful --no-cloudflare
 # 如果 Cloudflare 验证需要等待特定元素
 python scripts/journal_downloader.py "<url>" --wait-selector "#article-body"
 ```
+
+### 2. 集成版下载器 (`scripts/scansci_supp_downloader.py`)
+
+适用于高校/科研机构环境，多级加速（Elsevier API 直连 → CDN 极速探测 → WebVPN/Cookies 注入 → 浏览器动态渲染兜底）：
+
+```bash
+python scripts/scansci_supp_downloader.py <url_or_doi> [-o output_dir] [options]
+```
+
+#### 基本示例
+
+```bash
+# 校园网/VPN 下秒级下载（自动走 API/CDN）
+python scripts/scansci_supp_downloader.py "https://doi.org/10.1016/j.oregeorev.2022.104949"
+
+# 自定义输出目录
+python scripts/scansci_supp_downloader.py "<doi>" -o ./journal_downloads
+
+# 仅探测并输出诊断证据，不实际写入文件
+python scripts/scansci_supp_downloader.py "<doi>" --list-only
+```
+
+#### 常用参数
+
+| 参数 | 说明 |
+|------|------|
+| `url_or_doi` | 论文 DOI（如 `10.1016/...`）或着陆页完整 URL |
+| `-o`, `--output-dir` | 保存补充附件的输出目录（默认 `./journal_downloads`） |
+| `--no-api` | 跳过 Elsevier API 校园网直连层（Tier A） |
+| `--skip-cdn` | 跳过 Elsevier CDN 极速探测层（Tier 0） |
+| `--max-mmc` | CDN 探测扫描的最大 MMC 编号（默认 25） |
+| `--max-misses` | 连续未命中停止 CDN 探测的阈值（默认 4） |
+| `--no-vpn` | 禁用 WebVPN 代理转换与转链 |
+| `--no-cookies` | 禁用已保存凭据与 Cookies 注入 |
+| `--headful` | 抓取网页时显示真实浏览器窗口 |
+| `--list-only` | 仅输出发现的候选补充文件与诊断证据，不触发下载 |
 
 ## 认证与会话支持区分
 
