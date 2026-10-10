@@ -12,9 +12,12 @@ description: 使用 Scrapling 从学术期刊网站（Elsevier、Springer、Natu
 - **Cloudflare 绕过**：使用 Scrapling 的 `StealthyFetcher` 自动绕过 Cloudflare Turnstile/Interstitial 检测
 - **DOI 与重定向基址解析**：直接接受 DOI 链接，自动跟随重定向并以最终着陆页或 `<base>` 标签作为相对链接的基址，杜绝错误拼接到 `doi.org`
 - **全方位表格与附件识别**：支持 `Supplementary Table S1`、`Extended Data Table 1`、`补充表 S1`、`附表 1` 等中英文命名，覆盖连字符命名（如 `table-s1.pdf`）、`aria-label`、`title`、`download` 属性及按钮控件
+- **开放获取穿透直取（Tier OA）**：融合 Unpaywall REST API 与 OpenAlex API，一键查询全球合法开放获取镜像（如 PubMed Central / PMC、Europe PMC），遇到出版商付费墙或 Cloudflare 阻断时自动穿透至免认证的公开附表直取通道
+- **PubMed Central / PMC 专属提取**：专门适配 NCBI PMC 与 Europe PMC 结构，高保真解析 `/bin/` 附件路径、`click_feat_suppl` 与补充材料容器
 - **智能过滤与安全验证**：精准识别补充数据文件（xlsx、csv、zip、docx、pdf 附表等），自动排除正文插图（gr/ga/fx 等）、参考文献链接与外部导航；取消生硬的 1 KB 限制，以文件签名和内容校验为准，安全保留微型 CSV/表格
+- **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软开源 MarkItDown 将下载的 `.docx`、`.xlsx`、`.pdf`、`.zip` 自动解包生成 Markdown 副本（`.md`）及索引，完全保留原始数据文件
 - **自动组织与诊断证据**：按文章标题创建子文件夹，提供详细的候选发现规则与诊断原因
-- **边界说明**：本技能专注于下载**外部独立的补充数据文件与附件**（包括独立下载的 HTML 附表），**不提取或解析正文排版内的内联 HTML 表格**（正文内联表格请使用网页正文提取工具）。
+- **边界说明**：本技能专注于下载与管理**外部独立的补充数据文件与附件**（包括独立下载的 HTML 附表与原始数据包），**不提取或解析正文排版内的内联 HTML 表格**（正文内联表格请使用网页正文提取工具）。对于下载的数据文件，MarkItDown 作为可选副本生成器，绝不覆盖或损坏原始科研数据。
 
 ## 前置安装
 
@@ -63,6 +66,9 @@ python scripts/journal_downloader.py "<doi>" --list-only
 | `--timeout` | 页面加载超时毫秒数（默认 60000） |
 | `--wait-selector` | 等待特定 CSS 选择器出现后再抓取 |
 | `--list-only` | 仅列出候选文件、URL、区块及匹配规则证据，不下载 |
+| `--oa` | 优先/强制使用开放获取镜像穿透（PMC / Europe PMC） |
+| `--no-oa` | 禁用开放获取镜像穿透查询 |
+| `--convert-markdown` | 下载完成后，使用 MarkItDown 将附表与文档转为 Markdown 副本（`.md`） |
 
 #### 调试示例
 
@@ -109,6 +115,9 @@ python scripts/scansci_supp_downloader.py "<doi>" --list-only
 | `--no-cookies` | 禁用已保存凭据与 Cookies 注入 |
 | `--headful` | 抓取网页时显示真实浏览器窗口 |
 | `--list-only` | 仅输出发现的候选补充文件与诊断证据，不触发下载 |
+| `--oa` | 优先/强制使用开放获取镜像穿透（PMC / Europe PMC） |
+| `--no-oa` | 禁用开放获取镜像穿透查询 |
+| `--convert-markdown` | 下载完成后，使用 MarkItDown 将附表与文档转为 Markdown 副本（`.md`） |
 
 ## 认证与会话支持区分
 
@@ -172,6 +181,8 @@ python scripts/login_publishers.py
 | 脚本 | 说明 |
 |------|------|
 | `scripts/supp_finder.py` | 统一的补充附件与表格候选识别、证据记录及文件验证模块 |
+| `scripts/oa_resolver.py` | Unpaywall & OpenAlex 开放获取（OA）穿透直取与 PMC 镜像解析模块（支持 CLI 独立查询：`python scripts/oa_resolver.py <doi>`） |
+| `scripts/markitdown_converter.py` | 微软 MarkItDown 附表多格式智能转 Markdown 模块（支持 CLI 独立转换：`python scripts/markitdown_converter.py <dir_or_file>`） |
 | `scripts/journal_downloader.py` | 基础轻量版页面分析与下载器（Scrapling StealthyFetcher + Cookie 复用） |
 | `scripts/scansci_supp_downloader.py` | 高级集成版下载器（API/CDN/Cookie 多级策略 + 完整性动态渲染） |
 | `scripts/login_publishers.py` | 出版社登录与 Cookie 配置向导 |

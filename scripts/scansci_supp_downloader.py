@@ -82,6 +82,9 @@ try:
 except ImportError:
     normalize_playwright_cookies = lambda c: c
 
+from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
+from markitdown_converter import convert_directory_supplements, is_markitdown_available
+
 # Try importing scrapling
 try:
     from scrapling.fetchers import Fetcher, StealthyFetcher
@@ -203,6 +206,16 @@ def resolve_doi_url(doi_or_url):
             if r.url and r.url.startswith("http") and "doi.org" not in r.url:
                 print(f"  [scrapling] Resolved to: {r.url}")
                 return r.url
+        except Exception:
+            pass
+
+    # Method 4.5: Unpaywall & OpenAlex API resolution (fast, authoritative)
+    if doi and is_doi(doi):
+        try:
+            oa_res = resolve_oa_info(doi, timeout=8)
+            if oa_res and oa_res.publisher_url and "doi.org" not in oa_res.publisher_url:
+                print(f"  [oa_resolver:{oa_res.source}] Resolved to: {oa_res.publisher_url}")
+                return oa_res.publisher_url
         except Exception:
             pass
 
@@ -923,16 +936,28 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config):
     print("\n  Checking for additional supplements via page scrape...")
     _try_page_scrape_supplements(url, article_dir, config, args, files)
 
+    if getattr(args, "convert_markdown", False):
+        print("\n  [Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
+        converted = convert_directory_supplements(article_dir)
+        print(f"  Converted {len(converted)} file(s) to Markdown sidecars.")
+
 
 def _quick_title_lookup(doi, url):
-    """Try to get article title from CrossRef API (fast, no auth)."""
+    """Try to get article title from Unpaywall / OpenAlex / CrossRef APIs (fast, no auth)."""
     try:
-        doi_clean = doi if doi.startswith("10.") else ""
-        if not doi_clean:
-            m = re.search(r"10\.\d{4,}/[^\s?&]+", url)
-            if m:
-                doi_clean = m.group(0)
+        doi_clean = extract_doi(doi) or extract_doi(url)
         if doi_clean:
+            # First check Unpaywall & OpenAlex
+            oa_res = resolve_oa_info(doi_clean, timeout=6)
+            if oa_res and oa_res.title:
+                clean_title = html.unescape(oa_res.title)
+                clean_title = re.sub(r'[\\/*?:"<>|]', "_", clean_title)
+                clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+                if len(clean_title) > 120:
+                    clean_title = clean_title[:120]
+                return clean_title
+
+            # Fallback to CrossRef API
             resp = requests.get(
                 f"https://api.crossref.org/works/{doi_clean}",
                 timeout=10,
@@ -1058,6 +1083,9 @@ def main():
     parser.add_argument("--max-mmc", type=int, default=25, help="Max mmc number to scan in CDN brute-force (default: 25)")
     parser.add_argument("--max-misses", type=int, default=4, help="Max consecutive misses before stopping CDN probe (default: 4)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
+    parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
+    parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
+    parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
 
     config = load_config() if HAS_SCANSCI else {}
@@ -1202,6 +1230,40 @@ def main():
                     print(f"  Updated Title:  {article_dirname}")
                     print(f"  Updated Folder: {article_dir}")
 
+    # Tier OA Penetration: If still no candidates or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
+    doi_val = (
+        extract_doi(args.url_or_doi)
+        or extract_doi(url)
+        or extract_doi(effective_base)
+        or extract_doi_from_html(html_content)
+    )
+    if (not candidates or args.oa) and not getattr(args, "no_oa", False) and doi_val:
+        print(f"  Attempting Open Access penetration for DOI {doi_val} (Unpaywall & OpenAlex)...")
+        oa_info = resolve_oa_info(doi_val)
+        if oa_info and oa_info.oa_landing_urls:
+            print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
+            for oa_url in oa_info.oa_landing_urls:
+                print(f"  Trying OA mirror: {oa_url} ...")
+                oa_html, oa_status, oa_final = fetch_page_html(oa_url, session, play_cookies, args.headful)
+                if oa_html:
+                    oa_base = extract_effective_base_url(oa_html, oa_final or oa_url)
+                    oa_diag = find_all_candidates(oa_html, oa_base, original_url=oa_url)
+                    if oa_diag.candidates:
+                        print(f"  ✓ Open Access penetration success! Found {len(oa_diag.candidates)} supplementary file(s) via {oa_url}")
+                        seen_urls = {c.url for c in candidates}
+                        new_cands = [c for c in oa_diag.candidates if c.url not in seen_urls]
+                        if args.oa:
+                            candidates = new_cands + [c for c in candidates if c.url not in {x.url for x in new_cands}]
+                        else:
+                            candidates.extend(new_cands)
+                        if not candidates:
+                            candidates = list(oa_diag.candidates)
+                        diag = oa_diag
+                        url = oa_final or oa_url
+                        effective_base = oa_base
+                        html_content = oa_html
+                        break
+
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
             page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
@@ -1293,6 +1355,12 @@ def main():
 
     total_target = len(candidates) + len(extra_cdn_files)
     print(f"\n✓ Done: {success_count}/{total_target} files downloaded to {os.path.abspath(article_dir)}")
+
+    # Step 5: Optional MarkItDown conversion
+    if getattr(args, "convert_markdown", False):
+        print("\n  [Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
+        converted = convert_directory_supplements(article_dir)
+        print(f"  Converted {len(converted)} file(s) to Markdown sidecars.")
 
 
 if __name__ == "__main__":

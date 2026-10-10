@@ -1574,6 +1574,94 @@ class TestCodebaseAuditFixes(unittest.TestCase):
                 self.assertIn("local_cookie", names)
                 self.assertIn("profile_cookie", names)
 
+    # ── 12. PubMed Central (PMC) & Europe PMC Supplementary Extraction ──────
+
+    def test_pmc_supplementary_section_and_bin_links(self):
+        """PMC supplementary sections and /bin/ binary downloads must be extracted."""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head><title>PMC Test Article</title></head>
+        <body>
+            <section id="sec8">
+                <h2 class="pmc_sec_title">Supplementary information</h2>
+                <section class="supplementary-materials">
+                    <div class="media p">
+                        <a href="/articles/instance/7759461/bin/41586_2020_2649_MOESM1_ESM.pdf"
+                           data-ga-action="click_feat_suppl" class="usa-link">
+                            <span>Supplementary Information</span>
+                        </a>
+                        <p>This file contains Supplementary Methods and Figures.</p>
+                    </div>
+                    <div class="media p">
+                        <a href="/articles/instance/7759461/bin/supp_table_1.xlsx">
+                            <span>Supplementary Table 1</span>
+                        </a>
+                    </div>
+                </section>
+            </section>
+        </body>
+        </html>
+        """
+        landing_url = "https://pmc.ncbi.nlm.nih.gov/articles/PMC7759461/"
+        diag = find_all_candidates(html, base_url=landing_url)
+        urls = [c.url for c in diag.candidates]
+        fnames = [c.filename for c in diag.candidates]
+
+        self.assertEqual(len(diag.candidates), 2)
+        self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/instance/7759461/bin/41586_2020_2649_MOESM1_ESM.pdf", urls)
+        self.assertIn("https://pmc.ncbi.nlm.nih.gov/articles/instance/7759461/bin/supp_table_1.xlsx", urls)
+        self.assertIn("41586_2020_2649_MOESM1_ESM.pdf", fnames)
+        self.assertIn("supp_table_1.xlsx", fnames)
+
+    def test_europepmc_supplementary_links(self):
+        """Europe PMC binary supplementary links must be extracted."""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head><title>Europe PMC Article</title></head>
+        <body>
+            <div class="supplementary-material">
+                <a href="/articles/PMC12345/bin/Supp_Data_S1.docx">Supplementary Data S1</a>
+            </div>
+        </body>
+        </html>
+        """
+        landing_url = "https://europepmc.org/article/PMC/12345"
+        diag = find_all_candidates(html, base_url=landing_url)
+        self.assertEqual(len(diag.candidates), 1)
+        self.assertEqual(diag.candidates[0].url, "https://europepmc.org/articles/PMC12345/bin/Supp_Data_S1.docx")
+        self.assertEqual(diag.candidates[0].filename, "Supp_Data_S1.docx")
+
+    def test_pmc_excludes_article_figures_and_anchors(self):
+        """PMC parser must strictly exclude main-text figures (Fig1_HTML, gr1, fx1) and anchors."""
+        html = """
+        <!DOCTYPE html>
+        <html>
+        <head><title>PMC Mixed Content</title></head>
+        <body>
+            <div class="supplementary-material">
+                <a href="/articles/PMC12345/bin/Supp_Table_S1.xlsx">Supplementary Table S1</a>
+                <a href="#sec8">Back to section 8</a>
+                <a href="https://doi.org/10.1038/s41586-ref">External Reference</a>
+            </div>
+            <!-- Main-text figures often placed in /bin/ in PMC -->
+            <div class="figure">
+                <a href="/articles/PMC12345/bin/41586_2020_2649_Fig1_HTML.jpg">Figure 1 Overview</a>
+                <a href="/articles/PMC12345/bin/figure_2.png">Figure 2</a>
+                <a href="/articles/PMC12345/bin/gr1.jpg">Graphical Abstract</a>
+                <a href="/articles/PMC12345/bin/fx1.jpg">Figure FX1</a>
+            </div>
+        </body>
+        </html>
+        """
+        landing_url = "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345/"
+        diag = find_all_candidates(html, base_url=landing_url)
+        # ONLY Supp_Table_S1.xlsx should be extracted!
+        self.assertEqual(len(diag.candidates), 1)
+        self.assertEqual(diag.candidates[0].filename, "Supp_Table_S1.xlsx")
+        self.assertEqual(diag.candidates[0].url, "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345/bin/Supp_Table_S1.xlsx")
+
 
 if __name__ == "__main__":
     unittest.main()

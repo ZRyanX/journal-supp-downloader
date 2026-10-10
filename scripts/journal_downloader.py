@@ -57,6 +57,9 @@ try:
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
 
+from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
+from markitdown_converter import convert_directory_supplements, is_markitdown_available
+
 
 def load_saved_cookies():
     """Load saved cookies from local cookies.json and login_publishers.py profile."""
@@ -258,6 +261,18 @@ def main():
         "--list-only", action="store_true",
         help="Only list found links with diagnostic evidence, don't download"
     )
+    parser.add_argument(
+        "--oa", action="store_true",
+        help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex"
+    )
+    parser.add_argument(
+        "--no-oa", action="store_true",
+        help="Disable automatic Open Access repository mirror query and penetration"
+    )
+    parser.add_argument(
+        "--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true",
+        help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown"
+    )
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -351,6 +366,58 @@ def main():
         except Exception:
             pass
 
+    # Open Access repository mirror fallback (Unpaywall & OpenAlex)
+    doi_val = (
+        extract_doi(input_target)
+        or extract_doi(final_url)
+        or extract_doi(effective_base)
+        or extract_doi_from_html(html_content)
+    )
+    if (not candidates or args.oa) and not args.no_oa and doi_val:
+        print(f"\n  [OA Penetration] Checking Open Access repositories for DOI {doi_val} (Unpaywall & OpenAlex)...")
+        oa_info = resolve_oa_info(doi_val)
+        if oa_info and oa_info.oa_landing_urls:
+            print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
+            for oa_url in oa_info.oa_landing_urls:
+                print(f"  [OA Mirror] Probing: {oa_url} ...")
+                oa_html = ""
+                oa_base = oa_url
+                # 1. Fast HTTP first (open repositories like PMC rarely require full browser rendering)
+                try:
+                    oa_resp = Fetcher.get(oa_url, stealthy_headers=True, timeout=20000)
+                    if oa_resp.status < 400 and oa_resp.text:
+                        oa_html = oa_resp.text
+                        oa_base = extract_effective_base_url(oa_html, getattr(oa_resp, "url", None) or oa_url)
+                except Exception:
+                    pass
+
+                # 2. Browser fallback without publisher wait_selector or cookies
+                if not oa_html:
+                    try:
+                        oa_fetch_kwargs = dict(fetch_kwargs)
+                        oa_fetch_kwargs.pop("wait_selector", None)
+                        oa_fetch_kwargs.pop("cookies", None)
+                        oa_page = StealthyFetcher.fetch(oa_url, **oa_fetch_kwargs)
+                        oa_html = str(oa_page.html_content)
+                        oa_base = extract_effective_base_url(oa_html, getattr(oa_page, "url", None) or oa_url)
+                    except Exception as e:
+                        print(f"  [OA Mirror] Fetch failed for {oa_url}: {e}")
+
+                if oa_html:
+                    oa_diag = find_all_candidates(oa_html, oa_base, original_url=oa_url)
+                    if oa_diag.candidates:
+                        print(f"  [OA Success] Discovered {len(oa_diag.candidates)} supplementary file(s) via {oa_url}!")
+                        existing_urls = {c.url for c in candidates}
+                        new_cands = [c for c in oa_diag.candidates if c.url not in existing_urls]
+                        if args.oa:
+                            candidates = new_cands + [c for c in candidates if c.url not in {x.url for x in new_cands}]
+                        else:
+                            candidates.extend(new_cands)
+                        if not candidates:
+                            candidates = list(oa_diag.candidates)
+                        diag = oa_diag
+                        break
+
     if not candidates:
         print("  No supplementary data links found.")
         if diag.is_incomplete:
@@ -385,6 +452,12 @@ def main():
             success += 1
 
     print(f"\nDone: {success}/{len(candidates)} files downloaded to {os.path.abspath(article_dir)}")
+
+    # --- Step 4: Optional MarkItDown conversion ---
+    if args.convert_markdown:
+        print("\n[Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
+        converted = convert_directory_supplements(article_dir)
+        print(f"Converted {len(converted)} file(s) to Markdown sidecars.")
 
 
 if __name__ == "__main__":

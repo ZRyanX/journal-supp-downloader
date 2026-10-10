@@ -24,10 +24,12 @@
 * **多级下载策略 (Multi-Tier)**：
   - **Tier A**：Elsevier API 检索（极速，需 API 密钥与机构网络，约 3 秒）。
   - **Tier 0**：Elsevier CDN 暴力匹配（无需任何认证，约 1 秒/文件）。
+  - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，突破付费墙与反爬限制秒级提取附表）。
   - **Tier 1**：期刊直接链接下载（基于 Requests 会话，带 Cookie）。
   - **Tier 2**：Scrapling 浏览器渲染（自动绕过 Cloudflare Turnstile/验证码，约 15 秒）。
 * **智能过滤**：自动识别真实的数据文件（排除插图 `gr1.jpg`、参考文献、页面广告等）。
-* **自动重命名与归档**：使用 CrossRef API 自动查询文献标题并规范化命名文件夹，将所有附件统一整理。
+* **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软 MarkItDown 将下载的附表（`.docx`, `.xlsx`, `.pdf`）一键解包转换为 Markdown 副本及摘要索引，100% 保护原始科研数据完整性。
+* **自动重命名与归档**：使用 Unpaywall / OpenAlex / CrossRef API 自动查询文献标题并规范化命名文件夹，将所有附件统一整理。
 
 ---
 
@@ -170,13 +172,17 @@ journal-supp-downloader/
 ├── requirements.txt           # 依赖清单
 ├── scripts/
 │   ├── supp_finder.py         # 统一补充附件与表格候选识别、证据链与文件验证模块
+│   ├── oa_resolver.py         # Unpaywall & OpenAlex 开放获取（OA）穿透直取与 PMC 镜像解析
+│   ├── markitdown_converter.py# 微软 MarkItDown 附表多格式智能转 Markdown 模块（可选）
 │   ├── journal_downloader.py  # 基础页面分析与轻量下载器 (Scrapling)
-│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/Cookie 多级加速)
+│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/OA/Cookie 多级加速)
 │   ├── login_publishers.py    # 出版社登录与 Cookie 配置向导
 │   ├── test_api.py            # API 认证连通性测试脚本
 │   └── test_fetch.py          # 校园网直连与附件解析测试脚本
 ├── tests/
-│   └── test_supp_finder.py    # 自动化单元与回归测试集 (83 tests)
+│   ├── test_supp_finder.py    # 补充附件提取测试集 (85 tests)
+│   ├── test_oa_resolver.py    # Unpaywall / OpenAlex 开放获取测试集 (7 tests)
+│   └── test_markitdown_converter.py # MarkItDown 结构转换测试集 (4 tests)
 └── scansci-pdf/               # 内置的核心 PDF 下载与配置引擎
 ```
 
@@ -213,6 +219,9 @@ A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚�
 | **urllib3** | HTTP 连接池与底层网络传输 | [https://github.com/urllib3/urllib3](https://github.com/urllib3/urllib3) |
 | **Elsevier API** | 文章元数据检索、补充附件索引（Tier A 加速） | [https://dev.elsevier.com/](https://dev.elsevier.com/) |
 | **CrossRef API** | DOI 解析与文献标题规范化查询 | [https://github.com/CrossRef](https://github.com/CrossRef) |
+| **Unpaywall API** | 全球开放获取（OA）穿透与合法仓储元数据查询 | [https://unpaywall.org/products/api](https://unpaywall.org/products/api) |
+| **OpenAlex API** | 全球学术开放目录与仓储全文镜像检索 | [https://docs.openalex.org/](https://docs.openalex.org/) |
+| **Microsoft MarkItDown** | 微软多格式科研附表智能转 Markdown 工具 | [https://github.com/microsoft/markitdown](https://github.com/microsoft/markitdown) |
 | **pycryptodome** | 加密工具库（scansci-pdf 依赖） | [https://github.com/Legrandin/pycryptodome](https://github.com/Legrandin/pycryptodome) |
 | **Selenium** | 备用浏览器驱动（scansci-pdf 内部使用） | [https://github.com/SeleniumHQ/selenium](https://github.com/SeleniumHQ/selenium) |
 | **Zotero Table Extractor** | 学术正文表格提取技能；正在优化，暂未公开 | [https://github.com/ZRyanX/zotero-table-extractor](https://github.com/ZRyanX/zotero-table-extractor) |

@@ -170,9 +170,9 @@ EXCLUDE_URL_PATTERNS = [
     r"doi\.org/10\.\d+/",  # DOI links to other articles (references)
 ]
 
-# Article figures to exclude (gr1, ga1, fx1, etc.) (C2)
+# Article figures to exclude (gr1, ga1, fx1, fig1, figure_1, etc.) (C2)
 ARTICLE_FIGURE_PATTERN = re.compile(
-    r"(?:^|[\W_])(?:gr|ga|fx)\d+[a-z]?(?:[-_](?:lrg|sml|large|small|preview|highres)|\.(?:jpe?g|png|gif|tif|tiff|webp|svg)|$|\?)",
+    r"(?:^|[\W_])(?:gr|ga|fx|fig|figure)[-_]?\d+[a-z]?(?:[-_](?:lrg|sml|large|small|preview|highres|html)|\.(?:jpe?g|png|gif|tif|tiff|webp|svg)|$|\?)",
     re.IGNORECASE,
 )
 
@@ -268,11 +268,16 @@ def is_excluded_url(url: str, base_url: str = "") -> bool:
 
 
 def is_article_figure_url(url: str) -> bool:
-    """Check if a URL is an article figure (gr1, ga1, fx1, etc.). Never flags data files (C2)."""
+    """Check if a URL is an article figure (gr1, ga1, fx1, fig1, etc.). Never flags data files or supps (C2)."""
     if not url:
         return False
-    # Supplementary data files, MMCs, or table files are never article figures
-    if check_data_extension(url) or MMC_PATTERN.search(url) or TABLE_FILENAME_PATTERN.search(url):
+    # Supplementary data files, MMCs, table files, or explicit supp keywords are never article figures
+    if (
+        check_data_extension(url)
+        or MMC_PATTERN.search(url)
+        or TABLE_FILENAME_PATTERN.search(url)
+        or SUPP_KEYWORD_PATTERN.search(url)
+    ):
         return False
     return bool(ARTICLE_FIGURE_PATTERN.search(url))
 
@@ -829,6 +834,12 @@ def should_match_candidate(
     if re.search(r'/s\d+/?$', path_lower):
         return True, "mdpi_supp_path"
 
+    # Case H: NCBI / PMC / Europe PMC binary attachment link (/bin/ or click_feat_suppl)
+    if ("/bin/" in path_lower or "/bin/" in url_lower) and any(d in url_lower for d in ["ncbi.nlm.nih.gov", "pmc", "europepmc"]):
+        if is_article_figure_url(url):
+            return False, ""
+        return True, "pmc_bin_attachment"
+
     return False, ""
 
 
@@ -987,6 +998,10 @@ def find_all_candidates(
     if "plos.org" in effective_base:
         _extract_plos_candidates(soup, effective_base, add_candidate)
 
+    # NCBI / PMC / Europe PMC supplementary files
+    if any(d in effective_base for d in ["ncbi.nlm.nih.gov", "pmc.ncbi.nlm.nih.gov", "europepmc.org"]):
+        _extract_pmc_candidates(soup, effective_base, add_candidate)
+
     # Embedded JSON data structures (Next.js / Nuxt / Publisher JSON payloads)
     _extract_embedded_json_candidates(soup, effective_base, add_candidate)
 
@@ -1104,6 +1119,70 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
             section="plos_supplement",
             match_rule="plos_article_file_action",
         ))
+
+
+def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
+    """PMC (PubMed Central) and Europe PMC supplementary material extraction."""
+    # 1. Links inside PMC supplementary sections
+    for sec in soup.find_all(
+        lambda t: t.name in ["section", "div"]
+        and any(
+            c in " ".join(t.get("class", [])).lower()
+            for c in ["supplementary-materials", "supplementary-material", "suppl-data", "suppl-mat", "sm xbox"]
+        )
+    ):
+        for a in sec.find_all(["a", "button"]):
+            target = extract_target_url_from_tag(a)
+            if not target:
+                continue
+            full_url = urllib.parse.urljoin(base_url, target)
+            if is_excluded_url(full_url, base_url=base_url) or is_article_figure_url(full_url):
+                continue
+            link_text = a.get_text(separator=" ", strip=True)
+            fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
+            add_func(Candidate(
+                url=full_url,
+                filename=sanitize_filename(fname),
+                link_text=link_text,
+                section="pmc_supplementary_section",
+                match_rule="pmc_supp_section_link",
+                source_tag=a.name,
+            ))
+
+    # 2. Direct binary links (/bin/ or click_feat_suppl)
+    for a in soup.find_all("a", href=re.compile(r"/bin/", re.IGNORECASE)):
+        href = a.get("href")
+        full_url = urllib.parse.urljoin(base_url, href)
+        if is_excluded_url(full_url, base_url=base_url) or is_article_figure_url(full_url):
+            continue
+        link_text = a.get_text(separator=" ", strip=True)
+        fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
+        add_func(Candidate(
+            url=full_url,
+            filename=sanitize_filename(fname),
+            link_text=link_text,
+            section="pmc_bin_attachment",
+            match_rule="pmc_bin_link",
+            source_tag=a.name,
+        ))
+
+    # 3. Attributes specific to PMC
+    for a in soup.find_all("a", attrs={"data-ga-action": re.compile(r"click_(?:feat_)?suppl", re.IGNORECASE)}):
+        href = a.get("href")
+        if href:
+            full_url = urllib.parse.urljoin(base_url, href)
+            if is_excluded_url(full_url, base_url=base_url) or is_article_figure_url(full_url):
+                continue
+            link_text = a.get_text(separator=" ", strip=True)
+            fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
+            add_func(Candidate(
+                url=full_url,
+                filename=sanitize_filename(fname),
+                link_text=link_text,
+                section="pmc_featured_suppl",
+                match_rule="pmc_feat_suppl_link",
+                source_tag=a.name,
+            ))
 
 
 def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func):
