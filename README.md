@@ -224,5 +224,5 @@ A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚�
 | **Microsoft MarkItDown** | 微软多格式科研附表智能转 Markdown 工具 | [https://github.com/microsoft/markitdown](https://github.com/microsoft/markitdown) |
 | **pycryptodome** | 加密工具库（scansci-pdf 依赖） | [https://github.com/Legrandin/pycryptodome](https://github.com/Legrandin/pycryptodome) |
 | **Selenium** | 备用浏览器驱动（scansci-pdf 内部使用） | [https://github.com/SeleniumHQ/selenium](https://github.com/SeleniumHQ/selenium) |
-| **Zotero Table Extractor** | 学术正文表格提取技能；正在优化，暂未公开 | [https://github.com/ZRyanX/zotero-table-extractor](https://github.com/ZRyanX/zotero-table-extractor) |
+| **Zotero Table Extractor** | 学术正文表格提取技能；正在持续优化中 | [https://github.com/ZRyanX/zotero-table-extractor](https://github.com/ZRyanX/zotero-table-extractor) |
 
