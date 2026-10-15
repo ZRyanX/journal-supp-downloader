@@ -9,9 +9,10 @@ import sys as _sys
 # through the proxy tunnel, but the proxy's SSL context fails to verify real
 # server certs. We disable proxy usage project-wide so HTTPS goes direct.
 
-# 1. Block proxy usage (must run unconditionally, before any other import)
-_os.environ["NO_PROXY"] = "*"
-_os.environ["no_proxy"] = "*"
+# 1. Block proxy usage only if explicitly configured (avoids clobbering user proxy)
+if _os.environ.get("SCANSCI_DISABLE_PROXY", "").lower() in ("1", "true", "yes"):
+    _os.environ["NO_PROXY"] = "*"
+    _os.environ["no_proxy"] = "*"
 
 def _fix_ssl_cert_file() -> None:
     _cert_file = _os.environ.get("SSL_CERT_FILE", "")

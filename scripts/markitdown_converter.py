@@ -19,7 +19,8 @@ from typing import List, Optional, Tuple
 
 CONVERTIBLE_EXTENSIONS = {
     ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
-    ".pdf", ".csv", ".tsv", ".json", ".xml", ".zip"
+    ".pdf", ".csv", ".tsv", ".json", ".xml", ".zip",
+    ".html", ".htm",
 }
 
 
@@ -30,6 +31,9 @@ IGNORED_FILENAMES = {
     "package.json",
     "supplements_markdown_summary.md",
 }
+
+# Maximum single file size allowed for full markdown conversion (25 MB)
+MAX_CONVERTIBLE_FILE_SIZE = 25 * 1024 * 1024
 
 
 def is_markitdown_available() -> bool:
@@ -57,6 +61,8 @@ def convert_file_to_markdown(
     output_path: Optional[str] = None,
     llm_client=None,
     llm_model: Optional[str] = None,
+    converter=None,
+    max_file_size_bytes: int = MAX_CONVERTIBLE_FILE_SIZE,
 ) -> Optional[str]:
     """
     Convert a single downloaded supplementary file to Markdown.
@@ -66,6 +72,8 @@ def convert_file_to_markdown(
         output_path: Optional destination path for .md output. If None, saves as <input_path>.md.
         llm_client: Optional LLM client for MarkItDown image/document description.
         llm_model: Optional LLM model name.
+        converter: Optional pre-instantiated MarkItDown instance to avoid repeated setup.
+        max_file_size_bytes: Threshold to skip giant datasets/archives from memory blowout.
 
     Returns:
         The markdown text on success, or None if conversion failed or markitdown is not installed.
@@ -77,15 +85,27 @@ def convert_file_to_markdown(
         print("  [markitdown] Note: 'markitdown' is not installed. Run 'pip install markitdown' to enable Markdown conversion.")
         return None
 
+    # Guard against huge scientific packages / raw archives blowing up memory
     try:
-        from markitdown import MarkItDown
-        kwargs = {}
-        if llm_client:
-            kwargs["llm_client"] = llm_client
-            if llm_model:
-                kwargs["llm_model"] = llm_model
+        file_size = os.path.getsize(input_path)
+        if file_size > max_file_size_bytes:
+            print(f"  [markitdown] Notice: Skipping {os.path.basename(input_path)} ({file_size / (1024*1024):.1f} MB > {max_file_size_bytes / (1024*1024):.0f} MB limit) to prevent memory exhaustion.")
+            return None
+    except Exception:
+        pass
 
-        md = MarkItDown(**kwargs)
+    try:
+        if converter is not None:
+            md = converter
+        else:
+            from markitdown import MarkItDown
+            kwargs = {}
+            if llm_client:
+                kwargs["llm_client"] = llm_client
+                if llm_model:
+                    kwargs["llm_model"] = llm_model
+            md = MarkItDown(**kwargs)
+
         result = md.convert(input_path)
         content = result.text_content if hasattr(result, "text_content") else str(result)
 
@@ -122,6 +142,14 @@ def convert_directory_supplements(
         print("  [markitdown] Notice: 'markitdown' library not installed. Skipping markdown conversion.")
         return []
 
+    # Reuse a single MarkItDown instance across the batch to avoid repeated initialization
+    shared_converter = None
+    try:
+        from markitdown import MarkItDown
+        shared_converter = MarkItDown()
+    except Exception:
+        shared_converter = None
+
     converted: List[Tuple[str, str]] = []
     summary_entries: List[str] = []
 
@@ -150,7 +178,7 @@ def convert_directory_supplements(
                     text = None
             else:
                 print(f"  [markitdown] Converting {fname} -> {os.path.basename(out_md)} ...")
-                text = convert_file_to_markdown(fpath, output_path=out_md)
+                text = convert_file_to_markdown(fpath, output_path=out_md, converter=shared_converter)
 
             if text is not None:
                 converted.append((fpath, out_md))

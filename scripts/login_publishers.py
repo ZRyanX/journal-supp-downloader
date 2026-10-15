@@ -29,7 +29,7 @@ try:
     from playwright_utils import find_playwright_chromium, normalize_playwright_cookies
 except ImportError:
     find_playwright_chromium = lambda: None
-    normalize_playwright_cookies = lambda c: c
+    normalize_playwright_cookies = lambda c, default_url=None: c
 
 
 def save_merged_cookies(new_cookies, output_path):

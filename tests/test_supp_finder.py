@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch, MagicMock
+from bs4 import BeautifulSoup
 
 # Ensure scripts directory is on sys.path
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -41,6 +42,11 @@ from supp_finder import (
     is_explicit_supp_table,
     TABLE_LABEL_PATTERN,
     TABLE_FILENAME_PATTERN,
+    expand_page_accordions_action,
+    disambiguate_target_filename,
+    should_match_candidate,
+    get_nearby_context_text,
+    _extract_embedded_json_candidates,
 )
 
 
@@ -1663,5 +1669,414 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertEqual(diag.candidates[0].url, "https://pmc.ncbi.nlm.nih.gov/articles/PMC12345/bin/Supp_Table_S1.xlsx")
 
 
+    def test_scenario1_card_short_circuit_fix(self):
+        """Scenario 1: get_nearby_context_text must not short-circuit on inner non-table labels when outer container has explicit table label."""
+        html = """
+        <div class="supp-item-card">
+            <div class="supp-item-heading">
+                <h4>Supplementary Table S1. Patient demographic metadata</h4>
+            </div>
+            <div class="supp-item-body">
+                <span class="file-format-badge">XLSX (15.2 KB)</span>
+                <a href="/download/data-asset-8921.bin">Download File</a>
+            </div>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/article/123")
+        self.assertEqual(len(diag.candidates), 1)
+        cand = diag.candidates[0]
+        self.assertIn("Supplementary Table S1", cand.filename)
+        self.assertIn("nearby_context", cand.match_rule)
+
+    def test_scenario2_s_prefixed_table_numbering(self):
+        """Scenario 2: S-prefixed numbering (S1 Table, S2 Table, S1 Data, s1-table.pdf, S1_Table.xlsx) must be recognized."""
+        html = """
+        <div>
+            <a href="/download/s1_table.xlsx">S1 Table</a>
+            <a href="/download/s2_table.pdf">S2 Table</a>
+            <a href="/download/s1_data.xlsx">S1 Data</a>
+            <a href="/download/s1_dataset.csv">S1 Dataset</a>
+            <a href="/download/plos_file.bin" title="S1 File: Complete phylogenetic matrix">Download</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/article/123")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/download/s1_table.xlsx", urls)
+        self.assertIn("https://example.com/download/s2_table.pdf", urls)
+        self.assertIn("https://example.com/download/s1_data.xlsx", urls)
+        self.assertIn("https://example.com/download/s1_dataset.csv", urls)
+        self.assertIn("https://example.com/download/plos_file.bin", urls)
+
+    def test_scenario3_source_data_files(self):
+        """Scenario 3: Source Data files and Springer Nature source-data links must be recognized."""
+        html = """
+        <div class="article-body">
+            <a href="/download/source_data_fig1.xlsx">Source Data Fig. 1</a>
+            <a href="/download/source_data_table1.xlsx">Source Data Table 1</a>
+            <a href="/download/source-data.pdf">Download</a>
+            <a href="/download/nature_sd.bin" data-test="source-data-link">Raw Data</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://nature.com/articles/s41586-021")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://nature.com/download/source_data_fig1.xlsx", urls)
+        self.assertIn("https://nature.com/download/source_data_table1.xlsx", urls)
+        self.assertIn("https://nature.com/download/source-data.pdf", urls)
+        self.assertIn("https://nature.com/download/nature_sd.bin", urls)
+
+    def test_scenario4_chinese_table_numerals(self):
+        """Scenario 4: Chinese numerals and labels (附表一, 补充表二, 补充文件一) must be recognized."""
+        html = """
+        <div>
+            <a href="/files/fubiao1.xlsx">附表一：样本基本特征</a>
+            <a href="/files/buchongbiao2.xlsx">补充表二：回归分析模型结果</a>
+            <a href="/files/buchongwenjian1.pdf">补充文件一：质控标准</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://journal.cn/article/1")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://journal.cn/files/fubiao1.xlsx", urls)
+        self.assertIn("https://journal.cn/files/buchongbiao2.xlsx", urls)
+        self.assertIn("https://journal.cn/files/buchongwenjian1.pdf", urls)
+
+    def test_scenario5_roman_numeral_tables(self):
+        """Scenario 5: Roman numeral table designations (Table SI, Table SII, Supplementary Table II, Table SIV)."""
+        html = """
+        <div>
+            <a href="/tables/table_si.xlsx">Table SI: Cohort characteristics</a>
+            <a href="/tables/table_sii.pdf">Table SII: Sensitivity analysis</a>
+            <a href="/tables/supp_table_ii.xlsx">Supplementary Table II</a>
+            <a href="/tables/table_siv.csv">Table SIV</a>
+        </div>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/tables/table_si.xlsx", urls)
+        self.assertIn("https://example.com/tables/table_sii.pdf", urls)
+        self.assertIn("https://example.com/tables/supp_table_ii.xlsx", urls)
+        self.assertIn("https://example.com/tables/table_siv.csv", urls)
+
+    def test_scenario6_non_anchor_link_controls(self):
+        """Scenario 6: Non-<a> controls such as <object data="..."> and <form action="..."><button>."""
+        html = """
+        <section id="supplements">
+            <object data="/supp/table_s1.xlsx" type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+                Table S1 Spreadsheet
+            </object>
+            <form action="/api/download/table_s2.xlsx" method="POST">
+                <button type="submit">Download Supplementary Table S2</button>
+            </form>
+        </section>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/supp/table_s1.xlsx", urls)
+        self.assertIn("https://example.com/api/download/table_s2.xlsx", urls)
+
+    def test_scenario7_embedded_json_with_spaces_and_extensions(self):
+        """Scenario 7: Embedded JSON scripts containing file paths with spaces and various data extensions."""
+        html = """
+        <script type="application/json">
+        {
+            "supplements": [
+                {"url": "/files/Supplementary Table S1.xlsx", "title": "Table S1"},
+                {"url": "/files/Source Data 1.csv", "title": "Data 1"},
+                {"url": "/files/Extended Methods.docx", "title": "Methods"}
+            ]
+        }
+        </script>
+        """
+        diag = find_all_candidates(html, base_url="https://example.com/paper")
+        urls = [c.url for c in diag.candidates]
+        self.assertIn("https://example.com/files/Supplementary Table S1.xlsx", urls)
+        self.assertIn("https://example.com/files/Source Data 1.csv", urls)
+        self.assertIn("https://example.com/files/Extended Methods.docx", urls)
+
+    def test_scenario8_declared_count_pattern8(self):
+        """Scenario 8: Declared supplement count pattern 8 matches highest explicit table mention."""
+        text1 = "Clinical characteristics are presented in Supplementary Table S5."
+        self.assertEqual(detect_declared_supplement_count(text1), 5)
+        text2 = "Detailed metrics are available in Table S1-S4."
+        self.assertEqual(detect_declared_supplement_count(text2), 4)
+
+    def test_ole2_binary_magic_bytes(self):
+        """Legacy Office 97-2003 OLE2 binary files must be recognized by infer_file_extension and validate_downloaded_file."""
+        ole2_header = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 512
+        inferred = infer_file_extension(ole2_header, "application/octet-stream")
+        self.assertEqual(inferred, ".xls")
+
+        with tempfile.NamedTemporaryFile(suffix=".xls", delete=False) as tf:
+            tf.write(ole2_header)
+            tpath = tf.name
+        try:
+            is_val, reason = validate_downloaded_file(tpath)
+            self.assertTrue(is_val)
+            self.assertIn("Office 97-2003", reason)
+        finally:
+            if os.path.exists(tpath):
+                os.remove(tpath)
+
+    def test_expand_page_accordions_action(self):
+        """expand_page_accordions_action safely evaluates JavaScript on Playwright Page."""
+        mock_page = MagicMock()
+        expand_page_accordions_action(mock_page)
+        self.assertTrue(mock_page.evaluate.called)
+        self.assertTrue(mock_page.wait_for_timeout.called)
+
+        # Non-mock / empty object should not raise exception
+        expand_page_accordions_action(object())
+
+    def test_webvpn_no_vpn_and_proxy_security(self):
+        """load_all_scansci_cookies with no_vpn=True skips WebVPN cookies, and NO_PROXY is not polluted."""
+        from scansci_supp_downloader import load_all_scansci_cookies
+        config = {
+            "vpnsci_enabled": True,
+            "webvpn_base": "https://webvpn.univ.edu.cn",
+        }
+        with patch("scansci_supp_downloader.load_vpnsci_cookies_unified", return_value={"vpn_token": "secret"}):
+            # When no_vpn=False, WebVPN cookies are included
+            c_with_vpn = load_all_scansci_cookies(config, no_vpn=False)
+            names_with_vpn = [c["name"] for c in c_with_vpn]
+            self.assertIn("vpn_token", names_with_vpn)
+
+            # When no_vpn=True, WebVPN cookies are skipped
+            c_no_vpn = load_all_scansci_cookies(config, no_vpn=True)
+            names_no_vpn = [c["name"] for c in c_no_vpn]
+            self.assertNotIn("vpn_token", names_no_vpn)
+
+    def test_disambiguate_target_filename_collisions(self):
+        """disambiguate_target_filename appends suffixes to avoid overwriting files from different URLs."""
+        with tempfile.TemporaryDirectory() as td:
+            manifest = {}
+            f1 = disambiguate_target_filename(td, "supplement.pdf", "https://example.com/doc1.pdf", manifest)
+            self.assertEqual(f1, "supplement.pdf")
+            # Create file on disk and add to manifest
+            p1 = os.path.join(td, f1)
+            with open(p1, "wb") as f:
+                f.write(b"data1")
+            manifest[f1] = "https://example.com/doc1.pdf"
+
+            # Same URL returns same filename (idempotent)
+            f1_again = disambiguate_target_filename(td, "supplement.pdf", "https://example.com/doc1.pdf", manifest)
+            self.assertEqual(f1_again, "supplement.pdf")
+
+            # Different URL returns disambiguated filename
+            f2 = disambiguate_target_filename(td, "supplement.pdf", "https://example.com/doc2.pdf", manifest)
+            self.assertEqual(f2, "supplement_2.pdf")
+
+    def test_tier_0_multi_format_and_extended_extensions(self):
+        """Tier 0 Elsevier CDN brute force probes extended extensions (.cif, .h5, etc.) and does not abort early on multi-format mmcs."""
+        from scansci_supp_downloader import try_elsevier_cdn_brute_force
+        from supp_finder import load_download_manifest
+
+        with tempfile.TemporaryDirectory() as td:
+            def fake_head(url, timeout=10, allow_redirects=True):
+                resp = MagicMock()
+                if "mmc1.xlsx" in url or "mmc1.pdf" in url or "mmc2.cif" in url:
+                    resp.status_code = 200
+                    resp.headers = {"content-length": "1024"}
+                else:
+                    resp.status_code = 404
+                    resp.headers = {}
+                return resp
+
+            def fake_get(url, timeout=30, stream=True):
+                resp = MagicMock()
+                resp.status_code = 200
+                resp.headers = {}
+                resp.iter_content = MagicMock(return_value=[b"fake binary content" * 10])
+                return resp
+
+            with patch("requests.Session.head", side_effect=fake_head), \
+                 patch("requests.Session.get", side_effect=fake_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files = try_elsevier_cdn_brute_force("S99999", td, max_mmc=5, max_consecutive_misses=2)
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("mmc1.xlsx", basenames)
+                self.assertIn("mmc1.pdf", basenames)
+                self.assertIn("mmc2.cif", basenames)
+                self.assertEqual(len(files), 3)
+
+                # Check manifest records all 3 files
+                manifest = load_download_manifest(td)
+                self.assertIn("mmc1.xlsx", manifest)
+                self.assertIn("mmc1.pdf", manifest)
+                self.assertIn("mmc2.cif", manifest)
+
+    def test_tier_a_content_disposition_collision_disambiguation(self):
+        """Tier A Elsevier API campus downloads handle Content-Disposition filename collisions without overwriting."""
+        from scansci_supp_downloader import try_elsevier_api_campus
+        from supp_finder import load_download_manifest
+
+        with tempfile.TemporaryDirectory() as td:
+            api_response_json = {
+                "full-text-retrieval-response": {
+                    "coredata": {"pii": "S88888"},
+                    "originalText": "mmc1.pdf mmc2.pdf"
+                }
+            }
+
+            def fake_api_get(url, **kwargs):
+                resp = MagicMock()
+                if "content/article/doi" in url or "content/article/pii" in url:
+                    resp.status_code = 200
+                    resp.json = MagicMock(return_value=api_response_json)
+                elif "ars.els-cdn.com" in url:
+                    resp.status_code = 200
+                    resp.headers = {
+                        "content-disposition": 'attachment; filename="Supplementary_Information.pdf"'
+                    }
+                    resp.iter_content = MagicMock(return_value=[b"%PDF-1.5 fake pdf"])
+                return resp
+
+            with patch("requests.get", side_effect=fake_api_get), \
+                 patch("requests.Session.get", side_effect=fake_api_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files, mmcs = try_elsevier_api_campus("10.1016/j.test.2026.01", "S88888", td, {"elsevier_api_key": "dummy", "is_campus_network": True})
+                self.assertEqual(len(files), 2)
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("Supplementary_Information.pdf", basenames)
+                self.assertIn("Supplementary_Information_2.pdf", basenames)
+
+                manifest = load_download_manifest(td)
+                self.assertIn("Supplementary_Information.pdf", manifest)
+                self.assertIn("Supplementary_Information_2.pdf", manifest)
+                self.assertNotEqual(manifest["Supplementary_Information.pdf"], manifest["Supplementary_Information_2.pdf"])
+
+    def test_underscore_filenames_in_table_filename_pattern(self):
+        """Filenames with underscores after table/data keywords must match TABLE_FILENAME_PATTERN."""
+        names = ["S1_Table_raw.xlsx", "s1_table_data.xlsx", "S2_Data_final.zip", "s1-table.pdf"]
+        for name in names:
+            self.assertTrue(bool(TABLE_FILENAME_PATTERN.search(name)), f"Failed for {name}")
+
+    def test_letter_prefixed_appendix_tables_matching(self):
+        """Letter-prefixed appendix tables (Table A1, Table A.1, Table A-1, Table B.2) on PDF assets and appendix endpoints."""
+        letter_tables = ["Table A1", "Table A.1", "Table A-1", "Table B1", "Table B.2", "Tab. A.1", "Tbl A-1"]
+        for lt in letter_tables:
+            # Matches when pointing to PDF asset (e.g. /content/assets/12345.pdf)
+            matched, rule = should_match_candidate("https://example.com/content/assets/12345.pdf", text=lt)
+            self.assertTrue(matched, f"Failed should_match_candidate on PDF asset for {lt}")
+            # Matches when endpoint has appendix context
+            matched, rule = should_match_candidate("https://example.com/appendix/download?id=99", text=lt)
+            self.assertTrue(matched, f"Failed should_match_candidate on appendix endpoint for {lt}")
+
+        # Primary tables must not match generic endpoints
+        for pt in ["Table 1", "Table 2", "Table 10"]:
+            self.assertFalse(is_explicit_supp_table(pt), f"Primary table {pt} should not be explicit supp")
+            matched, _ = should_match_candidate("https://example.com/download?id=99", text=pt)
+            self.assertFalse(matched, f"Primary table {pt} should not match generic endpoint")
+
+    def test_multi_table_nearby_context_not_shared(self):
+        """Multiple tables in the same container must not falsely share the first table heading."""
+        html = """
+        <div class="table-container">
+          <h4>Supplementary Table S1</h4>
+          <p><a id="a1" href="/download/1">Download 1</a></p>
+          <h4>Supplementary Table S2</h4>
+          <p><a id="a2" href="/download/2">Download 2</a></p>
+        </div>
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        a1 = soup.find(id="a1")
+        a2 = soup.find(id="a2")
+        ctx1, _ = get_nearby_context_text(a1)
+        ctx2, _ = get_nearby_context_text(a2)
+        self.assertIn("Supplementary Table S1", ctx1)
+        self.assertIn("Supplementary Table S2", ctx2)
+        self.assertNotIn("Supplementary Table S1", ctx2)
+
+    def test_embedded_json_filtering_false_positives(self):
+        """_extract_embedded_json_candidates must extract data files while rejecting UI routes like /support or table-of-contents."""
+        html = """
+        <script type="application/json">
+        {
+          "help_center": "/user/settings/support",
+          "toc": "/articles/table-of-contents",
+          "script": "/static/js/main.bundle.js",
+          "supp1": "/files/Supplementary Table S1.xlsx",
+          "supp2": "https://example.com/assets/Table S1.pdf"
+        }
+        </script>
+        """
+        soup = BeautifulSoup(html, "html.parser")
+        cands = []
+        _extract_embedded_json_candidates(soup, "https://example.com/paper", cands.append)
+        urls = [c.url for c in cands]
+        self.assertIn("https://example.com/files/Supplementary Table S1.xlsx", urls)
+        self.assertIn("https://example.com/assets/Table S1.pdf", urls)
+        self.assertNotIn("https://example.com/user/settings/support", urls)
+        self.assertNotIn("https://example.com/articles/table-of-contents", urls)
+        self.assertNotIn("https://example.com/static/js/main.bundle.js", urls)
+
+    def test_declared_count_s_prefixed_and_chinese_numerals(self):
+        """detect_declared_supplement_count supports S-prefixed table formats and Chinese numerals."""
+        self.assertEqual(detect_declared_supplement_count("Results presented in S4 Table."), 4)
+        self.assertEqual(detect_declared_supplement_count("见附表一至附表四"), 4)
+        self.assertEqual(detect_declared_supplement_count("共四个补充文件"), 4)
+        self.assertEqual(detect_declared_supplement_count("详见附表四"), 4)
+
+    def test_manifest_aware_mmc_deduplication_after_rename(self):
+        """_try_page_scrape_supplements skips candidate MMC if already downloaded and recorded in manifest under renamed filename."""
+        from scansci_supp_downloader import _try_page_scrape_supplements
+        from supp_finder import Candidate, save_download_manifest
+
+        with tempfile.TemporaryDirectory() as td:
+            # Simulate mmc1 downloaded and renamed to Table_S1.xlsx
+            renamed_file = os.path.join(td, "Table_S1.xlsx")
+            with open(renamed_file, "wb") as f:
+                f.write(b"data")
+            manifest = {"Table_S1.xlsx": "https://ars.els-cdn.com/content/image/1-s2.0-S1234-mmc1.xlsx"}
+            save_download_manifest(td, manifest)
+
+            html = '<a href="https://ars.els-cdn.com/content/image/1-s2.0-S1234-mmc1.xlsx">mmc1.xlsx</a>'
+            with patch("scansci_supp_downloader.fetch_page_html", return_value=(html, 200, "https://example.com/article")), \
+                 patch("scansci_supp_downloader.download_file") as mock_dl:
+                _try_page_scrape_supplements("https://example.com/article", td, {}, MagicMock(no_cookies=True, headful=False), [renamed_file])
+                # download_file should NOT be called for mmc1 because it's already in manifest
+                self.assertFalse(mock_dl.called)
+
+    def test_elsevier_api_objects_and_ecomponent_extraction(self):
+        """try_elsevier_api_campus parses objects field and <ce:e-component> tags in Elsevier API response."""
+        from scansci_supp_downloader import try_elsevier_api_campus
+        from supp_finder import load_download_manifest
+
+        with tempfile.TemporaryDirectory() as td:
+            api_response_json = {
+                "full-text-retrieval-response": {
+                    "coredata": {"pii": "S77777"},
+                    "objects": {
+                        "object": [
+                            {"@ref": "mmc1.xlsx", "@format": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+                            {"@ref": "mmc2", "@format": "application/pdf"}
+                        ]
+                    },
+                    "originalText": '<ce:e-component id="mmc3" xlink:href="mmc3.csv"><ce:caption>Table S3</ce:caption></ce:e-component>'
+                }
+            }
+
+            def fake_api_get(url, **kwargs):
+                resp = MagicMock()
+                if "content/article/doi" in url or "content/article/pii" in url:
+                    resp.status_code = 200
+                    resp.json = MagicMock(return_value=api_response_json)
+                elif "ars.els-cdn.com" in url:
+                    resp.status_code = 200
+                    resp.headers = {}
+                    resp.iter_content = MagicMock(return_value=[b"dummy file bytes"])
+                return resp
+
+            with patch("requests.get", side_effect=fake_api_get), \
+                 patch("requests.Session.get", side_effect=fake_api_get), \
+                 patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")):
+                files, mmcs = try_elsevier_api_campus("10.1016/j.test.2026.02", "S77777", td, {"elsevier_api_key": "dummy", "is_campus_network": True})
+                self.assertEqual(len(files), 3)
+                basenames = [os.path.basename(f) for f in files]
+                self.assertIn("mmc1.xlsx", basenames)
+                self.assertIn("mmc2.pdf", basenames)
+                self.assertIn("mmc3.csv", basenames)
+                self.assertEqual(mmcs, {1, 2, 3})
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -49,6 +49,7 @@ from supp_finder import (
     save_download_manifest,
     disambiguate_target_filename,
     extract_article_title,
+    expand_page_accordions_action,
 )
 
 
@@ -346,7 +347,8 @@ def main():
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
-        retry_kwargs["wait_selector"] = "#supplementary-material, .supplementary-material, #extended-data, [data-section='supp-table'], [id*='suppl']"
+        retry_kwargs["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+        retry_kwargs["page_action"] = expand_page_accordions_action
         retry_kwargs["timeout"] = min(args.timeout, 30000)
         try:
             retry_page = StealthyFetcher.fetch(fetch_url, **retry_kwargs)

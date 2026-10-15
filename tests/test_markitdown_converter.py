@@ -169,6 +169,47 @@ class TestMarkItDownConverter(unittest.TestCase):
                     # convert_file_to_markdown should NOT have been called
                     mock_conv.assert_not_called()
 
+    def test_html_and_htm_convertibility(self):
+        """HTML files (.html, .htm) must be supported by markitdown converter."""
+        self.assertTrue(is_convertible_file("table_s1.html"))
+        self.assertTrue(is_convertible_file("table_s2.htm"))
+
+    def test_large_file_size_limit_guard(self):
+        """Files exceeding MAX_CONVERTIBLE_FILE_SIZE (25MB) should be skipped to prevent OOM."""
+        with tempfile.TemporaryDirectory() as td:
+            big_file = os.path.join(td, "huge_dataset.csv")
+            with open(big_file, "wb") as f:
+                f.write(b"small placeholder")
+
+            with patch("os.path.getsize", return_value=26 * 1024 * 1024):
+                with patch("markitdown_converter.is_markitdown_available", return_value=True):
+                    res = convert_file_to_markdown(big_file)
+                    self.assertIsNone(res)
+
+    def test_converter_instance_reused_in_directory_conversion(self):
+        """Batch conversion should initialize MarkItDown once, not per file."""
+        with tempfile.TemporaryDirectory() as td:
+            f1 = os.path.join(td, "Table1.xlsx")
+            f2 = os.path.join(td, "Table2.xlsx")
+            with open(f1, "wb") as f:
+                f.write(b"d1")
+            with open(f2, "wb") as f:
+                f.write(b"d2")
+
+            mock_md_instance = MagicMock()
+            mock_res = MagicMock()
+            mock_res.text_content = "# Converted"
+            mock_md_instance.convert.return_value = mock_res
+
+            mock_class = MagicMock(return_value=mock_md_instance)
+            with patch("markitdown_converter.is_markitdown_available", return_value=True):
+                with patch.dict("sys.modules", {"markitdown": MagicMock(MarkItDown=mock_class)}):
+                    converted = convert_directory_supplements(td)
+                    self.assertEqual(len(converted), 2)
+                    # Class constructor should be invoked only ONCE across all files
+                    self.assertEqual(mock_class.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
+

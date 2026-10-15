@@ -14,6 +14,7 @@ Integrates with scansci-pdf config (campus network, API keys, cookies).
 """
 
 import argparse
+import html
 import os
 import re
 import sys
@@ -28,6 +29,7 @@ import json
 import time
 import subprocess
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -75,12 +77,13 @@ from supp_finder import (
     save_download_manifest,
     disambiguate_target_filename,
     extract_article_title,
+    expand_page_accordions_action,
 )
 
 try:
     from playwright_utils import normalize_playwright_cookies
 except ImportError:
-    normalize_playwright_cookies = lambda c: c
+    normalize_playwright_cookies = lambda c, default_url=None: c
 
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
@@ -288,16 +291,22 @@ def load_vpnsci_cookies_unified(config):
     return jar
 
 
-def load_all_scansci_cookies(config):
+def load_all_scansci_cookies(config, no_vpn=False):
     """Load and merge all scansci-pdf cookies (WebVPN, publisher, CARSI) as Playwright list."""
     cookies = []
 
     # 1. WebVPN cookies
-    if config.get("vpnsci_enabled"):
+    if not no_vpn and config.get("vpnsci_enabled"):
         try:
             vpn_cookies = load_vpnsci_cookies_unified(config)
-            base_url = _get_webvpn_base(config) if HAS_SCANSCI else ""
-            domain = base_url.split("://")[-1].split(":")[0] if "://" in base_url else base_url
+            if HAS_SCANSCI:
+                try:
+                    base_url = _get_webvpn_base(config)
+                except Exception:
+                    base_url = config.get("webvpn_base", "")
+            else:
+                base_url = config.get("webvpn_base", "")
+            domain = base_url.split("://")[-1].split(":")[0] if "://" in base_url else (base_url or "localhost")
             for name, value in vpn_cookies.items():
                 cookies.append({
                     "name": name, "value": value, "domain": domain,
@@ -424,17 +433,56 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         original_text = str(original_text)
 
     mmc_files = set()
-    pattern = re.compile(r"mmc(\d+)\.(\w+)", re.IGNORECASE)
+    detected_mmcs = set()
     valid_exts = {e.lstrip('.') for e in DATA_EXTENSIONS} | {"pdf"}
+
+    # 1. Parse text pattern mmc{N}.{ext}
+    pattern = re.compile(r"mmc(\d+)\.(\w+)", re.IGNORECASE)
     for m in pattern.finditer(original_text):
         num = m.group(1)
         ext = m.group(2).lower()
         if ext in valid_exts:
             mmc_files.add((int(num), ext))
 
-    detected_mmcs = set()
     for m in re.finditer(r"mmc(\d+)", original_text, re.IGNORECASE):
         detected_mmcs.add(int(m.group(1)))
+
+    # 2. Parse Elsevier API JSON 'objects' field
+    objects = article.get("objects", {})
+    obj_list = []
+    if isinstance(objects, dict):
+        obj_val = objects.get("object", [])
+        obj_list = obj_val if isinstance(obj_val, list) else [obj_val]
+    elif isinstance(objects, list):
+        obj_list = objects
+
+    for obj in obj_list:
+        if isinstance(obj, dict):
+            ref = str(obj.get("@ref", "") or obj.get("ref", "") or "")
+            m_ref = re.search(r"mmc(\d+)(?:\.(\w+))?", ref, re.IGNORECASE)
+            if m_ref:
+                num = int(m_ref.group(1))
+                detected_mmcs.add(num)
+                ext = (m_ref.group(2) or "").lower()
+                if not ext:
+                    fmt = str(obj.get("@format", "") or obj.get("format", "") or obj.get("@mimetype", "")).lower()
+                    for e in valid_exts:
+                        if e in fmt:
+                            ext = e
+                            break
+                if ext and ext in valid_exts:
+                    mmc_files.add((num, ext))
+
+    # 3. Parse <ce:e-component> tags in originalText
+    for ecomp in re.finditer(r'<ce:e-component[^>]*>(.*?)</ce:e-component>', original_text, re.DOTALL | re.IGNORECASE):
+        comp_str = ecomp.group(0)
+        for m in re.finditer(r'id=["\'](?:esmmc|mmc)(\d+)["\']', comp_str, re.IGNORECASE):
+            detected_mmcs.add(int(m.group(1)))
+        for m in re.finditer(r'mmc(\d+)\.(\w+)', comp_str, re.IGNORECASE):
+            num = int(m.group(1))
+            ext = m.group(2).lower()
+            if ext in valid_exts:
+                mmc_files.add((num, ext))
 
     if not mmc_files:
         if detected_mmcs:
@@ -450,13 +498,15 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     cdn_base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
     dl_session = requests.Session()
     dl_session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+    manifest = load_download_manifest(output_dir)
 
     for num, ext in mmc_sorted:
-        fname = f"mmc{num}.{ext}"
-        url = f"{cdn_base}-{fname}"
+        target_fname = f"mmc{num}.{ext}"
+        url = f"{cdn_base}-{target_fname}"
+        fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
         filepath = os.path.join(output_dir, fname)
 
-        if os.path.exists(filepath):
+        if os.path.exists(filepath) and manifest.get(fname) == url:
             is_val, _ = validate_downloaded_file(filepath)
             if is_val:
                 print(f"  [SKIP] {fname} (already exists)")
@@ -468,12 +518,17 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
             dl_resp = dl_session.get(url, timeout=60, stream=True)
             if dl_resp.status_code == 200:
                 cd = dl_resp.headers.get("content-disposition", "")
-                if cd:
-                    cd_match = re.search(r'filename[^;=\n]*=(["\']?)(.+?)\1(;|$)', cd)
-                    if cd_match:
-                        real_name = sanitize_filename(cd_match.group(2).strip())
-                        filepath = os.path.join(output_dir, real_name)
-                        fname = real_name
+                cd_name = extract_filename_from_content_disposition(cd)
+                if cd_name:
+                    target_fname = sanitize_filename(cd_name)
+                    fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                        is_val, _ = validate_downloaded_file(filepath)
+                        if is_val:
+                            print(f"[SKIP] {fname} (already exists)")
+                            found_files.append(filepath)
+                            continue
 
                 with open(filepath, "wb") as f:
                     for chunk in dl_resp.iter_content(chunk_size=8192):
@@ -488,6 +543,8 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                 if is_val:
                     actual_size = os.path.getsize(filepath)
                     print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
+                    manifest[fname] = url
+                    save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
                     if os.path.exists(filepath):
@@ -529,9 +586,10 @@ def try_elsevier_cdn_brute_force(
         return []
 
     base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
-    exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt"]
+    exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt", "7z", "rar", "gz", "tsv", "cif", "h5"]
     found_files = []
     probed_mmcs = set()
+    manifest = load_download_manifest(output_dir)
 
     known_set = set(known_mmcs) if known_mmcs else set()
     valid_known = {int(m) for m in known_set if isinstance(m, (int, str)) and str(m).isdigit() and 1 <= int(m) <= 999}
@@ -542,61 +600,93 @@ def try_elsevier_cdn_brute_force(
 
     def _probe_single_mmc(i: int) -> bool:
         probed_mmcs.add(i)
-        for ext in exts:
+        found_any = False
+
+        def _check_ext(ext):
             url = f"{base}-mmc{i}.{ext}"
             try:
                 resp = session.head(url, timeout=10, allow_redirects=True)
                 if resp.status_code == 200:
                     size = int(resp.headers.get("content-length", 0))
-                    fname = f"mmc{i}.{ext}"
-                    filepath = os.path.join(output_dir, fname)
-
-                    if os.path.exists(filepath):
-                        is_val, _ = validate_downloaded_file(filepath)
-                        if is_val:
-                            print(f"  [SKIP] {fname} (already exists)")
-                            found_files.append(filepath)
-                            return True
-
-                    # Download the file
-                    print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
-                    dl_resp = session.get(url, timeout=30, stream=True)
-                    if dl_resp.status_code == 200:
-                        cd = dl_resp.headers.get("content-disposition", "")
-                        if cd:
-                            cd_match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', cd)
-                            if cd_match:
-                                real_name = cd_match.group(1).strip('"\'')
-                                real_name = sanitize_filename(real_name)
-                                filepath = os.path.join(output_dir, real_name)
-                                fname = real_name
-
-                        with open(filepath, "wb") as f:
-                            for chunk in dl_resp.iter_content(chunk_size=8192):
-                                if chunk:
-                                    f.write(chunk)
-
-                        is_val, reason = validate_downloaded_file(
-                            filepath,
-                            response_status=dl_resp.status_code,
-                            headers=dl_resp.headers
-                        )
-                        if is_val:
-                            actual_size = os.path.getsize(filepath)
-                            print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                            found_files.append(filepath)
-                            return True
-                        else:
-                            if os.path.exists(filepath):
-                                os.remove(filepath)
-                            print(f"FAIL ({reason})")
-                    else:
-                        print(f"FAIL (HTTP {dl_resp.status_code})")
+                    return ext, url, size
             except requests.exceptions.Timeout:
-                continue
+                pass
             except Exception:
-                continue
-        return False
+                pass
+            return ext, url, None
+
+        # Probe all candidate extensions concurrently
+        with ThreadPoolExecutor(max_workers=min(len(exts), 8)) as executor:
+            future_to_ext = {executor.submit(_check_ext, ext): ext for ext in exts}
+            hits = []
+            for future in as_completed(future_to_ext):
+                ext, url, size = future.result()
+                if size is not None:
+                    hits.append((ext, url, size))
+
+        # Sort hits by order of exts list for deterministic behavior
+        hits.sort(key=lambda x: exts.index(x[0]))
+
+        for ext, url, size in hits:
+            target_fname = f"mmc{i}.{ext}"
+            fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
+            filepath = os.path.join(output_dir, fname)
+
+            if os.path.exists(filepath) and manifest.get(fname) == url:
+                is_val, _ = validate_downloaded_file(filepath)
+                if is_val:
+                    print(f"  [SKIP] {fname} (already exists)")
+                    found_files.append(filepath)
+                    found_any = True
+                    continue
+
+            # Download the file
+            print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
+            try:
+                dl_resp = session.get(url, timeout=30, stream=True)
+                if dl_resp.status_code == 200:
+                    cd = dl_resp.headers.get("content-disposition", "")
+                    cd_name = extract_filename_from_content_disposition(cd)
+                    if cd_name:
+                        target_fname = sanitize_filename(cd_name)
+                        fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
+                        filepath = os.path.join(output_dir, fname)
+                        if os.path.exists(filepath) and manifest.get(fname) == url:
+                            is_val, _ = validate_downloaded_file(filepath)
+                            if is_val:
+                                print(f"[SKIP] {fname} (already exists)")
+                                found_files.append(filepath)
+                                found_any = True
+                                continue
+
+                    with open(filepath, "wb") as f:
+                        for chunk in dl_resp.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    is_val, reason = validate_downloaded_file(
+                        filepath,
+                        response_status=dl_resp.status_code,
+                        headers=dl_resp.headers
+                    )
+                    if is_val:
+                        actual_size = os.path.getsize(filepath)
+                        print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
+                        manifest[fname] = url
+                        save_download_manifest(output_dir, manifest)
+                        found_files.append(filepath)
+                        found_any = True
+                    else:
+                        if os.path.exists(filepath):
+                            os.remove(filepath)
+                        print(f"FAIL ({reason})")
+                else:
+                    print(f"FAIL (HTTP {dl_resp.status_code})")
+            except Exception as e:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                print(f"FAIL ({e})")
+        return found_any
 
     # Phase 1: Sequential scan from 1 up to max_mmc
     consecutive_misses = 0
@@ -831,12 +921,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
             download = download_info.value
             if hasattr(download, "suggested_filename") and download.suggested_filename:
                 real_name = sanitize_filename(download.suggested_filename)
-                filepath = os.path.join(output_dir, real_name)
+                fname = disambiguate_target_filename(output_dir, real_name, url, manifest)
+                filepath = os.path.join(output_dir, fname)
             download.save_as(filepath)
             session_stealth.close()
 
             is_val, reason = validate_downloaded_file(filepath)
             if is_val:
+                manifest[fname] = url
+                save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 return filepath
@@ -887,10 +980,18 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
                 final_url = resp.url or url
                 text = resp.text
                 cf_signals = ["challenge-platform", "cf-browser-verification", "just a moment", "Checking your browser"]
-                if not any(sig.lower() in text.lower() for sig in cf_signals):
+                is_challenge = any(sig.lower() in text.lower() for sig in cf_signals)
+                if HAS_SCANSCI:
+                    try:
+                        from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
+                        if _is_challenge_page(text) or _is_elsevier_crasolve(final_url, text):
+                            is_challenge = True
+                    except Exception:
+                        pass
+                if not is_challenge:
                     return text, resp.status_code, final_url
                 else:
-                    print("    (Cloudflare detected, falling through to browser...)")
+                    print("    (Cloudflare / anti-bot challenge detected, falling through to browser...)")
         except Exception:
             pass
 
@@ -904,7 +1005,10 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
                 "solve_cloudflare": True,
                 "network_idle": True,
                 "timeout": 60000,
+                "page_action": expand_page_accordions_action,
             }
+            if force_browser:
+                sc_args["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
             if play_cookies:
                 sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
             page = StealthyFetcher.fetch(url, **sc_args)
@@ -992,7 +1096,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
 
         if HAS_SCANSCI and not args.no_cookies:
             inject_cookies(session, config)
-            play_cookies = load_all_scansci_cookies(config)
+            play_cookies = load_all_scansci_cookies(config, no_vpn=getattr(args, "no_vpn", False))
         elif not args.no_cookies:
             play_cookies = load_saved_cookies_standalone()
             for c in play_cookies:
@@ -1023,14 +1127,36 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
             print("    Could not fetch page for additional links.")
             return
 
+        manifest = load_download_manifest(article_dir)
+        downloaded_urls = set(manifest.values())
         existing_basenames = {os.path.basename(f) for f in existing_files}
+        downloaded_mmcs = set()
+        for k, v in manifest.items():
+            for s in (k, v):
+                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                if m:
+                    downloaded_mmcs.add(int(m.group(1)))
+        for f in existing_files:
+            m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", os.path.basename(f), re.IGNORECASE)
+            if m:
+                downloaded_mmcs.add(int(m.group(1)))
+        if os.path.exists(article_dir):
+            for f in os.listdir(article_dir):
+                m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                if m_f:
+                    downloaded_mmcs.add(int(m_f.group(1)))
+
         seen_cand_urls = set()
         new_candidates = []
         for cand in diag.candidates:
+            if cand.url in downloaded_urls or cand.url in seen_cand_urls:
+                continue
             cand_fname = cand.filename or extract_filename_from_url(cand.url)
             if cand_fname in existing_basenames:
                 continue
-            if cand.url in seen_cand_urls:
+            # Skip if candidate refers to an MMC file that was already downloaded
+            m_cand = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", cand.url + " " + cand_fname, re.IGNORECASE)
+            if m_cand and int(m_cand.group(1)) in downloaded_mmcs:
                 continue
             seen_cand_urls.add(cand.url)
             new_candidates.append(cand)
@@ -1049,6 +1175,16 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
         if pii and not getattr(args, "skip_cdn", False):
             page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
             downloaded_mmcs = set()
+            manifest = load_download_manifest(article_dir)
+            for k, v in manifest.items():
+                for s in (k, v):
+                    m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                    if m:
+                        downloaded_mmcs.add(int(m.group(1)))
+            for f in existing_files:
+                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", os.path.basename(f), re.IGNORECASE)
+                if m:
+                    downloaded_mmcs.add(int(m.group(1)))
             if os.path.exists(article_dir):
                 for f in os.listdir(article_dir):
                     m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
@@ -1104,8 +1240,17 @@ def main():
     url = normalize_url(url)
     print(f"  Normalized:  {url}")
 
-    # Extract PII for Elsevier CDN
-    pii = extract_pii_from_url(url)
+    # Extract PII for Elsevier CDN (before WebVPN transformation)
+    pii = extract_pii_from_url(url) or (extract_pii_from_url(doi) if is_doi(doi) else None)
+
+    # WebVPN URL conversion if configured and not disabled
+    if not args.no_vpn and HAS_SCANSCI and vpnsci_is_configured(config):
+        webvpn_base = _get_webvpn_base(config)
+        vpn_url = convert_url(url, webvpn_base, config)
+        if vpn_url and vpn_url != url:
+            print(f"  WebVPN URL:  {vpn_url}")
+            url = vpn_url
+
     if pii:
         print(f"  Elsevier PII: {pii}")
 
@@ -1161,7 +1306,7 @@ def main():
                         )
                 except Exception:
                     pass
-        play_cookies = load_all_scansci_cookies(config)
+        play_cookies = load_all_scansci_cookies(config, no_vpn=args.no_vpn)
     elif not args.no_cookies:
         play_cookies = load_saved_cookies_standalone()
         if play_cookies:
@@ -1326,6 +1471,12 @@ def main():
     if pii and not args.skip_cdn and not args.list_only:
         page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
         downloaded_mmcs = set()
+        manifest = load_download_manifest(article_dir)
+        for k, v in manifest.items():
+            for s in (k, v):
+                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                if m:
+                    downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
                 m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
