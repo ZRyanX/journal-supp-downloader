@@ -62,6 +62,8 @@ python scripts/journal_downloader.py "<doi>" --list-only
 | `--headful` | 显示浏览器窗口（非无头模式），用于调试 |
 | `--no-cloudflare` | 禁用 Cloudflare 绕过（对于无防护的网站） |
 | `--real-chrome` | 使用系统安装的 Chrome，而非 Chromium |
+| `--cdp` | 自动探测并直连正在运行的日常浏览器（复用已登录凭据、机构SSO并自然穿透 Turnstile） |
+| `--cdp-url` | 指定 CDP 调试端点 URL 或端口（如 `http://127.0.0.1:9222`、`9222`） |
 | `--proxy` | 代理地址 `http://user:pass@host:port` |
 | `--timeout` | 页面加载超时毫秒数（默认 60000） |
 | `--wait-selector` | 等待特定 CSS 选择器出现后再抓取 |
@@ -115,6 +117,8 @@ python scripts/scansci_supp_downloader.py "<doi>" --list-only
 | `--no-cookies` | 禁用已保存凭据与 Cookies 注入 |
 | `--headful` | 抓取网页时显示真实浏览器窗口 |
 | `--list-only` | 仅输出发现的候选补充文件与诊断证据，不触发下载 |
+| `--cdp` | 自动探测并直连正在运行的日常浏览器（复用已登录凭据、机构SSO并自然穿透 Turnstile） |
+| `--cdp-url` | 指定 CDP 调试端点 URL 或端口（如 `http://127.0.0.1:9222`、`9222`） |
 | `--oa` | 优先/强制使用开放获取镜像穿透（PMC / Europe PMC） |
 | `--no-oa` | 禁用开放获取镜像穿透查询 |
 | `--convert-markdown` | 下载完成后，使用 MarkItDown 将附表与文档转为 Markdown 副本（`.md`） |
@@ -127,7 +131,8 @@ python scripts/scansci_supp_downloader.py "<doi>" --list-only
 - **定位**：深度集成 `scansci-pdf` 的高校与科研机构多级下载器。
 - **支持认证**：
   - **机构 IP 识别（Tier A）**：校园网下直连 Elsevier Article API，秒级提取全部 MMC 并走 CDN 下载。
-  - **scansci-pdf 已存 Cookie**：自动读取 scansci-pdf 已保存的出版商 Cookies、CARSI 凭据与 WebVPN 会话，亦可读取登录向导保存的会话（注：仅读取已保存凭据文件，下载时不克隆正在运行的浏览器配置）。
+  - **CDP 日常浏览器直连（Tier 3）**：支持 `--cdp` 自动发现或 `--cdp-url` 直连用户日常运行的 Chrome/Edge 浏览器，复用真实登录态与校园 SSO，100% 自然通过 Cloudflare Turnstile。
+  - **scansci-pdf 已存 Cookie**：自动读取 scansci-pdf 已保存的出版商 Cookies、CARSI 凭据与 WebVPN 会话，亦可读取登录向导保存的会话。
   - **校园 WebVPN / CARSI**：支持 WebVPN 自动转链与 CARSI SSO 会话凭证注入。
   - **登录向导 Cookies**：自动读取 `scripts/login_publishers.py` 保存的会话。
   - **动态渲染兜底**：当检测到页面声明的补充文件缺漏或补充容器存在但未提取到候选时，自动触发浏览器多级回退渲染与重试。
@@ -136,9 +141,10 @@ python scripts/scansci_supp_downloader.py "<doi>" --list-only
 - **定位**：独立的 Scrapling 极简下载器，无需安装配置复杂的 scansci-pdf 机构网络组件。
 - **支持认证与动态特性**：
   - **Cloudflare 隐身绕过**：内置 Turnstile/WAF 人机验证绕过。
+  - **CDP 日常浏览器直连**：支持 `--cdp` / `--cdp-url`，可直接附加到已打开的 Chrome/Edge 会话，无需启动孤立浏览器，轻松下载机构订阅附表。
   - **登录向导 Cookies**：运行 `python scripts/login_publishers.py` 完成出版社登录后，轻量版在页面抓取和文件下载中均会自动注入已保存的 Cookies。
   - **动态 SPA 占位重试**：当静态抓取发现补充容器未注水（incomplete）时，自动触发补充容器选择器等待并重试；亦可通过 `--wait-selector` 手动指定。
-  - *(注：轻量版不读取 scansci-pdf 目录中的 WebVPN/CARSI 凭据，仅支持手动登录向导保存的 Cookies)*。
+  - *(注：轻量版不读取 scansci-pdf 目录中的 WebVPN/CARSI 凭据，仅支持手动登录向导保存的 Cookies 或 live CDP 会话)*。
 
 ### 手动登录向导
 

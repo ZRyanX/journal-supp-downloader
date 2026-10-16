@@ -81,9 +81,21 @@ from supp_finder import (
 )
 
 try:
-    from playwright_utils import normalize_playwright_cookies
+    from playwright_utils import (
+        normalize_playwright_cookies,
+        discover_active_cdp_port,
+        resolve_cdp_ws_url,
+        extract_cdp_cookies,
+        merge_cookies,
+        fetch_page_via_cdp,
+    )
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
+    discover_active_cdp_port = lambda profile_paths=None: None
+    resolve_cdp_ws_url = lambda ep, timeout=1.0: None
+    extract_cdp_cookies = lambda ep, timeout=4.0: []
+    merge_cookies = lambda a, b: list(a or []) + list(b or [])
+    fetch_page_via_cdp = lambda ep, url, wait_selector=None, timeout=30.0: None
 
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
@@ -964,7 +976,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None):
     return None
 
 
-def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_browser=False):
+def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_browser=False, cdp_url=None):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
     Returns (html_content, status, final_url) for accurate base URL resolution.
@@ -972,8 +984,29 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
     html_content = ""
     final_url = url
 
+    # Primary CDP Method: Attach directly to running browser via CDP
+    if cdp_url:
+        try:
+            wait_sel = None
+            if force_browser:
+                wait_sel = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+            print(f"    (Attaching to live browser tab via CDP: {cdp_url} ...)")
+            cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
+                cdp_url, url, wait_selector=wait_sel, timeout=60.0
+            )
+            if cdp_html and cdp_status < 400:
+                if cdp_cookies:
+                    if session:
+                        for c in cdp_cookies:
+                            session.cookies.set(c.get("name"), c.get("value"), domain=c.get("domain") or None, path=c.get("path", "/"))
+                    if play_cookies is not None:
+                        play_cookies.extend([c for c in cdp_cookies if c not in play_cookies])
+                return cdp_html, cdp_status, cdp_final or url
+        except Exception as e_cdp:
+            print(f"    CDP direct tab attachment failed: {e_cdp}. Falling through to StealthyFetcher...")
+
     # Method 1: requests session (fast, but often blocked by Cloudflare)
-    if session and not force_browser:
+    if session and not force_browser and not cdp_url:
         try:
             resp = session.get(url, timeout=30, verify=False)
             if resp.status_code < 400:
@@ -997,26 +1030,40 @@ def fetch_page_html(url, session=None, play_cookies=None, headful=False, force_b
 
     # Method 2: Scrapling StealthyFetcher (bypasses Cloudflare)
     if HAS_SCRAPLING:
+        sc_args = {
+            "headless": not headful,
+            "solve_cloudflare": True,
+            "network_idle": True,
+            "timeout": 60000,
+            "page_action": expand_page_accordions_action,
+        }
+        if cdp_url:
+            sc_args["cdp_url"] = cdp_url
+            print(f"    (Connecting over CDP to live browser: {cdp_url})")
+        if force_browser:
+            print("    (Forcing browser rendering to execute client-side JS...)")
+            sc_args["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+        if play_cookies:
+            sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
+
         try:
-            if force_browser:
-                print("    (Forcing browser rendering to execute client-side JS...)")
-            sc_args = {
-                "headless": not headful,
-                "solve_cloudflare": True,
-                "network_idle": True,
-                "timeout": 60000,
-                "page_action": expand_page_accordions_action,
-            }
-            if force_browser:
-                sc_args["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
-            if play_cookies:
-                sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
             page = StealthyFetcher.fetch(url, **sc_args)
             html_content = str(page.html_content)
             final_url = getattr(page, "url", None) or url
             return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
+            if cdp_url:
+                print("    (Retrying without CDP using standalone stealth browser...)")
+                try:
+                    sc_nocdp = dict(sc_args)
+                    sc_nocdp.pop("cdp_url", None)
+                    page = StealthyFetcher.fetch(url, **sc_nocdp)
+                    html_content = str(page.html_content)
+                    final_url = getattr(page, "url", None) or url
+                    return html_content, page.status, final_url
+                except Exception as e2:
+                    print(f"    StealthyFetcher standalone error: {e2}")
 
     return html_content, 0, final_url
 
@@ -1221,6 +1268,8 @@ def main():
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
+    parser.add_argument("--cdp", action="store_true", help="Connect to running Chromium browser via CDP (inherits live session, cookies, Cloudflare bypass)")
+    parser.add_argument("--cdp-url", default=None, help="Custom CDP endpoint URL or port (e.g. http://127.0.0.1:9222, ws://... or 9222)")
     parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
 
@@ -1233,6 +1282,19 @@ def main():
     if os.environ.get("ELSEVIER_INSTTOKEN"):
         config["elsevier_insttoken"] = os.environ["ELSEVIER_INSTTOKEN"].strip()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    cdp_target = args.cdp_url
+    if args.cdp and not cdp_target:
+        detected = discover_active_cdp_port()
+        if detected:
+            print(f"  [CDP] Discovered running browser at {detected[0]} (ws: {detected[1]})")
+            cdp_target = detected[0]
+        else:
+            print("  [CDP] No active browser CDP port detected.")
+
+    ws_cdp_url = resolve_cdp_ws_url(cdp_target) if cdp_target else None
+    if ws_cdp_url:
+        print(f"  [CDP] Live browser session active: {ws_cdp_url}")
 
     # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
     doi = args.url_or_doi
@@ -1318,8 +1380,22 @@ def main():
     else:
         play_cookies = []
 
+    if cdp_target and not args.no_cookies:
+        try:
+            live_cdp_c = extract_cdp_cookies(cdp_target)
+            if live_cdp_c:
+                print(f"  [CDP] Extracted {len(live_cdp_c)} live authenticated cookies from browser.")
+                for c in live_cdp_c:
+                    session.cookies.set(
+                        c.get("name", ""), c.get("value", ""),
+                        domain=c.get("domain") or None, path=c.get("path", "/"),
+                    )
+                play_cookies = merge_cookies(play_cookies, live_cdp_c)
+        except Exception:
+            pass
+
     # Fetch page with redirect resolution (Fixing Issue #1)
-    html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful)
+    html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful, cdp_url=ws_cdp_url)
     if not html_content:
         print("  ERROR: Failed to fetch article page.")
         print("  Possible causes: Cloudflare block, network issue, or authentication required.")
@@ -1349,7 +1425,7 @@ def main():
     if (not candidates or is_inc) and HAS_SCRAPLING and session:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
-            url, session, play_cookies, args.headful, force_browser=True
+            url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
         )
         if html_content_browser:
             url = final_url_browser or url
@@ -1374,6 +1450,42 @@ def main():
                     article_dir = new_article_dir
                     print(f"  Updated Title:  {article_dirname}")
                     print(f"  Updated Folder: {article_dir}")
+
+    # Tier 3 (CDP Live Browser Probe): If still no candidates/incomplete and CDP wasn't explicitly provided,
+    # probe if an active running browser is available to bypass Turnstile or inherit SSO
+    if (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING:
+        detected = discover_active_cdp_port()
+        if detected:
+            print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
+            try:
+                live_auto_c = extract_cdp_cookies(detected[0])
+                if live_auto_c:
+                    print(f"  [Tier 3] Injected {len(live_auto_c)} session cookies from browser into downloader.")
+                    for c in live_auto_c:
+                        session.cookies.set(
+                            c.get("name", ""), c.get("value", ""),
+                            domain=c.get("domain") or None, path=c.get("path", "/"),
+                        )
+                    play_cookies = merge_cookies(play_cookies, live_auto_c)
+            except Exception:
+                pass
+
+            cdp_html, cdp_status, cdp_final = fetch_page_html(
+                url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0]
+            )
+            if cdp_html:
+                cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
+                cdp_diag = find_all_candidates(cdp_html, cdp_base, original_url=args.url_or_doi)
+                if cdp_diag.candidates:
+                    print(f"  ✓ Tier 3 CDP success! Found {len(cdp_diag.candidates)} supplementary file(s) via live browser.")
+                    seen_urls = {c.url for c in candidates}
+                    new_cands = [c for c in cdp_diag.candidates if c.url not in seen_urls]
+                    candidates.extend(new_cands)
+                    if not candidates:
+                        candidates = list(cdp_diag.candidates)
+                    diag = cdp_diag
+                    html_content = cdp_html
+                    effective_base = cdp_base
 
     # Tier OA Penetration: If still no candidates or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
     doi_val = (

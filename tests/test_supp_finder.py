@@ -2076,6 +2076,81 @@ class TestCodebaseAuditFixes(unittest.TestCase):
                 self.assertIn("mmc3.csv", basenames)
                 self.assertEqual(mmcs, {1, 2, 3})
 
+    def test_expanded_data_extensions(self):
+        from supp_finder import check_data_extension
+        self.assertEqual(check_data_extension("data.parquet"), ".parquet")
+        self.assertEqual(check_data_extension("genomics_table.tsv.gz"), ".tsv.gz")
+        self.assertEqual(check_data_extension("rnaseq.csv.gz"), ".csv.gz")
+        self.assertEqual(check_data_extension("dataset.feather"), ".feather")
+        self.assertEqual(check_data_extension("model_weights.arrow"), ".arrow")
+        self.assertEqual(check_data_extension("params.yaml"), ".yaml")
+        self.assertEqual(check_data_extension("clinical_cohort.sas7bdat"), ".sas7bdat")
+        self.assertEqual(check_data_extension("stata_data.dta"), ".dta")
+        # Added extensions
+        self.assertEqual(check_data_extension("raw_data.xz"), ".xz")
+        self.assertEqual(check_data_extension("archive.tar.xz"), ".tar.xz")
+        self.assertEqual(check_data_extension("compressed.bz2"), ".bz2")
+        self.assertEqual(check_data_extension("database.db"), ".db")
+        self.assertEqual(check_data_extension("data.sqlite"), ".sqlite")
+        self.assertEqual(check_data_extension("data.sqlite3"), ".sqlite3")
+        self.assertEqual(check_data_extension("variants.vcf"), ".vcf")
+        self.assertEqual(check_data_extension("variants.vcf.gz"), ".vcf.gz")
+        self.assertEqual(check_data_extension("annotations.bed"), ".bed")
+        self.assertEqual(check_data_extension("features.gff3"), ".gff3")
+        self.assertEqual(check_data_extension("transcripts.gtf"), ".gtf")
+
+    def test_infer_file_extension_new_formats(self):
+        # Parquet
+        self.assertEqual(infer_file_extension(b"PAR1\x00\x00dummy"), ".parquet")
+        # Arrow/Feather
+        self.assertEqual(infer_file_extension(b"ARROW1\x00\x00dummy"), ".feather")
+        # Tar archive with ustar at offset 257
+        tar_header = b"\x00" * 257 + b"ustar" + b"\x00" * 10
+        self.assertEqual(infer_file_extension(tar_header), ".tar")
+        # Bzip2
+        self.assertEqual(infer_file_extension(b"BZh91AY&SYdummy"), ".bz2")
+        # XZ
+        self.assertEqual(infer_file_extension(b"\xfd7zXZ\x00dummy"), ".xz")
+        # SQLite
+        self.assertEqual(infer_file_extension(b"SQLite format 3\x00dummy"), ".db")
+
+    def test_infer_file_extension_gzip_inspections(self):
+        import gzip
+        # Plain GZ
+        self.assertEqual(infer_file_extension(b"\x1f\x8b\x08\x00generic"), ".gz")
+        # GZ with Tar
+        tar_inner = b"\x00" * 257 + b"ustar" + b"\x00" * 20
+        self.assertEqual(infer_file_extension(gzip.compress(tar_inner)), ".tar.gz")
+        # GZ with CSV
+        csv_inner = b"sample_id,condition,score\nA,control,10\nB,case,20\n"
+        self.assertEqual(infer_file_extension(gzip.compress(csv_inner)), ".csv.gz")
+        # GZ with TSV
+        tsv_inner = b"sample_id\tcondition\tscore\nA\tcontrol\t10\nB\tcase\t20\n"
+        self.assertEqual(infer_file_extension(gzip.compress(tsv_inner)), ".tsv.gz")
+
+    def test_supp_keyword_pattern_expanded(self):
+        from supp_finder import SUPP_KEYWORD_PATTERN
+        self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supplementary Note 1")))
+        self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supporting Notes")))
+        self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supplementary Protocol S1")))
+        self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supplementary Method")))
+        self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supplementary Code")))
+
+    def test_explicit_supp_figures_and_tables(self):
+        from supp_finder import detect_declared_supplement_count
+        self.assertTrue(is_explicit_supp_table("Supplementary Figures and Tables"))
+        self.assertTrue(is_explicit_supp_table("Supplementary Tables and Figures"))
+        self.assertTrue(is_explicit_supp_table("Supporting Figures and Tables"))
+        self.assertTrue(is_explicit_supp_table("Supporting Tables and Figures"))
+        m1 = TABLE_LABEL_PATTERN.search("Supplementary Figures and Tables S1-S5")
+        self.assertTrue(bool(m1))
+        self.assertIn("S1-S5", m1.group(0))
+        m2 = TABLE_LABEL_PATTERN.search("Supplementary Tables and Figures S1-S5")
+        self.assertTrue(bool(m2))
+        self.assertIn("S1-S5", m2.group(0))
+        self.assertEqual(detect_declared_supplement_count("See Supplementary Figures and Tables S1-S5 for details."), 5)
+        self.assertEqual(detect_declared_supplement_count("Supplementary Tables and Figures S1 to S4 provide cohort info."), 4)
+
 
 if __name__ == "__main__":
     unittest.main()

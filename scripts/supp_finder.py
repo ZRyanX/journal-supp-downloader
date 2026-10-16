@@ -29,11 +29,14 @@ except ImportError:
 # rather than as generic blind extensions to prevent grabbing main article PDFs/pages.
 DATA_EXTENSIONS = {
     ".xlsx", ".xls", ".csv", ".tsv", ".zip", ".gz", ".tar", ".7z", ".rar",
-    ".tar.gz", ".tgz", ".tar.bz2",
+    ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz", ".txz", ".tsv.gz", ".csv.gz", ".txt.gz",
     ".txt", ".json", ".xml", ".r", ".py", ".ipynb", ".m", ".nb",
     ".cif", ".pdb", ".mol", ".sdf", ".xyz", ".fasta", ".fa", ".gb",
     ".nii", ".nii.gz", ".dcm", ".h5", ".hdf5", ".mat", ".pkl", ".rda", ".sav",
     ".docx", ".doc", ".pptx", ".ppt",
+    ".parquet", ".feather", ".arrow", ".yaml", ".yml", ".sas7bdat", ".dta",
+    ".bz2", ".xz", ".db", ".sqlite", ".sqlite3",
+    ".vcf", ".vcf.gz", ".bed", ".gff", ".gff3", ".gtf", ".zarr",
 }
 # Sort extensions by length descending so multi-part extensions like .nii.gz match before .gz (F3)
 SORTED_DATA_EXTENSIONS = tuple(sorted(DATA_EXTENSIONS, key=len, reverse=True))
@@ -48,12 +51,19 @@ SUPP_KEYWORD_PATTERN = re.compile(
     r"|supporting[-_ ]?info(?:rmation)?"
     r"|supporting[-_ ]?material(?:s)?"
     r"|supporting[-_ ]?document(?:s)?"
+    r"|supporting[-_ ]?note(?:s)?"
+    r"|supporting[-_ ]?file(?:s)?"
     r"|supplementary[-_ ]?material(?:s)?"
     r"|supplemental[-_ ]?material(?:s)?"
     r"|supplementary[-_ ]?file(?:s)?"
     r"|supplemental[-_ ]?file(?:s)?"
     r"|supplementary[-_ ]?data"
     r"|supplemental[-_ ]?data"
+    r"|supplementary[-_ ]?note(?:s)?"
+    r"|supplementary[-_ ]?protocol(?:s)?"
+    r"|supplementary[-_ ]?method(?:s)?"
+    r"|supplementary[-_ ]?code"
+    r"|supplementary[-_ ]?script(?:s)?"
     r"|additional[-_ ]?file(?:s)?"
     r"|additional[-_ ]?info(?:rmation)?"
     r"|source[-_ ]?data(?:[-_ ]?(?:tables?|tabs?\.?|tbls?\.?|figs?\.?|figures?|files?))?"
@@ -76,7 +86,7 @@ TABLE_LABEL_PATTERN = re.compile(
     r"(?:"
     # Branch 1: Explicit supplementary prefix with table/data (number optional, supports Roman numerals and ranges)
     r"(?:(?:supplementary|supporting|extended\s*data|ext\s*data|additional|appendix|online|suppl?\.?)\s+"
-    r"(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|表格?|数据)(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?|[sS]?[-_.]?[ivxldcmIVXLDCM]+|[a-zA-Z]\b))?)"
+    r"(?:(?:figures?|figs?\.?)\s+(?:and|&)\s+)?(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|表格?|数据)(?:\s+(?:and|&)\s+(?:figures?|figs?\.?))?(?:\s*(?:[a-zA-Z]?[-_.]?\d+[a-zA-Z]?(?:\s*(?:[-–至]|to)\s*[a-zA-Z]?[-_.]?\d+[a-zA-Z]?)?|[sS]?[-_.]?[ivxldcmIVXLDCM]+|[a-zA-Z]\b))?)"
     r"|"
     # Branch 1a2: Explicit supplementary prefix with file/文件 (number is required, e.g. Additional file 1, Supplementary File S1)
     r"(?:(?:supplementary|supporting|extended\s*data|ext\s*data|additional|appendix|online|suppl?\.?)\s+"
@@ -149,7 +159,7 @@ def is_explicit_supp_table(label: str) -> bool:
         return False
     # Check for supplementary/extended prefix with table/data
     if re.search(
-        r'(?:supplementary|supporting|extended\s*data|ext\s*data|additional|online|suppl?\.?)\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|表格?|数据)',
+        r'(?:supplementary|supporting|extended\s*data|ext\s*data|additional|online|suppl?\.?)\s+(?:(?:figures?|figs?\.?)\s+(?:and|&)\s+)?(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|表格?|数据)(?:\s+(?:and|&)\s+(?:figures?|figs?\.?))?',
         label,
         re.IGNORECASE,
     ):
@@ -452,6 +462,17 @@ def infer_file_extension(content_bytes: bytes, content_type: str = "") -> str:
             return ".pptx"
         return ".zip"
     if content_bytes.startswith(b"\x1f\x8b"):
+        try:
+            import zlib
+            decomp = zlib.decompressobj(31).decompress(content_bytes[:4096])
+            if len(decomp) >= 262 and decomp[257:262] == b"ustar":
+                return ".tar.gz"
+            if "tsv" in ct or (b"\t" in decomp and b"\n" in decomp):
+                return ".tsv.gz"
+            if "csv" in ct or (b"," in decomp and b"\n" in decomp):
+                return ".csv.gz"
+        except Exception:
+            pass
         return ".gz"
     # Office 97-2003 compound document (OLE2: .xls, .doc, .ppt)
     if content_bytes.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
@@ -468,6 +489,18 @@ def infer_file_extension(content_bytes: bytes, content_type: str = "") -> str:
         return ".rar"
     if content_bytes.startswith(b"\x89HDF\r\n\x1a\n"):
         return ".h5"
+    if content_bytes.startswith(b"PAR1"):
+        return ".parquet"
+    if content_bytes.startswith(b"ARROW1"):
+        return ".feather"
+    if len(content_bytes) >= 262 and content_bytes[257:262] == b"ustar":
+        return ".tar"
+    if content_bytes.startswith(b"BZh"):
+        return ".bz2"
+    if content_bytes.startswith(b"\xfd7zXZ\x00"):
+        return ".xz"
+    if content_bytes.startswith(b"SQLite format 3\x00"):
+        return ".db"
     if "csv" in ct:
         return ".csv"
     if "tab-separated" in ct or "tsv" in ct:
@@ -1391,7 +1424,7 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
     # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables S1 to S4' (E1)
     # Modifier and 'S' cannot both be omitted (e.g. 'Tables 1 to 3' is main text, not supplementary)
     m = re.search(
-        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+tables?\s+s?0?(\d{1,2})|tables?\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        r'(?:(?:supplementary|supporting|extended\s*data|appendix)\s+(?:(?:figures?|figs?\.?)\s+(?:and|&)\s+)?tables?(?:\s+(?:and|&)\s+(?:figures?|figs?\.?))?\s+s?0?(\d{1,2})|tables?\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
         html_content,
         re.IGNORECASE,
     )

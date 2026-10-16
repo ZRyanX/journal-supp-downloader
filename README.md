@@ -24,10 +24,11 @@
 * **多级下载策略 (Multi-Tier)**：
   - **Tier A**：Elsevier API 检索（极速，需 API 密钥与机构网络，约 3 秒）。
   - **Tier 0**：Elsevier CDN 暴力匹配（无需任何认证，约 1 秒/文件）。
-  - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，突破付费墙与反爬限制秒级提取附表）。
   - **Tier 1**：期刊直接链接下载（基于 Requests 会话，带 Cookie）。
   - **Tier 2**：Scrapling 浏览器渲染（自动绕过 Cloudflare Turnstile/验证码，约 15 秒）。
-* **智能过滤**：自动识别真实的数据文件（排除插图 `gr1.jpg`、参考文献、页面广告等）。
+  - **Tier 3 (全新增强)**：CDP 实时浏览器直连（支持 `--cdp` 自动发现或 `--cdp-url`，借鉴 `eze-is/web-access` 架构，直接附加到用户日常运行的 Chrome/Edge，复用机构 SSO 与有效凭据，100% 自然通过 Turnstile 防护）。
+  - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，突破付费墙与反爬限制秒级提取附表）。
+* **智能过滤**：自动识别真实的数据文件（支持 Parquet、Feather、Arrow、压缩表格等，排除插图 `gr1.jpg`、参考文献、页面广告等）。
 * **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软 MarkItDown 将下载的附表（`.docx`, `.xlsx`, `.pdf`）一键解包转换为 Markdown 副本及摘要索引，100% 保护原始科研数据完整性。
 * **自动重命名与归档**：使用 Unpaywall / OpenAlex / CrossRef API 自动查询文献标题并规范化命名文件夹，将所有附件统一整理。
 
@@ -64,10 +65,13 @@ python scripts/journal_downloader.py "<url>" --headful
 
 # 仅列出链接，不执行下载
 python scripts/journal_downloader.py "<url>" --list-only
+
+# 直连已打开的日常 Chrome 浏览器（自动复用登录态与机构 SSO，自然穿透 Turnstile）
+python scripts/journal_downloader.py "<url>" --cdp
 ```
 
 ### 2. 高级集成版下载器 (`scansci_supp_downloader.py`)
-支持 API、CDN 直连及 Cookie 注入的多级加速下载器，适合 Elsevier/ScienceDirect 批量下载：
+支持 API、CDN 直连、CDP 实时浏览器直连及 Cookie 注入的多级加速下载器，适合 Elsevier/ScienceDirect 批量下载：
 ```bash
 # 使用 DOI 链接
 python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349"
@@ -77,6 +81,9 @@ python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349" --no
 
 # 强制在抓取网页时显示浏览器（用于观察 Cloudflare 绕过过程）
 python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349" --headful
+
+# 直连日常浏览器 CDP 会话（突破最严苛的人机防护和机构订阅验证）
+python scripts/scansci_supp_downloader.py "<url_or_doi>" --cdp
 ```
 
 ---

@@ -54,9 +54,21 @@ from supp_finder import (
 
 
 try:
-    from playwright_utils import normalize_playwright_cookies
+    from playwright_utils import (
+        normalize_playwright_cookies,
+        discover_active_cdp_port,
+        resolve_cdp_ws_url,
+        extract_cdp_cookies,
+        merge_cookies,
+        fetch_page_via_cdp,
+    )
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
+    discover_active_cdp_port = lambda profile_paths=None: None
+    resolve_cdp_ws_url = lambda ep, timeout=1.0: None
+    extract_cdp_cookies = lambda ep, timeout=4.0: []
+    merge_cookies = lambda a, b: list(a or []) + list(b or [])
+    fetch_page_via_cdp = lambda ep, url, wait_selector=None, timeout=30.0: None
 
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
@@ -142,10 +154,33 @@ def download_file(cand_or_url, output_dir, cookies=None):
         if cookies:
             get_kwargs["cookies"] = cookies_to_dict(cookies, url)
 
-        resp = Fetcher.get(url, **get_kwargs)
+        resp = None
+        try:
+            resp = Fetcher.get(url, **get_kwargs)
+        except Exception:
+            pass
 
-        if resp.status >= 400:
-            print(f"HTTP {resp.status}")
+        if resp is None or resp.status >= 400:
+            # Fallback: try requests session with cookies and browser user agent
+            try:
+                import requests
+                sess = requests.Session()
+                c_dict = cookies_to_dict(cookies, url) if cookies else {}
+                for ck, cv in c_dict.items():
+                    sess.cookies.set(ck, cv)
+                req_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+                r = sess.get(url, timeout=30, headers=req_headers, verify=False)
+                if r.status_code < 400 and r.content:
+                    resp = type("Resp", (), {"status": r.status_code, "body": r.content, "headers": dict(r.headers)})()
+            except Exception:
+                pass
+
+        if resp is None or resp.status >= 400:
+            status_desc = f"HTTP {resp.status}" if resp else "Connection error"
+            print(f"{status_desc}")
             return None
 
         # Try to get filename from Content-Disposition
@@ -259,6 +294,14 @@ def main():
         help="Use real Chrome browser instead of Chromium"
     )
     parser.add_argument(
+        "--cdp", action="store_true",
+        help="Connect to running Chromium browser via CDP (inherits live session, cookies, Cloudflare bypass)"
+    )
+    parser.add_argument(
+        "--cdp-url", default=None,
+        help="Custom CDP endpoint URL or port (e.g. http://127.0.0.1:9222, ws://... or 9222)"
+    )
+    parser.add_argument(
         "--list-only", action="store_true",
         help="Only list found links with diagnostic evidence, don't download"
     )
@@ -290,6 +333,8 @@ def main():
     print(f"Output: {os.path.abspath(args.output_dir)}")
     print(f"Cloudflare bypass: {'ON' if solve_cf else 'OFF'}")
     print(f"Mode: {'Headful' if args.headful else 'Headless'}")
+    if args.cdp or args.cdp_url:
+        print(f"CDP Live Browser: {'ON (' + (args.cdp_url or 'auto-detect') + ')'}")
     if args.proxy:
         print(f"Proxy: {args.proxy}")
 
@@ -316,16 +361,99 @@ def main():
     if cookies:
         fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
 
-    page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
+    # Check CDP connectivity if requested or if --cdp / --cdp-url specified
+    cdp_target = args.cdp_url
+    if args.cdp and not cdp_target:
+        detected = discover_active_cdp_port()
+        if detected:
+            print(f"  [CDP] Discovered running browser at {detected[0]} (ws: {detected[1]})")
+            cdp_target = detected[0]
+        else:
+            print("  [CDP] No active browser CDP port detected. Falling back to standalone stealth browser.")
+
+    page = None
+    if cdp_target:
+        # Extract live authenticated cookies from the browser session
+        try:
+            live_cdp_c = extract_cdp_cookies(cdp_target)
+            if live_cdp_c:
+                print(f"  [CDP] Extracted {len(live_cdp_c)} live authenticated session cookies from browser.")
+                cookies = merge_cookies(cookies, live_cdp_c)
+                fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
+        except Exception:
+            pass
+
+        # Primary CDP Attempt: Attach to live browser tab or open in authenticated default profile
+        try:
+            print(f"  [CDP] Connecting over CDP to live browser: {cdp_target} ...")
+            cdp_html, cdp_status, cdp_final_url, cdp_c = fetch_page_via_cdp(
+                cdp_target, fetch_url, wait_selector=args.wait_selector, timeout=args.timeout / 1000.0
+            )
+            if cdp_html and cdp_status < 400:
+                print("  [CDP] Successfully retrieved page DOM from live browser session.")
+                if cdp_c:
+                    cookies = merge_cookies(cookies, cdp_c)
+                page = type("CdpPage", (), {
+                    "html_content": cdp_html,
+                    "text": cdp_html,
+                    "url": cdp_final_url,
+                    "status": cdp_status,
+                })()
+        except Exception as e_cdp:
+            print(f"  [CDP] Live tab attachment notice: {e_cdp}. Falling back to StealthyFetcher...")
+
+    # Secondary: Scrapling StealthyFetcher fallback
+    if page is None:
+        ws_cdp_url = resolve_cdp_ws_url(cdp_target) if cdp_target else None
+        if ws_cdp_url:
+            fetch_kwargs["cdp_url"] = ws_cdp_url
+            fetch_kwargs.pop("real_chrome", None)
+
+        try:
+            page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
+        except Exception as e:
+            print(f"  [Warning] Browser fetch encountered error: {e}")
+            if "cdp_url" in fetch_kwargs:
+                print("  [Recovery] Retrying with standalone stealth browser...")
+                fb_kwargs = dict(fetch_kwargs)
+                fb_kwargs.pop("cdp_url", None)
+                try:
+                    page = StealthyFetcher.fetch(fetch_url, **fb_kwargs)
+                except Exception as e2:
+                    print(f"  [Warning] Standalone browser fetch also failed: {e2}")
+
+            if page is None:
+                print("  [Recovery] Attempting HTTP direct fetch fallback...")
+                try:
+                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout, 30000)}
+                    if cookies:
+                        http_kwargs["cookies"] = cookies_to_dict(cookies, fetch_url)
+                    resp = Fetcher.get(fetch_url, **http_kwargs)
+                    if resp.status < 400 and resp.text:
+                        page = resp
+                except Exception as e3:
+                    print(f"  [Recovery] HTTP direct fetch failed: {e3}")
+
+    if page is None:
+        print(f"Error: Unable to fetch page content from {fetch_url}.")
+        return
 
     # Resolve effective base URL (Fixing Issue #1: DOI redirect resolution)
     final_url = getattr(page, "url", None) or fetch_url
-    html_content = str(page.html_content)
+    html_content = getattr(page, "html_content", None) or getattr(page, "text", "")
+    html_content = str(html_content)
     effective_base = extract_effective_base_url(html_content, final_url)
 
     # Extract and sanitize article title for folder name
-    raw_title = page.css('title::text').get() or "N/A"
-    article_dirname = extract_article_title(page)
+    raw_title = "N/A"
+    if hasattr(page, "css"):
+        try:
+            raw_title = page.css('title::text').get() or "N/A"
+        except Exception:
+            pass
+    if raw_title == "N/A":
+        raw_title = extract_article_title(html_content, default="N/A")
+    article_dirname = extract_article_title(html_content, default="supplements")
     article_dir = os.path.join(args.output_dir, article_dirname)
     os.makedirs(article_dir, exist_ok=True)
 
