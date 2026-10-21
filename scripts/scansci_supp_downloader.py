@@ -95,20 +95,15 @@ except ImportError:
     resolve_cdp_ws_url = lambda ep, timeout=1.0: None
     extract_cdp_cookies = lambda ep, timeout=4.0: []
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
-try:
-    from browserskill_adapter import (
-        is_browserskill_available,
-        fetch_page_via_browserskill,
-        check_browserskill_status,
-        download_file_via_browserskill,
-        BrowserSkillSession,
-    )
-except ImportError:
-    is_browserskill_available = lambda timeout=2.0: False
-    fetch_page_via_browserskill = lambda *a, **kw: None
-    check_browserskill_status = lambda *a, **kw: {"available": False}
-    download_file_via_browserskill = lambda *a, **kw: None
-    BrowserSkillSession = None
+from browserskill_adapter import (
+    BrowserSkillError,
+    BrowserSkillRuntime,
+    add_browserskill_arguments,
+    runtime_from_args,
+    fetch_page_via_browserskill,
+    download_file_via_browserskill,
+)
+
 
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
@@ -768,7 +763,7 @@ def is_html_file(filepath):
     return not is_valid
 
 
-def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None):
+def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None):
     """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session."""
     if isinstance(cand_or_url, Candidate):
         url = cand_or_url.url
@@ -794,7 +789,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
     if session:
         try:
-            resp = session.get(url, timeout=30, stream=True, verify=False)
+            resp = session.get(url, timeout=30, stream=True, verify=False, headers={"Referer": referer} if referer else {})
             if resp.status_code < 400:
                 hdr = {k.lower(): v for k, v in resp.headers.items()}
                 cd = hdr.get("content-disposition", "")
@@ -855,7 +850,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # Method 2: Scrapling Fetcher (basic HTTP client)
     if HAS_SCRAPLING:
         try:
-            sc_args = {}
+            sc_args = {"headers": {"Referer": referer}} if referer else {}
             if cookies:
                 sc_args["cookies"] = cookies_to_dict(cookies, url)
             resp = Fetcher.get(url, stealthy_headers=True, timeout=30000, **sc_args)
@@ -908,6 +903,17 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         except Exception:
             if os.path.exists(filepath):
                 os.remove(filepath)
+
+    # Reuse the opted-in authenticated session before a standalone browser.
+    if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
+        result = download_file_via_browserskill(
+            url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime
+        )
+        if result:
+            manifest[fname] = url
+            save_download_manifest(output_dir, manifest)
+            print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
+            return filepath
 
     # Method 3: Scrapling StealthySession + Playwright sync download fallback
     if HAS_SCRAPLING:
@@ -978,32 +984,14 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             is_val, reason = validate_downloaded_file(filepath)
             if is_val:
                 size_kb = os.path.getsize(filepath) / 1024
+                manifest[fname] = url
+                save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
             elif os.path.exists(filepath):
                 os.remove(filepath)
     except Exception:
         pass
-
-    # Method 5: BrowserSkill authenticated browser download fallback
-    if is_browserskill_available():
-        try:
-            bsk_dl = download_file_via_browserskill(
-                url, filepath, session=bsk_session, referer=referer
-            )
-            if bsk_dl and os.path.exists(filepath):
-                is_val, reason = validate_downloaded_file(filepath)
-                if is_val:
-                    manifest[fname] = url
-                    save_download_manifest(output_dir, manifest)
-                    size_kb = os.path.getsize(filepath) / 1024
-                    print(f"OK (via BrowserSkill, {size_kb:.1f} KB - {reason})")
-                    return filepath
-                elif os.path.exists(filepath):
-                    os.remove(filepath)
-        except Exception:
-            if os.path.exists(filepath):
-                os.remove(filepath)
 
     print("FAIL")
     return None
@@ -1020,6 +1008,7 @@ def fetch_page_html(
     bsk_browser=None,
     bsk_session=None,
     bsk_tab=None,
+    bsk_runtime=None,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
@@ -1039,10 +1028,13 @@ def fetch_page_html(
                 browser=bsk_browser,
                 tab_id=bsk_tab,
                 session=bsk_session,
+                runtime=bsk_runtime,
             )
             if bsk_html and bsk_status < 400:
                 return bsk_html, bsk_status, bsk_final or url
         except Exception as e_bsk:
+            if bsk_runtime and (bsk_runtime.browser or bsk_runtime.tab_id):
+                raise
             print(f"    BrowserSkill fetch notice: {e_bsk}. Falling back to default pipeline...")
 
     # Primary CDP Method: Attach directly to running browser via CDP
@@ -1129,7 +1121,7 @@ def fetch_page_html(
     return html_content, 0, final_url
 
 
-def _finish_success(tier_name, files, article_dir, doi, url, args, config):
+def _finish_success(tier_name, files, article_dir, doi, url, args, config, bsk_runtime=None):
     """Common success handler: print summary, rename folder, check for extra supplements."""
     print(f"\n✓ {tier_name} Success: {len(files)} supplementary file(s) downloaded.")
     print(f"  Output: {os.path.abspath(article_dir)}")
@@ -1146,7 +1138,7 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config):
         pass
 
     print("\n  Checking for additional supplements via page scrape...")
-    _try_page_scrape_supplements(url, article_dir, config, args, files)
+    _try_page_scrape_supplements(url, article_dir, config, args, files, bsk_runtime=bsk_runtime)
 
     if getattr(args, "convert_markdown", False):
         print("\n  [Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
@@ -1190,7 +1182,7 @@ def _quick_title_lookup(doi, url):
     return None
 
 
-def _try_page_scrape_supplements(url, article_dir, config, args, existing_files):
+def _try_page_scrape_supplements(url, article_dir, config, args, existing_files, bsk_runtime=None):
     """
     After CDN success, scrape the page for non-CDN supplement links.
     Falls back to browser rendering if raw HTML is blocked or incomplete (Fixing Issue #4).
@@ -1215,16 +1207,16 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
         else:
             play_cookies = []
 
-        html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful)
+        html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful, use_bsk=bool(bsk_runtime and args.browserskill), bsk_runtime=bsk_runtime)
 
         url_to_use = final_url or url
         effective_base = extract_effective_base_url(html_content, url_to_use)
         diag = find_all_candidates(html_content, effective_base, original_url=url)
 
         # Fallback to browser rendering if raw HTML yields no candidates or is incomplete
-        if (not diag.candidates or diag.is_incomplete) and HAS_SCRAPLING:
+        if (not diag.candidates or diag.is_incomplete) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
             print("    Raw HTML incomplete or blocked. Retrying with browser rendering for page scrape...")
-            html_content_b, status_b, final_url_b = fetch_page_html(url, session, play_cookies, args.headful, force_browser=True)
+            html_content_b, status_b, final_url_b = fetch_page_html(url, session, play_cookies, args.headful, force_browser=True, use_bsk=bool(bsk_runtime and bsk_runtime.enabled), bsk_runtime=bsk_runtime)
             if html_content_b:
                 html_content = html_content_b
                 url_to_use = final_url_b or url_to_use
@@ -1279,7 +1271,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
                     article_dir,
                     session,
                     play_cookies,
-                    bsk_session=bsk_session,
+                    bsk_runtime=bsk_runtime,
                     referer=url_to_use,
                 )
         else:
@@ -1316,6 +1308,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files)
                 )
                 if extra_cdn_files:
                     existing_files.extend(extra_cdn_files)
+    except BrowserSkillError:
+        raise
     except Exception as e:
         print(f"    Page scrape error: {e}")
 
@@ -1338,11 +1332,19 @@ def main():
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
     parser.add_argument("--cdp", action="store_true", help="Connect to running Chromium browser via CDP (inherits live session, cookies, Cloudflare bypass)")
     parser.add_argument("--cdp-url", default=None, help="Custom CDP endpoint URL or port (e.g. http://127.0.0.1:9222, ws://... or 9222)")
-    parser.add_argument("--bsk", "--browserskill", dest="browserskill", action="store_true", help="Connect to running browser via Tencent BrowserSkill (bsk) to inherit university SSO & bypass Turnstile")
-    parser.add_argument("--bsk-browser", dest="bsk_browser", default=None, help="Target specific browser instance name/id for BrowserSkill")
-    parser.add_argument("--bsk-tab", dest="bsk_tab", default=None, help="Borrow specific active browser tab ID via BrowserSkill")
+    add_browserskill_arguments(parser)
     parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
+
+    with runtime_from_args(args, parser) as bsk_runtime:
+        try:
+            return run_download(args, bsk_runtime)
+        except BrowserSkillError as exc:
+            print(f"BrowserSkill: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+
+
+def run_download(args, bsk_runtime):
 
     config = load_config() if HAS_SCANSCI else {}
     if os.environ.get("ELSEVIER_API_KEY"):
@@ -1353,21 +1355,6 @@ def main():
     if os.environ.get("ELSEVIER_INSTTOKEN"):
         config["elsevier_insttoken"] = os.environ["ELSEVIER_INSTTOKEN"].strip()
     os.makedirs(args.output_dir, exist_ok=True)
-
-    bsk_session = None
-    if getattr(args, "browserskill", False) and is_browserskill_available() and BrowserSkillSession:
-        try:
-            bsk_session = BrowserSkillSession(
-                browser=getattr(args, "bsk_browser", None),
-                no_focus=True,
-                timeout=60.0,
-            )
-            bsk_session.start()
-            import atexit
-            atexit.register(lambda: bsk_session.stop() if bsk_session else None)
-        except Exception as e_start:
-            print(f"  [BrowserSkill] Notice: Could not start persistent session: {e_start}")
-            bsk_session = None
 
     if getattr(args, "browserskill", False):
         print("  [BrowserSkill] Tencent BrowserSkill mode active")
@@ -1416,7 +1403,7 @@ def main():
         known_mmcs.update(detected_mmcs)
 
     if api_files:
-        _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config)
+        _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config, bsk_runtime=bsk_runtime)
         return
 
     # ── Step 3: Tier 0 — CDN Brute-Force (fast, no auth) ─────────────────
@@ -1430,7 +1417,7 @@ def main():
         )
 
     if cdn_files:
-        _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config)
+        _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config, bsk_runtime=bsk_runtime)
         return
 
     # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
@@ -1492,9 +1479,16 @@ def main():
         cdp_url=ws_cdp_url,
         use_bsk=getattr(args, "browserskill", False),
         bsk_browser=getattr(args, "bsk_browser", None),
-        bsk_session=bsk_session,
+        bsk_runtime=bsk_runtime,
         bsk_tab=getattr(args, "bsk_tab", None),
     )
+    if (not html_content or status >= 400) and bsk_runtime.enabled and not args.browserskill:
+        try:
+            html_content, status, final_url = fetch_page_via_browserskill(url, runtime=bsk_runtime)
+        except BrowserSkillError as exc:
+            if bsk_runtime.browser or bsk_runtime.tab_id:
+                raise
+            print(f"  [BrowserSkill] Recovery failed: {exc}")
     if not html_content:
         print("  ERROR: Failed to fetch article page.")
         print("  Possible causes: Cloudflare block, network issue, or authentication required.")
@@ -1521,7 +1515,7 @@ def main():
 
     # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
     is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
-    if (not candidates or is_inc) and HAS_SCRAPLING and session:
+    if (not candidates or is_inc) and HAS_SCRAPLING and session and not args.browserskill:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
             url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
@@ -1550,9 +1544,11 @@ def main():
                     print(f"  Updated Title:  {article_dirname}")
                     print(f"  Updated Folder: {article_dir}")
 
+    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+
     # Tier 3 (CDP Live Browser Probe): If still no candidates/incomplete and CDP wasn't explicitly provided,
     # probe if an active running browser is available to bypass Turnstile or inherit SSO
-    if (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING:
+    if (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -1586,8 +1582,10 @@ def main():
                     html_content = cdp_html
                     effective_base = cdp_base
 
+    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
-    if (not candidates or is_inc) and is_browserskill_available():
+    if (not candidates or is_inc) and bsk_runtime.enabled:
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
@@ -1595,9 +1593,9 @@ def main():
                 timeout=60.0,
                 browser=getattr(args, "bsk_browser", None),
                 tab_id=getattr(args, "bsk_tab", None),
-                session=bsk_session,
+                runtime=bsk_runtime,
             )
-            if bsk_html:
+            if bsk_html and bsk_status < 400:
                 bsk_base = extract_effective_base_url(bsk_html, bsk_final or url)
                 bsk_diag = find_all_candidates(bsk_html, bsk_base, original_url=args.url_or_doi)
                 if bsk_diag.candidates:
@@ -1610,7 +1608,10 @@ def main():
                     diag = bsk_diag
                     html_content = bsk_html
                     effective_base = bsk_base
+                    url = bsk_final or url
         except Exception as e_bsk:
+            if bsk_runtime.browser or bsk_runtime.tab_id:
+                raise
             print(f"  [Tier 3-BSK] Notice: {e_bsk}")
 
     # Tier OA Penetration: If still no candidates or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
@@ -1705,7 +1706,7 @@ def main():
             article_dir,
             session,
             play_cookies,
-            bsk_session=bsk_session,
+            bsk_runtime=bsk_runtime,
             referer=url,
         )
         if res:
@@ -1758,8 +1759,6 @@ def main():
         converted = convert_directory_supplements(article_dir)
         print(f"  Converted {len(converted)} file(s) to Markdown sidecars.")
 
-    if bsk_session:
-        bsk_session.stop()
 
 
 if __name__ == "__main__":

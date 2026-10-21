@@ -10,6 +10,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
+
+import pytest
 from unittest.mock import MagicMock, call, patch
 
 repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -34,6 +37,18 @@ from browserskill_adapter import (
 )
 import journal_downloader
 import scansci_supp_downloader
+
+
+@pytest.fixture(autouse=True)
+def isolate_exit_handlers():
+    # Test-created fake session IDs must never reach a real process at interpreter exit.
+    with patch("browserskill_adapter.atexit.register"), patch("browserskill_adapter.atexit.unregister"):
+        yield
+
+
+def write_native_download(command, **kwargs):
+    Path(command[command.index("--out") + 1]).write_bytes(b"x,y\n1,2\n")
+    return subprocess.CompletedProcess(command, 0, "Downloaded", "")
 
 
 class TestBrowserSkillDiscovery(unittest.TestCase):
@@ -292,7 +307,7 @@ class TestBrowserSkillSession(unittest.TestCase):
             html = sess.get_html()
             self.assertIn("<title>Test</title>", html)
             mock_run.assert_called_once_with(
-                ["/bin/bsk", "get-html", "--session", "sess_html"],
+                ["/bin/bsk", "get-html", "--session", "sess_html", "--json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -388,18 +403,15 @@ class TestBrowserSkillSession(unittest.TestCase):
     def test_download_ref(self):
         sess = BrowserSkillSession(bsk_bin="/bin/bsk")
         sess.session_id = "sess_dl"
-        mock_proc = MagicMock(returncode=0, stdout="Downloaded to file.pdf")
-        with patch("subprocess.run", return_value=mock_proc) as mock_run:
-            with patch("os.makedirs"):
-                out = sess.download("@e1", "/tmp/file.pdf")
-                self.assertEqual(out, "/tmp/file.pdf")
-                mock_run.assert_called_once_with(
-                    ["/bin/bsk", "download", "@e1", "--session", "sess_dl", "--out", "/tmp/file.pdf", "--overwrite"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=60.0,
-                )
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "table.csv")
+            with patch("subprocess.run", side_effect=write_native_download) as run:
+                self.assertEqual(sess.download("@e1", output), output)
+            self.assertEqual(Path(output).read_bytes(), b"x,y\n1,2\n")
+            command = run.call_args.args[0]
+            self.assertEqual(command[2], "@e1")
+            self.assertNotEqual(command[command.index("--out") + 1], output)
+            self.assertEqual(os.listdir(td), ["table.csv"])
 
     def test_download_url_authenticated_success(self):
         sess = BrowserSkillSession(bsk_bin="/bin/bsk")
@@ -499,25 +511,28 @@ class TestFetchPageViaBrowserSkill(unittest.TestCase):
 class TestDownloadFileViaBrowserSkill(unittest.TestCase):
 
     def test_download_file_via_browserskill_success(self):
-        start_proc = MagicMock(returncode=0, stdout=json.dumps({"session_id": "dl_sess"}))
-        dl_proc = MagicMock(returncode=0, stdout="Downloaded")
-        stop_proc = MagicMock(returncode=0, stdout="Stopped")
-
-        with patch("browserskill_adapter.find_bsk_executable", return_value="/bin/bsk"):
-            with patch("subprocess.run", side_effect=[start_proc, dl_proc, stop_proc]):
-                with patch("os.makedirs"):
-                    res = download_file_via_browserskill("@e1", "/tmp/s1.xlsx")
-                    self.assertEqual(res, "/tmp/s1.xlsx")
+        def cli(command, **kwargs):
+            if command[1:3] == ["session", "start"]:
+                return subprocess.CompletedProcess(command, 0, '{"session_id":"dl_sess"}', "")
+            if command[1] == "download":
+                return write_native_download(command, **kwargs)
+            return subprocess.CompletedProcess(command, 0, "Stopped", "")
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "table.csv")
+            with patch("browserskill_adapter.find_bsk_executable", return_value="/bin/bsk"), patch("subprocess.run", side_effect=cli) as run:
+                self.assertEqual(download_file_via_browserskill("@e1", output), output)
+            self.assertEqual(Path(output).read_bytes(), b"x,y\n1,2\n")
+            self.assertEqual(run.call_args.args[0], ["/bin/bsk", "session", "stop", "dl_sess"])
 
     def test_download_file_via_browserskill_with_active_session(self):
         sess = BrowserSkillSession(bsk_bin="/bin/bsk")
         sess.session_id = "active_sess_1"
-        dl_proc = MagicMock(returncode=0, stdout="Downloaded")
-
-        with patch("subprocess.run", return_value=dl_proc):
-            with patch("os.makedirs"):
-                res = download_file_via_browserskill("@e2", "/tmp/s2.xlsx", session=sess)
-                self.assertEqual(res, "/tmp/s2.xlsx")
+        with tempfile.TemporaryDirectory() as td:
+            output = os.path.join(td, "table.csv")
+            with patch("subprocess.run", side_effect=write_native_download) as run:
+                self.assertEqual(download_file_via_browserskill("@e2", output, session=sess), output)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(sess.session_id, "active_sess_1")
 
 
 class TestDownloaderIntegrations(unittest.TestCase):

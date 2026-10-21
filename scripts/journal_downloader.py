@@ -70,20 +70,15 @@ except ImportError:
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
     fetch_page_via_cdp = lambda ep, url, wait_selector=None, timeout=30.0: None
 
-try:
-    from browserskill_adapter import (
-        is_browserskill_available,
-        fetch_page_via_browserskill,
-        check_browserskill_status,
-        download_file_via_browserskill,
-        BrowserSkillSession,
-    )
-except ImportError:
-    is_browserskill_available = lambda timeout=2.0: False
-    fetch_page_via_browserskill = lambda *a, **kw: None
-    check_browserskill_status = lambda *a, **kw: {"available": False}
-    download_file_via_browserskill = lambda *a, **kw: None
-    BrowserSkillSession = None
+from browserskill_adapter import (
+    BrowserSkillError,
+    BrowserSkillRuntime,
+    add_browserskill_arguments,
+    runtime_from_args,
+    fetch_page_via_browserskill,
+    download_file_via_browserskill,
+)
+
 
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
@@ -138,7 +133,7 @@ def is_html_file(filepath):
     return not is_valid
 
 
-def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, referer=None):
+def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, referer=None, bsk_runtime=None):
     """
     Download a single file using HTTP Fetcher (not browser-based).
     Validates content signatures and HTTP headers, avoiding arbitrary 1 KB threshold.
@@ -168,6 +163,8 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     try:
         get_kwargs = {"stealthy_headers": True, "timeout": 30000}
+        if referer:
+            get_kwargs["headers"] = {"Referer": referer}
         if cookies:
             get_kwargs["cookies"] = cookies_to_dict(cookies, url)
 
@@ -189,6 +186,8 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 }
+                if referer:
+                    req_headers["Referer"] = referer
                 r = sess.get(url, timeout=30, headers=req_headers, verify=False)
                 if r.status_code < 400 and r.content:
                     resp = type("Resp", (), {"status": r.status_code, "body": r.content, "headers": dict(r.headers)})()
@@ -197,8 +196,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
 
         if resp is None or resp.status >= 400:
             status_desc = f"HTTP {resp.status}" if resp else "Connection error"
-            print(f"{status_desc}")
-            return None
+            raise RuntimeError(status_desc)
 
         # Try to get filename from Content-Disposition
         hdr = {k.lower(): v for k, v in (resp.headers or {}).items()}
@@ -247,46 +245,21 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             save_download_manifest(output_dir, manifest)
             print(f"OK ({size_kb:.1f} KB - {reason})")
             return filepath
-        else:
-            if os.path.exists(filepath):
-                os.remove(filepath)
-            if is_browserskill_available():
-                try:
-                    bsk_dl = download_file_via_browserskill(
-                        url, filepath, session=bsk_session, referer=referer
-                    )
-                    if bsk_dl and os.path.exists(filepath):
-                        is_val_bsk, reason_bsk = validate_downloaded_file(filepath)
-                        if is_val_bsk:
-                            manifest[fname] = url
-                            save_download_manifest(output_dir, manifest)
-                            size_kb = os.path.getsize(filepath) / 1024
-                            print(f"OK (via BrowserSkill, {size_kb:.1f} KB - {reason_bsk})")
-                            return filepath
-                except Exception:
-                    pass
-            print(f"FAIL: {reason}")
-            return None
+        raise RuntimeError(reason)
 
-    except Exception as e:
+    except Exception as exc:
         if os.path.exists(filepath):
             os.remove(filepath)
-        if is_browserskill_available():
-            try:
-                bsk_dl = download_file_via_browserskill(
-                    url, filepath, session=bsk_session, referer=referer
-                )
-                if bsk_dl and os.path.exists(filepath):
-                    is_val_bsk, reason_bsk = validate_downloaded_file(filepath)
-                    if is_val_bsk:
-                        manifest[fname] = url
-                        save_download_manifest(output_dir, manifest)
-                        size_kb = os.path.getsize(filepath) / 1024
-                        print(f"OK (via BrowserSkill, {size_kb:.1f} KB - {reason_bsk})")
-                        return filepath
-            except Exception:
-                pass
-        print(f"FAIL: {e}")
+        if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
+            result = download_file_via_browserskill(
+                url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime
+            )
+            if result:
+                manifest[fname] = url
+                save_download_manifest(output_dir, manifest)
+                print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
+                return filepath
+        print(f"FAIL: {exc}")
         return None
 
 
@@ -348,18 +321,7 @@ def main():
         "--cdp-url", default=None,
         help="Custom CDP endpoint URL or port (e.g. http://127.0.0.1:9222, ws://... or 9222)"
     )
-    parser.add_argument(
-        "--bsk", "--browserskill", dest="browserskill", action="store_true",
-        help="Connect to running browser via Tencent BrowserSkill (bsk) to inherit university SSO & bypass Turnstile"
-    )
-    parser.add_argument(
-        "--bsk-browser", dest="bsk_browser", default=None,
-        help="Target specific browser instance name/id for BrowserSkill"
-    )
-    parser.add_argument(
-        "--bsk-tab", dest="bsk_tab", default=None,
-        help="Borrow specific active browser tab ID via BrowserSkill instead of opening new navigation"
-    )
+    add_browserskill_arguments(parser)
     parser.add_argument(
         "--list-only", action="store_true",
         help="Only list found links with diagnostic evidence, don't download"
@@ -377,6 +339,16 @@ def main():
         help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown"
     )
     args = parser.parse_args()
+
+    with runtime_from_args(args, parser) as bsk_runtime:
+        try:
+            return run_download(args, bsk_runtime)
+        except BrowserSkillError as exc:
+            print(f"BrowserSkill: {exc}", file=sys.stderr)
+            raise SystemExit(1) from exc
+
+
+def run_download(args, bsk_runtime):
 
     os.makedirs(args.output_dir, exist_ok=True)
     solve_cf = not args.no_cloudflare and args.solve_cloudflare
@@ -423,21 +395,6 @@ def main():
         fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
 
     page = None
-    bsk_session = None
-    if getattr(args, "browserskill", False) and is_browserskill_available() and BrowserSkillSession:
-        try:
-            bsk_session = BrowserSkillSession(
-                browser=getattr(args, "bsk_browser", None),
-                no_focus=True,
-                timeout=args.timeout / 1000.0,
-            )
-            bsk_session.start()
-            import atexit
-            atexit.register(lambda: bsk_session.stop() if bsk_session else None)
-        except Exception as e_start:
-            print(f"  [BrowserSkill] Notice: Could not start persistent session: {e_start}")
-            bsk_session = None
-
     # Primary BrowserSkill check if requested via --bsk / --browserskill
     if getattr(args, "browserskill", False):
         print("  [BrowserSkill] Fetching page via Tencent BrowserSkill (bsk)...")
@@ -448,7 +405,7 @@ def main():
                 timeout=args.timeout / 1000.0,
                 browser=getattr(args, "bsk_browser", None),
                 tab_id=getattr(args, "bsk_tab", None),
-                session=bsk_session,
+                runtime=bsk_runtime,
             )
             if bsk_html and bsk_status < 400:
                 print("  [BrowserSkill] Successfully retrieved page DOM from live browser session.")
@@ -459,6 +416,8 @@ def main():
                     "status": bsk_status,
                 })()
         except Exception as e_bsk:
+            if bsk_runtime.browser or bsk_runtime.tab_id:
+                raise
             print(f"  [BrowserSkill] Fetch notice: {e_bsk}. Falling back to CDP/StealthyFetcher...")
 
     # Check CDP connectivity if requested or if --cdp / --cdp-url specified
@@ -533,25 +492,18 @@ def main():
                 except Exception as e3:
                     print(f"  [Recovery] HTTP direct fetch failed: {e3}")
 
-            if page is None and not getattr(args, "browserskill", False) and is_browserskill_available():
-                print("  [Recovery] Attempting fetch via Tencent BrowserSkill (bsk)...")
-                try:
-                    bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
-                        fetch_url,
-                        wait_selector=args.wait_selector,
-                        timeout=args.timeout / 1000.0,
-                        browser=getattr(args, "bsk_browser", None),
-                    )
-                    if bsk_html and bsk_status < 400:
-                        print("  [BrowserSkill] Successfully retrieved page DOM via BrowserSkill fallback.")
-                        page = type("BrowserSkillPage", (), {
-                            "html_content": bsk_html,
-                            "text": bsk_html,
-                            "url": bsk_final,
-                            "status": bsk_status,
-                        })()
-                except Exception as e_bsk_rec:
-                    print(f"  [Recovery] BrowserSkill fallback fetch failed: {e_bsk_rec}")
+
+    if (page is None or getattr(page, "status", 200) >= 400) and bsk_runtime.enabled and not args.browserskill:
+        try:
+            html, status, landing = fetch_page_via_browserskill(
+                fetch_url, wait_selector=args.wait_selector,
+                timeout=args.timeout / 1000.0, runtime=bsk_runtime,
+            )
+            page = type("BrowserSkillPage", (), {"html_content": html, "text": html, "url": landing, "status": status})()
+        except BrowserSkillError as exc:
+            if bsk_runtime.browser or bsk_runtime.tab_id:
+                raise
+            print(f"  [Recovery] BrowserSkill: {exc}")
 
     if page is None:
         print(f"Error: Unable to fetch page content from {fetch_url}.")
@@ -590,7 +542,25 @@ def main():
     diag = find_all_candidates(html_content, effective_base, original_url=args.url)
     candidates = diag.candidates
 
-    if diag.is_incomplete and not args.wait_selector:
+    if (not candidates or diag.is_incomplete) and bsk_runtime.enabled and not args.wait_selector:
+        try:
+            retry_html, _, retry_url = fetch_page_via_browserskill(
+                fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
+            )
+            retry_base = extract_effective_base_url(retry_html, retry_url)
+            retry_diag = find_all_candidates(retry_html, retry_base, original_url=args.url)
+            seen = {c.url for c in candidates}
+            candidates.extend(c for c in retry_diag.candidates if c.url not in seen)
+            if retry_diag.candidates:
+                diag = retry_diag
+                diag.candidates = candidates
+                final_url, effective_base = retry_url, retry_base
+        except BrowserSkillError as exc:
+            if bsk_runtime.browser or bsk_runtime.tab_id:
+                raise
+            print(f"  [Recovery] BrowserSkill: {exc}")
+
+    if diag.is_incomplete and not args.wait_selector and not args.browserskill:
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
@@ -697,7 +667,7 @@ def main():
     success = 0
     for cand in candidates:
         result = download_file(
-            cand, article_dir, cookies=cookies, bsk_session=bsk_session, referer=fetch_url
+            cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime, referer=final_url
         )
         if result:
             success += 1
@@ -710,8 +680,6 @@ def main():
         converted = convert_directory_supplements(article_dir)
         print(f"Converted {len(converted)} file(s) to Markdown sidecars.")
 
-    if bsk_session:
-        bsk_session.stop()
 
 
 if __name__ == "__main__":

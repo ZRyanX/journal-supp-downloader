@@ -1,6 +1,6 @@
 # Journal Supplementary Data Downloader (文献附表与附件自动下载工具)
 
-本工具用于从主流学术期刊网站（Elsevier ScienceDirect, SpringerLink, Nature, Wiley 等）自动识别并批量下载文章的补充数据/附表文件（如 `xlsx`, `csv`, `zip`, `docx` 等）。支持绕过 Cloudflare 验证，并内置了多级下载策略（API -> CDN 直连 -> 页面解析 -> 浏览器渲染模拟）。
+本工具用于从主流学术期刊网站（Elsevier ScienceDirect, SpringerLink, Nature, Wiley 等）自动识别并批量下载文章的补充数据/附表文件（如 `xlsx`, `csv`, `zip`, `docx` 等）。支持处理动态页面与复用浏览器认证会话，并内置了多级下载策略（API -> CDN 直连 -> 页面解析 -> 浏览器渲染模拟）。
 
 本仓库已内置 [scansci-pdf](https://github.com/Rimagination/scansci-pdf) 核心组件，支持作为独立项目运行，也可与全局 `scansci-pdf` 联动。
 
@@ -25,10 +25,10 @@
   - **Tier A**：Elsevier API 检索（极速，需 API 密钥与机构网络，约 3 秒）。
   - **Tier 0**：Elsevier CDN 暴力匹配（无需任何认证，约 1 秒/文件）。
   - **Tier 1**：期刊直接链接下载（基于 Requests 会话，带 Cookie）。
-  - **Tier 2**：Scrapling 浏览器渲染（自动绕过 Cloudflare Turnstile/验证码，约 15 秒）。
-  - **Tier 3 (全新增强)**：CDP 实时浏览器直连（支持 `--cdp` 自动发现或 `--cdp-url`，直接附加到用户日常运行的 Chrome/Edge，复用机构 SSO 与有效凭据，100% 自然通过 Turnstile 防护）。
-  - **Tier BSK (全新增强)**：Tencent BrowserSkill 深度协同（支持 `--bsk`，原生集成腾讯开源 [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill)，AI Agent 无需设置任何调试端口即可直接借用日常 Chromium 浏览器会话，无感复用大学 CARSI/机构 SSO 与真实 Cookie，自然穿透 Turnstile，支持 DOM 自动展开提取与失败下载直通兜底）。
-  - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，突破付费墙与反爬限制秒级提取附表）。
+  - **Tier 2**：Scrapling 浏览器渲染（用于动态页面；验证是否通过取决于站点与浏览器环境）。
+  - **Tier 3 (全新增强)**：CDP 实时浏览器直连（支持 `--cdp` 自动发现或 `--cdp-url`，直接附加到用户日常运行的 Chrome/Edge，复用机构 SSO 与有效凭据，可能仍需用户完成 Turnstile 验证）。
+  - **Tier BSK (全新增强)**：Tencent BrowserSkill 深度协同（支持 `--bsk`，原生集成腾讯开源 [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill)，AI Agent 无需设置任何调试端口即可直接借用日常 Chromium 浏览器会话，复用已有登录态；支持 DOM 展开、任务级会话复用与认证下载恢复，验证可能仍需用户操作）。
+  - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，从可访问的公开来源查找附表，需核对其完整性）。
 * **智能过滤**：自动识别真实的数据文件（支持 Parquet、Feather、Arrow、压缩表格等，排除插图 `gr1.jpg`、参考文献、页面广告等）。
 * **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软 MarkItDown 将下载的附表（`.docx`, `.xlsx`, `.pdf`）一键解包转换为 Markdown 副本及摘要索引，100% 保护原始科研数据完整性。
 * **自动重命名与归档**：使用 Unpaywall / OpenAlex / CrossRef API 自动查询文献标题并规范化命名文件夹，将所有附件统一整理。
@@ -67,10 +67,10 @@ python scripts/journal_downloader.py "<url>" --headful
 # 仅列出链接，不执行下载
 python scripts/journal_downloader.py "<url>" --list-only
 
-# 直连已打开的日常 Chrome 浏览器（自动复用登录态与机构 SSO，自然穿透 Turnstile）
+# 直连已打开的日常 Chrome 浏览器（复用已有登录态与机构 SSO）
 python scripts/journal_downloader.py "<url>" --cdp
 
-# 使用腾讯 BrowserSkill 协同抓取（免配调试端口，后台无感运行）
+# 使用腾讯 BrowserSkill 协同抓取（免配调试端口，独立 Agent Window）
 python scripts/journal_downloader.py "<url_or_doi>" --bsk
 
 # 借用日常浏览器已打开的文献标签页（免重新加载，零等待）
@@ -100,6 +100,21 @@ python scripts/scansci_supp_downloader.py "<url_or_doi>" --bsk --bsk-tab <tab-id
 ```
 
 ### 3. Tencent BrowserSkill 独立协同与管理工具 (`browserskill_adapter.py`)
+
+BrowserSkill 保持为外部可选依赖，需要单独安装 `bsk` CLI 和浏览器扩展。[接入、兼容性与故障处理](references/browserskill.md) 提供完整说明。
+
+**行为变更**：仅安装 `bsk` 不再自动触发个人浏览器接入。使用 `--bsk` 优先读取页面，或 `--bsk-auto` 允许失败/附件缺漏时按需恢复；`--no-bsk` 显式禁用 BrowserSkill。指定 `--bsk-browser` / `--bsk-tab` 会自动启用接入，与 `--bsk-auto` 合用时保持按需模式。
+
+```bash
+# 自动恢复模式：普通请求成功时无需启动 BrowserSkill
+python scripts/journal_downloader.py "<doi_or_url>" --bsk-auto
+python scripts/scansci_supp_downloader.py "<doi_or_url>" --bsk-auto
+
+# 结构化健康检查，只有 CLI、daemon 和浏览器连接均可用才返回成功
+python scripts/browserskill_adapter.py status --json
+```
+
+一次任务复用一个按需启动的会话，借用标签页保留至附件处理结束，并在成功、提前返回或异常时清理。HTTP 403、无效内容和连接失败均支持浏览器恢复；小文件页内传输限制为 8 MiB，大文件通过原生下载路径处理。文件先落到临时目录，内容校验通过后提交，避免把错误页登记为附件。
 提供环境自检、活跃会话监控、标签页借用与网页抓取功能：
 ```bash
 # 检查 BrowserSkill 与日常浏览器联通状态
@@ -207,6 +222,8 @@ journal-supp-downloader/
 ├── README.md                  # 说明文档
 ├── SKILL.md                   # 技能规范与详细说明
 ├── requirements.txt           # 依赖清单
+├── references/
+│   └── browserskill.md         # BrowserSkill 配置、模式与诊断边界
 ├── scripts/
 │   ├── browserskill_adapter.py# 腾讯 BrowserSkill (bsk) 协同接口与 CLI 适配器
 │   ├── supp_finder.py         # 统一补充附件与表格候选识别、证据链与文件验证模块
@@ -219,7 +236,8 @@ journal-supp-downloader/
 │   ├── test_api.py            # API 认证连通性测试脚本
 │   └── test_fetch.py          # 校园网直连与附件解析测试脚本
 ├── tests/
-│   ├── test_browserskill_adapter.py # BrowserSkill 适配器与协同测试集 (44 tests)
+│   ├── test_browserskill_adapter.py # BrowserSkill 适配器与协同测试集 (会话、协议、下载与恢复测试)
+│   ├── test_browserskill_reliability.py # 故障恢复、文件校验与完整 CLI 流程
 │   ├── test_supp_finder.py    # 补充附件提取测试集 (85 tests)
 │   ├── test_oa_resolver.py    # Unpaywall / OpenAlex 开放获取测试集 (7 tests)
 │   ├── test_playwright_utils.py # CDP 与浏览器定位测试集 (59 tests)
@@ -232,12 +250,12 @@ journal-supp-downloader/
 ## 常见问题 FAQ
 
 #### Q: 在 AI Agent 安装 Tencent/BrowserSkill 后是不是能更好地运用该技能的功能？
-A: **是的，能带来质的飞跃**：
+A: 对需要已有登录态的文章有帮助。安装 CLI、连接扩展并启用 `--bsk` / `--bsk-auto` 后：
 1. **彻底免去配置 Chrome 远程调试端口**：传统 CDP 直连要求用户彻底退出正在工作的浏览器并携带 `--remote-debugging-port=9222` 重启；而安装 Tencent BrowserSkill 后，只需日常浏览器加载其轻量扩展并启动后台守护进程 (`bsk daemon start`)，AI Agent 即可直接与日常浏览器通信。
 2. **无感复用校园网 SSO 与机构权限**：用户日常浏览器只要保持校园网 VPN / CARSI 或 Elsevier/Springer 登录，BrowserSkill 就能直接借用其身份发起请求，无需手动提取和更新 `cookies.json`。
-3. **100% 自然绕过 Cloudflare Turnstile**：依托用户真实的浏览器指纹与环境，人机验证自然通过，杜绝无头浏览器被 WAF 阻断的困境。
-4. **后台静默运行（`--no-focus`）**：任务在独立的 Agent 窗口运行，不会夺取用户屏幕焦点或干扰日常工作。
-5. **双向下载兜底**：若常规 HTTP 请求因权限问题遭遇 401/403 付费墙，下载器会自动回退至 `bsk download` 通过真实浏览器会话完成附件下载。
+3. **复用真实浏览器环境**：可使用已有登录态；Cloudflare、人机验证和机构认证仍可能需要用户操作，不能保证通过。
+4. **独立 Agent Window**：请求后台启动；窗口焦点和借用确认仍受浏览器扩展设置影响。
+5. **双向下载兜底**：启用 BrowserSkill 后，常规 HTTP 的 401/403 或无效内容会进入认证下载恢复路径；文件校验通过后才提交结果。
 
 #### Q: 提示 "No Cloudflare challenge found"？
 A: 这是正常提示。说明目标期刊网站当前未开启 Cloudflare 验证或验证已被自动静默绕过，脚本已直接进入正常页面解析。

@@ -707,7 +707,7 @@ class TestSuppFinder(unittest.TestCase):
             with open(existing_files[0], "wb") as f:
                 f.write(b"data")
 
-            def fake_fetch_page(url, session, cookies, headful, force_browser=False):
+            def fake_fetch_page(url, session, cookies, headful, force_browser=False, **kwargs):
                 return html_with_unlinked_mmc, 200, url
 
             with patch("scansci_supp_downloader.fetch_page_html", side_effect=fake_fetch_page), \

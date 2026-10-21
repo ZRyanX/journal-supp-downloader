@@ -4,23 +4,23 @@ Tencent BrowserSkill (bsk) Adapter Module for journal-supp-downloader.
 
 Connects AI agents and journal downloaders to the user's running Chrome or Edge browser
 via Tencent/BrowserSkill (https://github.com/Tencent/BrowserSkill).
-Inherits authenticated university/institution subscriptions, CARSI SSO, publisher cookies,
-and naturally passes Cloudflare Turnstile without requiring manual remote debugging flags.
+Reuses existing institutional and publisher login state without remote debugging flags. Verification may still need user interaction.
 
 Key Features:
 - Auto-discovery of bsk CLI binary across macOS, Linux, and Windows (supporting BSK_HOME,
   BSK_INSTALL_DIR, ~/.local/bin, ~/.cargo/bin, and system PATH)
 - Structured status diagnostics (daemon health, extension connectivity, browser sessions)
 - Safe session lifecycle management (with automatic cleanup on error or exit)
-- DOM extraction via native 'bsk get-html' with accordion expansion & evaluate fallback
+- DOM and landing-URL extraction with accordion expansion and get-html fallback
 - Visual Object Model inspection ('bsk observe') and interaction ('bsk click')
 - User tab borrowing & return ('bsk tab borrow' / 'bsk tab return') for zero-friction handoff
-- Authenticated in-session file download with Base64 transfer & 'bsk download' fallback
+- Bounded small-file transfer and native browser download with atomic file validation
 - Seamless persistent session reuse across page fetch and supplementary downloads
 - Standalone CLI interface (status, doctor, sessions, tabs, fetch, borrow-fetch, observe, download, stop-all)
 """
 
 import argparse
+import atexit
 import base64
 import json
 import os
@@ -30,7 +30,10 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union
+import uuid
+import warnings
+from urllib.parse import urlparse
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class BrowserSkillError(Exception):
@@ -51,6 +54,10 @@ class BrowserSkillDaemonError(BrowserSkillError):
 class BrowserSkillSessionError(BrowserSkillError):
     """Raised when starting, operating, or closing a BrowserSkill session fails."""
     pass
+
+
+class BrowserSkillBindingError(BrowserSkillSessionError):
+    """The requested browser or user tab cannot be used; do not substitute another."""
 
 
 class BrowserSkillExecutionError(BrowserSkillError):
@@ -210,6 +217,7 @@ def check_browserskill_status(
     if not exe:
         return {
             "available": False,
+            "ready": False,
             "bsk_path": None,
             "version": None,
             "daemon_running": False,
@@ -251,43 +259,24 @@ def check_browserskill_status(
         browser_connected = False
         browsers = []
 
-        if isinstance(parsed, dict):
-            # Check daemon status
-            daemon_val = parsed.get("daemon") or parsed.get("daemon_running") or parsed.get("daemon_status")
+        if isinstance(parsed, dict) and s_res.returncode == 0:
+            # Current CLI returns StatusResult directly (daemon_version, pid, browsers).
+            daemon_val = parsed.get("daemon", parsed.get("daemon_running"))
             if isinstance(daemon_val, dict):
-                daemon_running = bool(daemon_val.get("running") or daemon_val.get("ok"))
+                daemon_running = daemon_val.get("running") is True or daemon_val.get("ok") is True
             elif isinstance(daemon_val, bool):
                 daemon_running = daemon_val
-            elif parsed.get("status") in ("ok", "ready", "running") or parsed.get("ok") is True:
-                daemon_running = True
-
-            # Check browser/extension connectivity
-            browsers = parsed.get("browsers") or parsed.get("connected_browsers") or []
-            if browsers or parsed.get("browser_connected") or parsed.get("extension_connected"):
-                browser_connected = True
-        elif s_res.returncode == 0:
-            daemon_running = "daemon" in raw_out.lower() or "running" in raw_out.lower()
-            browser_connected = "connected" in raw_out.lower()
-
-        # Check 'bsk browsers' as well if status output didn't list any
-        if daemon_running and not browsers:
-            try:
-                b_res = subprocess.run(
-                    [exe, "browsers", "--json"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=timeout,
-                )
-                b_parsed = _parse_json_safely(b_res.stdout)
-                if isinstance(b_parsed, list):
-                    browsers = b_parsed
-                elif isinstance(b_parsed, dict) and "browsers" in b_parsed:
-                    browsers = b_parsed["browsers"]
-                if browsers:
-                    browser_connected = True
-            except Exception:
-                pass
+            else:
+                daemon_running = bool(parsed.get("daemon_version")) or parsed.get("ok") is True or parsed.get("status") in ("ok", "ready", "running")
+            raw_browsers = parsed.get("browsers", parsed.get("connected_browsers", []))
+            browsers = raw_browsers if isinstance(raw_browsers, list) else []
+            browser_connected = daemon_running and (
+                any(not isinstance(b, dict) or b.get("connected", True) is not False for b in browsers)
+                or parsed.get("browser_connected") is True
+                or parsed.get("extension_connected") is True
+            )
+        # Unknown text formats are not evidence of readiness: "disconnected"
+        # and "not running" used to be incorrectly classified as healthy.
 
         msg = "BrowserSkill is ready." if (daemon_running and browser_connected) else (
             "Daemon is running, but no browser extension connected." if daemon_running else (
@@ -303,6 +292,9 @@ def check_browserskill_status(
             "browser_connected": browser_connected,
             "browsers": browsers,
             "message": msg,
+            "ready": daemon_running and browser_connected,
+            "protocol_version": parsed.get("protocol_version") if isinstance(parsed, dict) else None,
+            "version_skew_browsers": parsed.get("version_skew_browsers", []) if isinstance(parsed, dict) else [],
             "raw": parsed or raw_out,
         }
     except Exception as e:
@@ -313,6 +305,7 @@ def check_browserskill_status(
             "daemon_running": False,
             "browser_connected": False,
             "browsers": [],
+            "ready": False,
             "message": f"Failed to query BrowserSkill daemon status: {e}",
             "raw": None,
         }
@@ -338,6 +331,9 @@ class BrowserSkillSession:
         self.bsk_bin = bsk_bin or find_bsk_executable()
         self.timeout = timeout
         self.session_id: Optional[str] = None
+        self.borrowed_tabs = set()
+        self.tab_id: Optional[str] = None
+        self.current_url: Optional[str] = None
 
         if not self.bsk_bin:
             raise BrowserSkillUnavailableError(
@@ -373,6 +369,8 @@ class BrowserSkillSession:
             raise BrowserSkillSessionError(f"BrowserSkill failed to start session: {err_msg}")
 
         parsed = _parse_json_safely(res.stdout)
+        if isinstance(parsed, dict) and parsed.get("ok") is False:
+            raise BrowserSkillSessionError(f"Session start failed: {parsed.get('error')}")
         sid = None
         if isinstance(parsed, dict):
             sid = (
@@ -404,6 +402,7 @@ class BrowserSkillSession:
             )
 
         self.session_id = str(sid)
+        atexit.register(self.stop)
         return self.session_id
 
     def stop(self) -> bool:
@@ -413,18 +412,29 @@ class BrowserSkillSession:
         if not self.session_id:
             return True
         sid = self.session_id
-        self.session_id = None
+        # Return borrowed tabs even if stopping the session later fails.
+        for tab_id in list(self.borrowed_tabs):
+            self.tab_return(tab_id)
         try:
             res = subprocess.run(
                 [self.bsk_bin, "session", "stop", sid],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=15.0,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, timeout=15.0,
             )
-            return res.returncode == 0
+            if res.returncode == 0:
+                self.session_id = None
+                self.tab_id = None
+                self.current_url = None
+                self.borrowed_tabs.clear()
+                atexit.unregister(self.stop)
+                return True
         except Exception:
-            return False
+            pass
+        warnings.warn(f"BrowserSkill session {sid} could not be stopped; run bsk session stop {sid}.", RuntimeWarning)
+        return False
+
+    def _target_args(self):
+        return ["--tab-id", self.tab_id] if self.tab_id else []
 
     def __enter__(self) -> "BrowserSkillSession":
         self.start()
@@ -440,7 +450,7 @@ class BrowserSkillSession:
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
         to = timeout or self.timeout
-        cmd = [self.bsk_bin, "navigate", url, "--session", self.session_id]
+        cmd = [self.bsk_bin, "navigate", url, "--session", self.session_id] + self._target_args()
         try:
             res = subprocess.run(
                 cmd,
@@ -452,6 +462,7 @@ class BrowserSkillSession:
             if res.returncode != 0:
                 err_msg = res.stderr.strip() or res.stdout.strip()
                 raise BrowserSkillExecutionError(f"Navigation to {url} failed: {err_msg}")
+            self.current_url = url
             return True
         except subprocess.TimeoutExpired:
             raise BrowserSkillExecutionError(f"Navigation to {url} timed out after {to}s.")
@@ -470,7 +481,7 @@ class BrowserSkillSession:
         to = timeout or 30.0
 
         # Try native bsk get-html
-        cmd = [self.bsk_bin, "get-html", "--session", self.session_id]
+        cmd = [self.bsk_bin, "get-html", "--session", self.session_id, "--json"] + self._target_args()
         if out_path:
             cmd.extend(["--out", out_path])
 
@@ -483,19 +494,20 @@ class BrowserSkillSession:
                 timeout=to,
             )
             if res.returncode == 0:
-                if out_path and os.path.exists(out_path):
-                    with open(out_path, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                        if content and content.strip():
-                            return content
-                elif res.stdout and res.stdout.strip():
+                parsed = _parse_json_safely(res.stdout)
+                content = parsed.get("html") if isinstance(parsed, dict) and not parsed.get("truncated") else None
+                if isinstance(content, str) and content.strip():
+                    return content
+                if parsed is None and res.stdout.lstrip().startswith("<"):
                     return res.stdout
         except Exception:
             pass
 
         # Fallback to evaluate document.documentElement.outerHTML
         try:
-            html = str(self.evaluate("document.documentElement.outerHTML", timeout=to))
+            html = self.evaluate("document.documentElement.outerHTML", timeout=to)
+            if not isinstance(html, str) or not html.strip():
+                raise BrowserSkillExecutionError("Empty HTML result")
             if out_path and html:
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(html)
@@ -510,7 +522,7 @@ class BrowserSkillSession:
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
         to = timeout or 15.0
-        cmd = [self.bsk_bin, "observe", "--session", self.session_id, "--json"]
+        cmd = [self.bsk_bin, "observe", "--session", self.session_id, "--json"] + self._target_args()
         try:
             res = subprocess.run(
                 cmd,
@@ -524,7 +536,7 @@ class BrowserSkillSession:
                 return parsed if parsed is not None else res.stdout.strip()
             # Try without --json
             res2 = subprocess.run(
-                [self.bsk_bin, "observe", "--session", self.session_id],
+                [self.bsk_bin, "observe", "--session", self.session_id] + self._target_args(),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -548,7 +560,7 @@ class BrowserSkillSession:
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
         to = timeout or 15.0
-        cmd = [self.bsk_bin, "click", ref, "--session", self.session_id]
+        cmd = [self.bsk_bin, "click", ref, "--session", self.session_id] + self._target_args()
         try:
             res = subprocess.run(
                 cmd,
@@ -575,7 +587,7 @@ class BrowserSkillSession:
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
         to = timeout or 15.0
-        cmd = [self.bsk_bin, "evaluate", script, "--session", self.session_id, "--json"]
+        cmd = [self.bsk_bin, "evaluate", script, "--session", self.session_id, "--json"] + self._target_args()
         try:
             res = subprocess.run(
                 cmd,
@@ -585,22 +597,12 @@ class BrowserSkillSession:
                 timeout=to,
             )
             if res.returncode != 0:
-                # Try without --json flag
-                cmd_nojson = [self.bsk_bin, "evaluate", script, "--session", self.session_id]
-                res_nojson = subprocess.run(
-                    cmd_nojson,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=to,
-                )
-                if res_nojson.returncode != 0:
-                    err_msg = res.stderr.strip() or res.stdout.strip()
-                    raise BrowserSkillExecutionError(f"Evaluate failed: {err_msg}")
-                res = res_nojson
+                raise BrowserSkillExecutionError(f"Evaluate failed: {res.stderr.strip() or res.stdout.strip()}")
 
             parsed = _parse_json_safely(res.stdout)
             if isinstance(parsed, dict):
+                if parsed.get("ok") is False:
+                    raise BrowserSkillExecutionError(f"JavaScript evaluation failed: {parsed.get('error')}")
                 # Check for .ok status or .result field
                 if "result" in parsed:
                     return parsed["result"]
@@ -648,6 +650,9 @@ class BrowserSkillSession:
         """
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
+        if str(tab_id) in self.borrowed_tabs:
+            self.tab_id = str(tab_id)
+            return True
         to = timeout or 30.0
         cmd = [self.bsk_bin, "tab", "borrow", str(tab_id), "--session", self.session_id]
         try:
@@ -655,6 +660,8 @@ class BrowserSkillSession:
             if res.returncode != 0:
                 err = res.stderr.strip() or res.stdout.strip()
                 raise BrowserSkillExecutionError(f"Tab borrow failed for tab {tab_id}: {err}")
+            self.borrowed_tabs.add(str(tab_id))
+            self.tab_id = str(tab_id)
             return True
         except subprocess.TimeoutExpired:
             raise BrowserSkillExecutionError(f"Tab borrow timed out for tab {tab_id}.")
@@ -673,106 +680,126 @@ class BrowserSkillSession:
         cmd = [self.bsk_bin, "tab", "return", str(tab_id), "--session", self.session_id]
         try:
             res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=to)
-            return res.returncode == 0
+            if res.returncode == 0:
+                self.borrowed_tabs.discard(str(tab_id))
+                if self.tab_id == str(tab_id):
+                    self.tab_id = None
+                return True
+            return False
         except Exception:
             return False
 
     def download_url_in_session(self, url: str, out_path: str, timeout: Optional[float] = None) -> str:
-        """
-        Downloads a file URL inside the authenticated session tab using in-page fetch()
-        and base64 transfer, preserving all session cookies, CARSI tokens, and login headers.
-        """
+        """Bounded in-page transfer for small files; native download handles larger files."""
+        limit = 8 * 1024 * 1024
         to = timeout or 30.0
         script = f"""
         (async () => {{
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), {max(1, int(to * 1000))});
             try {{
-                const resp = await window.fetch({json.dumps(url)}, {{ credentials: 'include' }});
-                if (!resp.ok) {{
-                    return {{ ok: false, status: resp.status, error: "HTTP " + resp.status }};
+                const resp = await fetch({json.dumps(url)}, {{credentials: 'include', signal: controller.signal}});
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                if (Number(resp.headers.get('content-length')) > {limit}) throw new Error('Native download required: file too large');
+                const reader = resp.body.getReader();
+                const chunks = [];
+                let size = 0;
+                while (true) {{
+                    const part = await reader.read();
+                    if (part.done) break;
+                    size += part.value.byteLength;
+                    if (size > {limit}) {{ await reader.cancel(); throw new Error('Native download required: file too large'); }}
+                    chunks.push(part.value);
                 }}
-                const blob = await resp.blob();
-                return new Promise((resolve) => {{
+                const blob = new Blob(chunks);
+                const base64 = await new Promise((resolve, reject) => {{
                     const reader = new FileReader();
-                    reader.onloadend = () => {{
-                        const res = reader.result;
-                        const b64 = (typeof res === 'string') ? (res.split(',')[1] || '') : '';
-                        resolve({{ ok: true, status: resp.status, base64: b64, size: blob.size }});
-                    }};
-                    reader.onerror = () => resolve({{ ok: false, error: 'FileReader error' }});
+                    reader.onload = () => resolve(reader.result.split(',')[1]);
+                    reader.onerror = () => reject(new Error('FileReader failed'));
                     reader.readAsDataURL(blob);
                 }});
-            }} catch(err) {{
-                return {{ ok: false, error: String(err) }};
-            }}
+                return {{ok: true, base64, size}};
+            }} finally {{ clearTimeout(timer); controller.abort(); }}
         }})()
         """
-        res = self.evaluate(script, timeout=to)
-        parsed = None
-        if isinstance(res, dict):
-            parsed = res
-        elif isinstance(res, str):
-            parsed = _parse_json_safely(res)
+        result = self.evaluate(script, timeout=to + 2)
+        if isinstance(result, str):
+            result = _parse_json_safely(result)
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            raise BrowserSkillExecutionError("In-page download failed")
+        encoded = result.get("base64", "")
+        if not isinstance(encoded, str) or len(encoded) > ((limit + 2) // 3) * 4:
+            raise BrowserSkillExecutionError("In-page download exceeds transfer limit")
+        data = base64.b64decode(encoded, validate=True)
+        if not data or len(data) > limit or result.get("size") != len(data):
+            raise BrowserSkillExecutionError("Incomplete in-page download")
+        with open(out_path, "wb") as stream:
+            stream.write(data)
+        return out_path
 
-        if isinstance(parsed, dict) and parsed.get("ok") and parsed.get("base64"):
-            data = base64.b64decode(parsed["base64"])
-            with open(out_path, "wb") as f:
-                f.write(data)
-            return out_path
-
-        err = (parsed.get("error") if isinstance(parsed, dict) else None) or "Failed to transfer file data via browser tab"
-        raise BrowserSkillExecutionError(f"In-session URL download failed: {err}")
-
-    def download(
-        self,
-        target: str,
-        out_path: str,
-        overwrite: bool = True,
-        timeout: Optional[float] = None,
-    ) -> str:
-        """
-        Downloads a file or target element via BrowserSkill.
-        - If target starts with '@' (e.g. '@e3'): invokes native 'bsk download <ref>'.
-        - If target is an HTTP/HTTPS URL: executes authenticated in-session download preserving
-          session cookies and institutional credentials, falling back to 'bsk download'.
-        """
+    def download(self, target: str, out_path: str, overwrite: bool = True,
+                 timeout: Optional[float] = None) -> str:
+        """Stage downloads atomically; URLs are converted to actual DOM link targets."""
         if not self.session_id:
             raise BrowserSkillSessionError("Session is not active.")
         to = timeout or 60.0
         out_abs = os.path.abspath(out_path)
+        if os.path.exists(out_abs) and not overwrite:
+            raise FileExistsError(out_abs)
         os.makedirs(os.path.dirname(out_abs), exist_ok=True)
-
-        # Case 1: Target is a URL -> attempt in-page authenticated fetch first
-        if target.startswith(("http://", "https://")):
+        anchor_id = None
+        with tempfile.TemporaryDirectory(prefix=".bsk-", dir=os.path.dirname(out_abs)) as staging:
+            staged = os.path.join(staging, os.path.basename(out_abs))
+            is_url = target.startswith(("http://", "https://"))
+            transferred = False
+            if is_url:
+                try:
+                    self.download_url_in_session(target, staged, timeout=min(to, 30.0))
+                    from supp_finder import validate_downloaded_file
+                    transferred, _ = validate_downloaded_file(staged)
+                    if not transferred and os.path.exists(staged):
+                        os.remove(staged)
+                except Exception:
+                    if os.path.exists(staged):
+                        os.remove(staged)
             try:
-                self.download_url_in_session(target, out_abs, timeout=to)
-                if os.path.exists(out_abs) and os.path.getsize(out_abs) > 0:
-                    return out_abs
-            except Exception:
-                pass
-
-        # Case 2: Element ref (@eN) or URL fallback via bsk download
-        cmd = [self.bsk_bin, "download", target, "--session", self.session_id, "--out", out_abs]
-        if overwrite:
-            cmd.append("--overwrite")
-
-        try:
-            res = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=to,
-            )
-            if res.returncode == 0:
+                if not transferred:
+                    native_target = target
+                    if is_url:
+                        # bsk download takes refs/selectors, never a URL. A temporary
+                        # anchor lets the browser handle cross-origin/native transfers.
+                        anchor_id = "journal-bsk-" + uuid.uuid4().hex
+                        self.evaluate(f"""(() => {{
+                            const a = document.createElement('a');
+                            a.id = {json.dumps(anchor_id)};
+                            a.href = {json.dumps(target)};
+                            a.download = '';
+                            a.textContent = 'Download supplementary file';
+                            document.body.appendChild(a);
+                            return true;
+                        }})()""", timeout=min(to, 10.0))
+                        native_target = "#" + anchor_id
+                    cmd = [self.bsk_bin, "download", native_target, "--session", self.session_id,
+                           "--out", staged, "--timeout", f"{max(1, int(to * 1000))}ms"] + self._target_args()
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            text=True, timeout=to + 5)
+                    if result.returncode != 0:
+                        raise BrowserSkillExecutionError(f"Native download failed: {result.stderr.strip() or result.stdout.strip()}")
+                if not os.path.isfile(staged) or os.path.getsize(staged) == 0:
+                    raise BrowserSkillExecutionError("BrowserSkill reported success without a nonempty file")
+                if overwrite:
+                    os.replace(staged, out_abs)
+                else:
+                    # Exclusive creation also protects against a concurrent writer.
+                    with open(staged, "rb") as source, open(out_abs, "xb") as destination:
+                        shutil.copyfileobj(source, destination)
                 return out_abs
-            err_msg = res.stderr.strip() or res.stdout.strip()
-            raise BrowserSkillExecutionError(f"Download failed: {err_msg or f'exit code {res.returncode}'}")
-        except subprocess.TimeoutExpired:
-            raise BrowserSkillExecutionError(f"Download timed out after {to}s.")
-        except Exception as e:
-            if isinstance(e, BrowserSkillExecutionError):
-                raise
-            raise BrowserSkillExecutionError(f"Download error: {e}") from e
+            finally:
+                if anchor_id:
+                    try:
+                        self.evaluate(f"document.getElementById({json.dumps(anchor_id)})?.remove()", timeout=5.0)
+                    except Exception:
+                        pass
 
     @classmethod
     def stop_all(cls, bsk_bin: Optional[str] = None) -> bool:
@@ -869,6 +896,7 @@ def fetch_page_via_browserskill(
     expand_accordions: bool = True,
     session: Optional[BrowserSkillSession] = None,
     bsk_bin: Optional[str] = None,
+    runtime=None,
 ) -> Tuple[str, int, str]:
     """
     Fetches an article page using Tencent BrowserSkill:
@@ -877,11 +905,15 @@ def fetch_page_via_browserskill(
        or borrows an existing user tab if tab_id is provided.
     3. Follows redirects naturally (e.g. doi.org -> sciencedirect.com).
     4. Automatically expands collapsed supplementary sections.
-    5. Retrieves fully rendered HTML DOM via native 'bsk get-html' and final landing page URL.
+    5. Extracts DOM and landing URL together; falls back to get-html and URL metadata.
     6. Safely cleans up the session (if created internally).
 
-    Returns: (html_content, status_code, final_url)
+    Returns: (html_content, 200, final_url). 200 is a synthetic DOM-success
+    signal; BrowserSkill does not expose the navigation HTTP status here.
     """
+    if runtime is not None:
+        session = runtime.get_session()
+        tab_id = runtime.tab_id if tab_id is None else tab_id
     exe = bsk_bin or (session.bsk_bin if session else None) or find_bsk_executable()
     if not exe:
         raise BrowserSkillUnavailableError(
@@ -898,38 +930,21 @@ def fetch_page_via_browserskill(
 
     should_close_session = False
     sess = session
-    if not sess or not sess.session_id:
+    if sess is None:
         sess = BrowserSkillSession(browser=browser, no_focus=True, bsk_bin=exe, timeout=timeout)
         sess.start()
         should_close_session = True
+    elif not sess.session_id:
+        sess.start()
 
     try:
         # If tab_id provided, borrow that existing user tab
-        borrowed = False
         if tab_id:
-            try:
-                sess.tab_borrow(str(tab_id), timeout=min(timeout, 30.0))
-                borrowed = True
-            except Exception as e_borrow:
-                # Fall back to standard navigation if borrow fails
-                pass
-
-        if not borrowed:
+            sess.tab_borrow(str(tab_id), timeout=min(timeout, 30.0))
+        else:
+            if not fetch_url:
+                raise BrowserSkillExecutionError("A URL or an explicit tab ID is required")
             sess.navigate(fetch_url, timeout=timeout)
-
-        # Wait for selector if specified
-        if wait_selector:
-            check_script = f"!!document.querySelector({json.dumps(wait_selector)})"
-            start_t = time.time()
-            wait_limit = min(timeout, 15.0)
-            while time.time() - start_t < wait_limit:
-                try:
-                    exists = sess.evaluate(check_script, timeout=3.0)
-                    if exists is True or str(exists).lower() == "true":
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.5)
 
         # Expand collapsed supplementary accordions if requested
         if expand_accordions:
@@ -938,47 +953,68 @@ def fetch_page_via_browserskill(
             except Exception:
                 pass
 
+        # Wait for selector if specified
+        if wait_selector:
+            check_script = f"!!document.querySelector({json.dumps(wait_selector)})"
+            start_t = time.monotonic()
+            wait_limit = min(timeout, 15.0)
+            while time.monotonic() - start_t < wait_limit:
+                try:
+                    exists = sess.evaluate(check_script, timeout=3.0)
+                    if exists is True or str(exists).lower() == "true":
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.5)
+            else:
+                raise BrowserSkillExecutionError(f"Timed out waiting for selector: {wait_selector}")
+
         # Extract DOM, title, and final landing page URL
         final_html = ""
-        final_url = fetch_url
+        final_url = None
         try:
             extracted_raw = sess.evaluate(PAGE_EXTRACTION_SCRIPT, timeout=15.0)
             if isinstance(extracted_raw, str):
                 parsed_data = _parse_json_safely(extracted_raw)
                 if isinstance(parsed_data, dict):
                     final_html = parsed_data.get("html") or ""
-                    final_url = parsed_data.get("url") or fetch_url
-                else:
-                    final_html = extracted_raw
+                    final_url = parsed_data.get("url")
             elif isinstance(extracted_raw, dict):
                 final_html = extracted_raw.get("html") or ""
-                final_url = extracted_raw.get("url") or fetch_url
+                final_url = extracted_raw.get("url")
         except Exception:
             pass
 
         # Fallback to get_html
-        if not final_html or not final_html.strip():
+        if not isinstance(final_html, str) or not final_html.strip():
             try:
                 final_html = sess.get_html(timeout=15.0)
             except Exception:
                 pass
 
-        if not final_html or not final_html.strip():
+        if not isinstance(final_html, str) or not final_html.strip():
             # Second fallback: direct outerHTML evaluate
             try:
-                final_html = str(sess.evaluate("document.documentElement.outerHTML", timeout=10.0))
+                final_html = sess.evaluate("document.documentElement.outerHTML", timeout=10.0)
             except Exception:
                 pass
 
-        if not final_html or not final_html.strip():
+        if not isinstance(final_html, str) or not final_html.strip():
             raise BrowserSkillExecutionError("Failed to extract HTML DOM from BrowserSkill session.")
 
-        # Return borrowed tab if applicable
-        if borrowed and tab_id:
-            try:
-                sess.tab_return(str(tab_id), timeout=5.0)
-            except Exception:
-                pass
+        if not final_url:
+            metadata = sess.evaluate(PAGE_META_SCRIPT, timeout=10.0)
+            metadata = _parse_json_safely(metadata) if isinstance(metadata, str) else metadata
+            if isinstance(metadata, dict):
+                final_url = metadata.get("url") or final_url
+        if not isinstance(final_url, str) or not final_url.startswith(("http://", "https://")):
+            raise BrowserSkillExecutionError("Could not determine the article landing URL")
+        sess.current_url = final_url
+        # DOM retrieval has no HTTP status; reject recognizable challenge/login pages.
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", final_html, re.I | re.S)
+        title = title_match.group(1).strip().lower() if title_match else ""
+        if any(marker in title for marker in ("just a moment", "access denied", "attention required", "verify you are human")):
+            raise BrowserSkillExecutionError("Browser page requires verification or access; complete it in the browser and retry")
 
         return final_html, 200, final_url
 
@@ -995,6 +1031,7 @@ def download_file_via_browserskill(
     browser: Optional[str] = None,
     bsk_bin: Optional[str] = None,
     timeout: float = 60.0,
+    runtime=None,
 ) -> Optional[str]:
     """
     Downloads a supplementary file using BrowserSkill within an authenticated session.
@@ -1003,23 +1040,103 @@ def download_file_via_browserskill(
       to establish cookies/session context, downloads, and closes.
     Returns the saved file path if successful, or None on failure.
     """
-    exe = bsk_bin or (session.bsk_bin if session else None) or find_bsk_executable()
-    if not exe:
-        return None
-
+    owned = False
+    sess = session
     try:
-        if session and session.session_id:
-            return session.download(url_or_ref, output_path, overwrite=True, timeout=timeout)
-        else:
-            with BrowserSkillSession(browser=browser, no_focus=True, bsk_bin=exe, timeout=timeout) as sess:
-                if referer and str(referer).startswith(("http://", "https://")):
-                    try:
-                        sess.navigate(referer, timeout=min(timeout, 20.0))
-                    except Exception:
-                        pass
-                return sess.download(url_or_ref, output_path, overwrite=True, timeout=timeout)
-    except Exception:
+        if runtime is not None:
+            sess = runtime.get_session()
+        if sess is None:
+            sess = BrowserSkillSession(browser=browser, no_focus=True, bsk_bin=bsk_bin, timeout=timeout)
+            owned = True
+        if not sess.session_id:
+            sess.start()
+        # A caller-owned page already has the right context; never navigate a borrowed tab.
+        if not sess.current_url and not sess.tab_id:
+            origin = urlparse(url_or_ref)
+            context_url = referer or (f"{origin.scheme}://{origin.netloc}/" if origin.scheme in ("http", "https") else None)
+            if context_url:
+                sess.navigate(context_url, timeout=min(timeout, 20.0))
+                sess.current_url = context_url
+        # Validate before replacing an existing file. Session.download already stages
+        # transport output; this outer stage separates transport success from validity.
+        from supp_finder import validate_downloaded_file
+        output_abs = os.path.abspath(output_path)
+        os.makedirs(os.path.dirname(output_abs), exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".bsk-validate-", dir=os.path.dirname(output_abs)) as staging:
+            staged = os.path.join(staging, os.path.basename(output_abs))
+            sess.download(url_or_ref, staged, timeout=timeout)
+            valid, reason = validate_downloaded_file(staged)
+            if not valid:
+                raise BrowserSkillExecutionError(f"Invalid browser download: {reason}")
+            os.replace(staged, output_abs)
+        return output_path
+    except BrowserSkillBindingError:
+        raise
+    except Exception as exc:
+        print(f"  [BrowserSkill] Download failed: {exc}", file=sys.stderr)
         return None
+    finally:
+        if owned and sess:
+            sess.stop()
+
+
+class BrowserSkillRuntime:
+    """One lazily opened, explicitly enabled browser session per downloader run."""
+
+    def __init__(self, enabled=False, browser=None, tab_id=None, timeout=60.0):
+        self.enabled = enabled
+        self.browser = browser
+        self.tab_id = tab_id
+        self.timeout = timeout
+        self.session = None
+        self.failure = None
+
+    def get_session(self):
+        if not self.enabled:
+            raise BrowserSkillUnavailableError("BrowserSkill is disabled; enable --bsk or --bsk-auto")
+        error_type = BrowserSkillBindingError if self.browser or self.tab_id else BrowserSkillSessionError
+        if self.failure:
+            raise error_type(self.failure)
+        if self.session is None:
+            try:
+                self.session = BrowserSkillSession(browser=self.browser, timeout=self.timeout)
+                self.session.start()
+                if self.tab_id:
+                    self.session.tab_borrow(str(self.tab_id))
+            except Exception as exc:
+                self.failure = f"{exc}. Check bsk doctor and the browser extension connection."
+                if self.session:
+                    self.session.stop()
+                raise error_type(self.failure) from exc
+        return self.session
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.session:
+            self.session.stop()
+
+
+def add_browserskill_arguments(parser):
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--bsk", "--browserskill", dest="browserskill", action="store_true",
+                       help="Prefer BrowserSkill for article pages and reuse its login session")
+    modes.add_argument("--bsk-auto", action="store_true",
+                       help="Enable BrowserSkill only when ordinary fetch/download methods fail")
+    modes.add_argument("--no-bsk", action="store_true", help="Disable BrowserSkill (default)")
+    parser.add_argument("--bsk-browser", default=None, help="Bind to a BrowserSkill browser instance ID or label")
+    parser.add_argument("--bsk-tab", default=None, help="Borrow this user tab until the download run finishes")
+
+
+def runtime_from_args(args, parser):
+    if args.no_bsk and (args.bsk_browser or args.bsk_tab):
+        parser.error("--no-bsk cannot be combined with --bsk-browser or --bsk-tab")
+    if (args.bsk_browser or args.bsk_tab) and not args.bsk_auto:
+        args.browserskill = True
+    return BrowserSkillRuntime(enabled=args.browserskill or args.bsk_auto,
+                               browser=args.bsk_browser, tab_id=args.bsk_tab,
+                               timeout=getattr(args, "timeout", 60000) / 1000.0)
 
 
 def main():
@@ -1041,7 +1158,8 @@ def main():
     subparsers = parser.add_subparsers(dest="subcommand", help="Subcommand to execute")
 
     # Subcommand: status
-    subparsers.add_parser("status", help="Check BrowserSkill health & connected browsers")
+    status_parser = subparsers.add_parser("status", help="Check BrowserSkill health & connected browsers")
+    status_parser.add_argument("--json", action="store_true", help="Emit structured diagnostics")
 
     # Subcommand: doctor
     subparsers.add_parser("doctor", help="Run bsk doctor")
@@ -1085,8 +1203,12 @@ def main():
     args = parser.parse_args()
 
     if not args.subcommand or args.subcommand == "status":
-        print("Checking Tencent BrowserSkill status...")
         info = check_browserskill_status()
+        ready = info["available"] and info["daemon_running"] and info["browser_connected"]
+        if getattr(args, "json", False):
+            print(json.dumps(info, ensure_ascii=False, indent=2))
+            sys.exit(0 if ready else 1)
+        print("Checking Tencent BrowserSkill status...")
         print(f"  Installed:          {info['available']}")
         print(f"  Executable:         {info['bsk_path'] or 'Not found'}")
         print(f"  Version:            {info['version'] or 'N/A'}")
@@ -1095,7 +1217,7 @@ def main():
         if info["browsers"]:
             print(f"  Connected Browsers: {info['browsers']}")
         print(f"  Status Message:     {info['message']}")
-        sys.exit(0 if (info["available"] and info["daemon_running"]) else 1)
+        sys.exit(0 if ready else 1)
 
     elif args.subcommand == "doctor":
         exe = find_bsk_executable()
