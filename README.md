@@ -26,7 +26,8 @@
   - **Tier 0**：Elsevier CDN 暴力匹配（无需任何认证，约 1 秒/文件）。
   - **Tier 1**：期刊直接链接下载（基于 Requests 会话，带 Cookie）。
   - **Tier 2**：Scrapling 浏览器渲染（自动绕过 Cloudflare Turnstile/验证码，约 15 秒）。
-  - **Tier 3 (全新增强)**：CDP 实时浏览器直连（支持 `--cdp` 自动发现或 `--cdp-url`，借鉴 `eze-is/web-access` 架构，直接附加到用户日常运行的 Chrome/Edge，复用机构 SSO 与有效凭据，100% 自然通过 Turnstile 防护）。
+  - **Tier 3 (全新增强)**：CDP 实时浏览器直连（支持 `--cdp` 自动发现或 `--cdp-url`，直接附加到用户日常运行的 Chrome/Edge，复用机构 SSO 与有效凭据，100% 自然通过 Turnstile 防护）。
+  - **Tier BSK (全新增强)**：Tencent BrowserSkill 深度协同（支持 `--bsk`，原生集成腾讯开源 [Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill)，AI Agent 无需设置任何调试端口即可直接借用日常 Chromium 浏览器会话，无感复用大学 CARSI/机构 SSO 与真实 Cookie，自然穿透 Turnstile，支持 DOM 自动展开提取与失败下载直通兜底）。
   - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，突破付费墙与反爬限制秒级提取附表）。
 * **智能过滤**：自动识别真实的数据文件（支持 Parquet、Feather、Arrow、压缩表格等，排除插图 `gr1.jpg`、参考文献、页面广告等）。
 * **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软 MarkItDown 将下载的附表（`.docx`, `.xlsx`, `.pdf`）一键解包转换为 Markdown 副本及摘要索引，100% 保护原始科研数据完整性。
@@ -68,10 +69,16 @@ python scripts/journal_downloader.py "<url>" --list-only
 
 # 直连已打开的日常 Chrome 浏览器（自动复用登录态与机构 SSO，自然穿透 Turnstile）
 python scripts/journal_downloader.py "<url>" --cdp
+
+# 使用腾讯 BrowserSkill 协同抓取（免配调试端口，后台无感运行）
+python scripts/journal_downloader.py "<url_or_doi>" --bsk
+
+# 借用日常浏览器已打开的文献标签页（免重新加载，零等待）
+python scripts/journal_downloader.py "<url_or_doi>" --bsk --bsk-tab <tab-id>
 ```
 
 ### 2. 高级集成版下载器 (`scansci_supp_downloader.py`)
-支持 API、CDN 直连、CDP 实时浏览器直连及 Cookie 注入的多级加速下载器，适合 Elsevier/ScienceDirect 批量下载：
+支持 API、CDN 直连、CDP 实时浏览器直连、BrowserSkill 协同及 Cookie 注入的多级加速下载器，适合 Elsevier/ScienceDirect 批量下载：
 ```bash
 # 使用 DOI 链接
 python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349"
@@ -84,6 +91,29 @@ python scripts/scansci_supp_downloader.py "10.1016/j.oregeorev.2026.107349" --he
 
 # 直连日常浏览器 CDP 会话（突破最严苛的人机防护和机构订阅验证）
 python scripts/scansci_supp_downloader.py "<url_or_doi>" --cdp
+
+# 使用腾讯 BrowserSkill 协同下载（借用日常浏览器机构订阅与会话）
+python scripts/scansci_supp_downloader.py "<url_or_doi>" --bsk
+
+# 借用日常浏览器已打开的文献标签页协同下载
+python scripts/scansci_supp_downloader.py "<url_or_doi>" --bsk --bsk-tab <tab-id>
+```
+
+### 3. Tencent BrowserSkill 独立协同与管理工具 (`browserskill_adapter.py`)
+提供环境自检、活跃会话监控、标签页借用与网页抓取功能：
+```bash
+# 检查 BrowserSkill 与日常浏览器联通状态
+python scripts/browserskill_adapter.py status
+
+# 查看当前活跃的浏览器会话与可用标签页
+python scripts/browserskill_adapter.py sessions
+python scripts/browserskill_adapter.py tabs --scope user
+
+# 独立测试通过 BrowserSkill 抓取期刊页面 DOM（保存到文件）
+python scripts/browserskill_adapter.py fetch "<doi_or_url>" -o ./page.html
+
+# 借用用户已打开的文献标签页抓取
+python scripts/browserskill_adapter.py borrow-fetch <tab_id> -o ./page.html
 ```
 
 ---
@@ -178,17 +208,21 @@ journal-supp-downloader/
 ├── SKILL.md                   # 技能规范与详细说明
 ├── requirements.txt           # 依赖清单
 ├── scripts/
+│   ├── browserskill_adapter.py# 腾讯 BrowserSkill (bsk) 协同接口与 CLI 适配器
 │   ├── supp_finder.py         # 统一补充附件与表格候选识别、证据链与文件验证模块
 │   ├── oa_resolver.py         # Unpaywall & OpenAlex 开放获取（OA）穿透直取与 PMC 镜像解析
 │   ├── markitdown_converter.py# 微软 MarkItDown 附表多格式智能转 Markdown 模块（可选）
-│   ├── journal_downloader.py  # 基础页面分析与轻量下载器 (Scrapling)
-│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/OA/Cookie 多级加速)
+│   ├── journal_downloader.py  # 基础页面分析与轻量下载器 (Scrapling + BrowserSkill)
+│   ├── scansci_supp_downloader.py # 高级集成版下载器 (API/CDN/OA/Cookie/BrowserSkill 多级加速)
 │   ├── login_publishers.py    # 出版社登录与 Cookie 配置向导
+│   ├── playwright_utils.py    # Playwright Chromium 自动定位与 CDP / BrowserSkill 连接工具
 │   ├── test_api.py            # API 认证连通性测试脚本
 │   └── test_fetch.py          # 校园网直连与附件解析测试脚本
 ├── tests/
+│   ├── test_browserskill_adapter.py # BrowserSkill 适配器与协同测试集 (44 tests)
 │   ├── test_supp_finder.py    # 补充附件提取测试集 (85 tests)
 │   ├── test_oa_resolver.py    # Unpaywall / OpenAlex 开放获取测试集 (7 tests)
+│   ├── test_playwright_utils.py # CDP 与浏览器定位测试集 (59 tests)
 │   └── test_markitdown_converter.py # MarkItDown 结构转换测试集 (4 tests)
 └── scansci-pdf/               # 内置的核心 PDF 下载与配置引擎
 ```
@@ -197,13 +231,21 @@ journal-supp-downloader/
 
 ## 常见问题 FAQ
 
+#### Q: 在 AI Agent 安装 Tencent/BrowserSkill 后是不是能更好地运用该技能的功能？
+A: **是的，能带来质的飞跃**：
+1. **彻底免去配置 Chrome 远程调试端口**：传统 CDP 直连要求用户彻底退出正在工作的浏览器并携带 `--remote-debugging-port=9222` 重启；而安装 Tencent BrowserSkill 后，只需日常浏览器加载其轻量扩展并启动后台守护进程 (`bsk daemon start`)，AI Agent 即可直接与日常浏览器通信。
+2. **无感复用校园网 SSO 与机构权限**：用户日常浏览器只要保持校园网 VPN / CARSI 或 Elsevier/Springer 登录，BrowserSkill 就能直接借用其身份发起请求，无需手动提取和更新 `cookies.json`。
+3. **100% 自然绕过 Cloudflare Turnstile**：依托用户真实的浏览器指纹与环境，人机验证自然通过，杜绝无头浏览器被 WAF 阻断的困境。
+4. **后台静默运行（`--no-focus`）**：任务在独立的 Agent 窗口运行，不会夺取用户屏幕焦点或干扰日常工作。
+5. **双向下载兜底**：若常规 HTTP 请求因权限问题遭遇 401/403 付费墙，下载器会自动回退至 `bsk download` 通过真实浏览器会话完成附件下载。
+
 #### Q: 提示 "No Cloudflare challenge found"？
 A: 这是正常提示。说明目标期刊网站当前未开启 Cloudflare 验证或验证已被自动静默绕过，脚本已直接进入正常页面解析。
 
 #### Q: 下载文件为 0 KB 或提示下载失败？
 A: 
 1. 确认该文献是否确实拥有附件（有些文献仅在正文中列出表格而无附件文件）。
-2. 若提示权限拒绝（HTTP 401/403），请检查您的 IP 范围或更新本地 `cookies.json` 文件。
+2. 若提示权限拒绝（HTTP 401/403），请检查您的 IP 范围、使用 `--bsk` 复用日常已登录浏览器，或更新本地 `cookies.json` 文件。
 
 #### Q: 无法解析 DOI 链接？
 A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚本已内置了 `curl.exe` 作为备用解析手段，如仍失败，请直接传入期刊文章的真实 URL 链接。
@@ -218,6 +260,7 @@ A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚�
 
 | 库 / 工具 | 用途 | 链接 |
 |-----------|------|------|
+| **Tencent BrowserSkill** | 腾讯日常浏览器与 AI Agent 高可用桥接工具（免配置调试端口，无感复用登录态与机构订阅） | [https://github.com/Tencent/BrowserSkill](https://github.com/Tencent/BrowserSkill) |
 | **Scrapling** | 隐匿浏览器抓取，绕过 Cloudflare Turnstile/Interstitial 检测 | [https://github.com/D4Vinci/Scrapling](https://github.com/D4Vinci/Scrapling) |
 | **scansci-pdf** | PDF 下载引擎、cookie 管理、机构认证配置 | [https://github.com/Rimagination/scansci-pdf](https://github.com/Rimagination/scansci-pdf) |
 | **Playwright** | 跨平台浏览器自动化（CDP / persistent context / stealth 注入） | [https://github.com/microsoft/playwright-python](https://github.com/microsoft/playwright-python) |

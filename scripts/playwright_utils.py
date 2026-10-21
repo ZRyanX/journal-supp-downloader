@@ -570,3 +570,33 @@ def normalize_playwright_cookies(cookies, default_url=None):
 
         normalized.append(c)
     return normalized
+
+
+# ── Tencent BrowserSkill Re-exports ───────────────────────────────────────────
+try:
+    from browserskill_adapter import (
+        find_bsk_executable,
+        is_browserskill_available,
+        check_browserskill_status,
+        BrowserSkillSession,
+        fetch_page_via_browserskill,
+        download_file_via_browserskill,
+        BrowserSkillError,
+        BrowserSkillUnavailableError,
+        BrowserSkillDaemonError,
+        BrowserSkillSessionError,
+        BrowserSkillExecutionError,
+    )
+except ImportError:
+    find_bsk_executable = lambda: None
+    is_browserskill_available = lambda timeout=2.0: False
+    check_browserskill_status = lambda bsk_bin=None, timeout=4.0: {"available": False}
+    BrowserSkillSession = None
+    fetch_page_via_browserskill = lambda *a, **kw: None
+    download_file_via_browserskill = lambda *a, **kw: None
+    BrowserSkillError = Exception
+    BrowserSkillUnavailableError = Exception
+    BrowserSkillDaemonError = Exception
+    BrowserSkillSessionError = Exception
+    BrowserSkillExecutionError = Exception
+
