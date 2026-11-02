@@ -227,6 +227,37 @@ class TestOAResolver(unittest.TestCase):
         self.assertEqual(len(res.oa_landing_urls), 1)
         self.assertEqual(res.oa_landing_urls[0], "https://pmc.ncbi.nlm.nih.gov/articles/PMC7759461/")
 
+    @patch("oa_resolver.requests.get")
+    def test_exclude_direct_pdf_urls_from_oa_landing_urls(self, mock_get):
+        """Direct PDF URLs (url_for_pdf, .pdf, /pdf/) must be excluded from oa_landing_urls."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "doi": "10.1000/pdf-test",
+            "title": "PDF Filter Test",
+            "is_oa": True,
+            "oa_locations": [
+                {
+                    "url_for_landing_page": None,
+                    "url": "https://arxiv.org/pdf/2301.00001.pdf",
+                    "url_for_pdf": "https://arxiv.org/pdf/2301.00001.pdf",
+                },
+                {
+                    "url_for_landing_page": "https://europepmc.org/articles/PMC99999/pdf/main.pdf",
+                    "url": "https://europepmc.org/articles/PMC99999/pdf/main.pdf",
+                },
+                {
+                    "url_for_landing_page": "https://pmc.ncbi.nlm.nih.gov/articles/PMC99999/",
+                    "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC99999/",
+                    "url_for_pdf": "https://pmc.ncbi.nlm.nih.gov/articles/PMC99999/pdf/main.pdf",
+                },
+            ],
+        }
+        mock_get.return_value = mock_resp
+        res = query_unpaywall("10.1000/pdf-test")
+        self.assertIsNotNone(res)
+        self.assertEqual(res.oa_landing_urls, ["https://pmc.ncbi.nlm.nih.gov/articles/PMC99999/"])
+
 
 if __name__ == "__main__":
     unittest.main()

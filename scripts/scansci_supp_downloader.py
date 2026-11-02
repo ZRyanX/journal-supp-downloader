@@ -78,6 +78,10 @@ from supp_finder import (
     disambiguate_target_filename,
     extract_article_title,
     expand_page_accordions_action,
+    SUPP_WAIT_SELECTOR,
+    ensure_inferred_extension_on_disk,
+    is_placeholder_or_blocked_title,
+    migrate_or_merge_article_dir,
 )
 
 try:
@@ -225,7 +229,7 @@ def resolve_doi_url(doi_or_url):
     if HAS_SCRAPLING:
         try:
             from scrapling import Fetcher
-            r = Fetcher.get(url, stealthy_headers=True, timeout=15000)
+            r = Fetcher.get(url, stealthy_headers=True, timeout=15)
             if r.url and r.url.startswith("http") and "doi.org" not in r.url:
                 print(f"  [scrapling] Resolved to: {r.url}")
                 return r.url
@@ -261,18 +265,43 @@ def is_data_url(url, text=""):
 
 
 def extract_pii_from_url(url):
-    """Extract Elsevier PII from a URL or DOI string."""
-    m = re.search(r"pii/([A-Z0-9]+)", url, re.IGNORECASE)
+    """Extract Elsevier PII from a URL or DOI string, stripping formatting characters."""
+    if not url:
+        return None
+    url_str = str(url)
+    m = re.search(r"pii/([A-Z0-9().-]+)", url_str, re.IGNORECASE)
     if m:
-        return m.group(1)
+        cleaned = re.sub(r"[^A-Z0-9]", "", m.group(1), flags=re.IGNORECASE)
+        if cleaned:
+            return cleaned
+    m_cell = re.search(
+        r"(?:cell\.com|thelancet\.com)/[^?#]*/(?:fulltext|pdf|abs|article|retrieve)/([S0-9X().-]{10,})",
+        url_str,
+        re.IGNORECASE,
+    )
+    if m_cell:
+        cleaned = re.sub(r"[^A-Z0-9]", "", m_cell.group(1), flags=re.IGNORECASE)
+        if len(cleaned) >= 10:
+            return cleaned
     return None
 
 
 def normalize_url(url):
-    """Rewrite linkinghub.elsevier.com → www.sciencedirect.com."""
+    """Rewrite linkinghub.elsevier.com or ScienceDirect abs/pdfft URLs → canonical www.sciencedirect.com URL."""
+    if not url:
+        return url
     if "linkinghub.elsevier.com/retrieve/pii/" in url:
-        pii = url.split("/retrieve/pii/")[-1]
+        raw_tail = url.split("/retrieve/pii/")[-1].split("?")[0].split("#")[0].strip("/")
+        pii = extract_pii_from_url(f"pii/{raw_tail}") or raw_tail
         return f"https://www.sciencedirect.com/science/article/pii/{pii}"
+    if "sciencedirect.com/science/article/" in url:
+        pii = extract_pii_from_url(url)
+        if pii and (
+            "/abs/pii/" in url
+            or "/pdfft" in url
+            or url.split("?")[0].split("#")[0].rstrip("/").endswith("/pdf")
+        ):
+            return f"https://www.sciencedirect.com/science/article/pii/{pii}"
     return url
 
 
@@ -371,7 +400,156 @@ def load_all_scansci_cookies(config, no_vpn=False):
     return list(deduped.values())
 
 
+def _setup_authenticated_session_and_cookies(config, args, cdp_target=None):
+    """
+    Create a requests.Session and Playwright cookie list populated uniformly from:
+    1. scansci-pdf publisher cookies, WebVPN cookies, and CARSI cookies (when HAS_SCANSCI)
+    2. standalone local cookies.json / ~/.journal_supp_downloader_profile/cookies.json
+    3. live CDP browser cookies (when cdp_target is provided)
+    """
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    })
+    session.verify = False
+    play_cookies = []
+
+    if getattr(args, "no_cookies", False):
+        return session, play_cookies
+
+    no_vpn = getattr(args, "no_vpn", False)
+    if HAS_SCANSCI:
+        try:
+            inject_cookies(session, config)
+        except Exception:
+            pass
+        # Inject WebVPN cookies into requests session as well
+        if not no_vpn and config.get("vpnsci_enabled"):
+            try:
+                vpn_cookies = load_vpnsci_cookies_unified(config)
+                try:
+                    base_url = _get_webvpn_base(config)
+                except Exception:
+                    base_url = config.get("webvpn_base", "")
+                domain = base_url.split("://")[-1].split(":")[0] if "://" in base_url else None
+                for name, value in vpn_cookies.items():
+                    session.cookies.set(name, value, domain=domain, path="/")
+            except Exception:
+                pass
+        # Inject CARSI cookies into requests session
+        cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
+        carsi_dir = cache_dir / "carsi_cookies"
+        if carsi_dir.is_dir():
+            for cf in carsi_dir.glob("*.json"):
+                try:
+                    for c in json.loads(cf.read_text(encoding="utf-8")):
+                        if c.get("name"):
+                            session.cookies.set(
+                                c.get("name", ""), c.get("value", ""),
+                                domain=c.get("domain") or None, path=c.get("path", "/"),
+                            )
+                except Exception:
+                    pass
+        play_cookies = load_all_scansci_cookies(config, no_vpn=no_vpn)
+
+    # Always merge standalone cookies (cookies.json and login wizard profile)
+    standalone_cookies = load_saved_cookies_standalone()
+    if standalone_cookies:
+        for c in standalone_cookies:
+            if c.get("name"):
+                session.cookies.set(
+                    c.get("name", ""), c.get("value", ""),
+                    domain=c.get("domain") or None, path=c.get("path", "/"),
+                )
+        play_cookies = merge_cookies(play_cookies, standalone_cookies)
+
+    if cdp_target:
+        try:
+            live_cdp_c = extract_cdp_cookies(cdp_target)
+            if live_cdp_c:
+                print(f"  [CDP] Extracted {len(live_cdp_c)} live authenticated cookies from browser.")
+                for c in live_cdp_c:
+                    if c.get("name"):
+                        session.cookies.set(
+                            c.get("name", ""), c.get("value", ""),
+                            domain=c.get("domain") or None, path=c.get("path", "/"),
+                        )
+                play_cookies = merge_cookies(play_cookies, live_cdp_c)
+        except Exception:
+            pass
+
+    return session, play_cookies
+
+
 # ── Tier A: Elsevier API Campus-IP ──────────────────────────────────────────
+
+ELSEVIER_MIME_TO_EXT = {
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.ms-excel": "xls",
+    "application/x-excel": "xls",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/msword": "doc",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/pdf": "pdf",
+    "application/zip": "zip",
+    "application/x-zip-compressed": "zip",
+    "application/x-7z-compressed": "7z",
+    "application/x-rar-compressed": "rar",
+    "application/vnd.rar": "rar",
+    "application/gzip": "gz",
+    "application/x-gzip": "gz",
+    "application/x-tar": "tar",
+    "application/x-bzip2": "bz2",
+    "application/x-xz": "xz",
+    "text/csv": "csv",
+    "application/csv": "csv",
+    "text/tab-separated-values": "tsv",
+    "text/plain": "txt",
+    "application/json": "json",
+    "application/xml": "xml",
+    "text/xml": "xml",
+    "chemical/x-cif": "cif",
+    "application/x-hdf": "h5",
+    "application/x-hdf5": "h5",
+    "application/x-netcdf": "nc",
+}
+
+
+def _resolve_elsevier_ext(raw_ext, valid_exts):
+    """Resolve single or multi-part extension (e.g. tar.gz, xlsx) against valid_exts."""
+    if not raw_ext:
+        return ""
+    ext = raw_ext.lower().strip(".")
+    if ext in valid_exts:
+        return ext
+    first_part = ext.split(".")[0]
+    if first_part in valid_exts:
+        return first_part
+    return ""
+
+
+def _mime_or_format_to_ext(fmt_str, valid_exts):
+    """Map an Elsevier API @format or @mimetype string to a valid file extension without substring false positives."""
+    if not fmt_str:
+        return ""
+    fmt = fmt_str.lower().split(";")[0].strip().lstrip(".")
+    if fmt in valid_exts:
+        return fmt
+    if fmt in ELSEVIER_MIME_TO_EXT:
+        mapped = ELSEVIER_MIME_TO_EXT[fmt]
+        if mapped in valid_exts:
+            return mapped
+    for mime_key, mapped_ext in ELSEVIER_MIME_TO_EXT.items():
+        if mime_key in fmt and mapped_ext in valid_exts:
+            return mapped_ext
+    # Check multi-character extension tokens bounded by non-alphanumeric delimiters
+    for token in re.split(r"[^a-z0-9]+", fmt):
+        if len(token) >= 2 and token in valid_exts:
+            return token
+    return ""
+
 
 def try_elsevier_api_campus(doi, pii, output_dir, config):
     """
@@ -386,7 +564,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     if not api_key:
         return [], set()
 
-    print(f"\n[Tier A] Elsevier API campus-IP access (DOI: {doi}) ...")
+    print(f"\n[Tier A] Elsevier API campus-IP access (DOI/URL: {doi}) ...")
     t0 = time.time()
 
     headers = {
@@ -398,16 +576,19 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     if insttoken:
         headers["X-ELS-InstToken"] = insttoken
 
-    doi_clean = doi
-    if not doi_clean.startswith("10."):
-        m = re.search(r"10\.\d{4,}/[^\s?&]+", doi)
-        if m:
-            doi_clean = m.group(0)
-        else:
-            print("  [Tier A] Cannot extract DOI, skipping.")
-            return [], set()
+    doi_clean = extract_doi(doi)
+    if doi_clean:
+        api_url = f"https://api.elsevier.com/content/article/doi/{doi_clean}"
+    elif pii and (
+        not doi
+        or extract_pii_from_url(str(doi))
+        or any(d in str(doi).lower() for d in ("sciencedirect.com", "elsevier.com", "cell.com", "thelancet.com"))
+    ):
+        api_url = f"https://api.elsevier.com/content/article/pii/{pii}"
+    else:
+        print("  [Tier A] Cannot extract DOI or Elsevier PII, skipping.")
+        return [], set()
 
-    api_url = f"https://api.elsevier.com/content/article/doi/{doi_clean}"
     try:
         resp = requests.get(api_url, headers=headers, timeout=30)
     except Exception as e:
@@ -435,8 +616,16 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         print("  [Tier A] Failed to parse API JSON response.")
         return [], set()
 
+    core = article.get("coredata", {}) if isinstance(article.get("coredata"), dict) else {}
+    if core:
+        api_title = str(core.get("dc:title") or "").strip()
+        if api_title:
+            config["_last_api_title"] = api_title
+        api_doi = extract_doi(str(core.get("prism:doi") or ""))
+        if api_doi:
+            config["_last_api_doi"] = api_doi
+
     if not pii:
-        core = article.get("coredata", {})
         raw_pii = core.get("pii", "")
         pii = re.sub(r"[^A-Z0-9]", "", raw_pii, flags=re.IGNORECASE)
         if pii:
@@ -456,15 +645,15 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     detected_mmcs = set()
     valid_exts = {e.lstrip('.') for e in DATA_EXTENSIONS} | {"pdf"}
 
-    # 1. Parse text pattern mmc{N}.{ext}
-    pattern = re.compile(r"mmc(\d+)\.(\w+)", re.IGNORECASE)
+    # 1. Parse text pattern mmc{N}.{ext} (including multi-part extensions like tar.gz)
+    pattern = re.compile(r"mmc(\d+)\.([a-z0-9]+(?:\.[a-z0-9]+)?)", re.IGNORECASE)
     for m in pattern.finditer(original_text):
         num = m.group(1)
-        ext = m.group(2).lower()
-        if ext in valid_exts:
+        ext = _resolve_elsevier_ext(m.group(2), valid_exts)
+        if ext:
             mmc_files.add((int(num), ext))
 
-    for m in re.finditer(r"mmc(\d+)", original_text, re.IGNORECASE):
+    for m in re.finditer(r"(?:es)?mmc(\d+)", original_text, re.IGNORECASE):
         detected_mmcs.add(int(m.group(1)))
 
     # 2. Parse Elsevier API JSON 'objects' field
@@ -479,17 +668,19 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     for obj in obj_list:
         if isinstance(obj, dict):
             ref = str(obj.get("@ref", "") or obj.get("ref", "") or "")
-            m_ref = re.search(r"mmc(\d+)(?:\.(\w+))?", ref, re.IGNORECASE)
+            m_ref = re.search(r"(?:es)?mmc(\d+)(?:\.([a-z0-9]+(?:\.[a-z0-9]+)?))?", ref, re.IGNORECASE)
             if m_ref:
                 num = int(m_ref.group(1))
                 detected_mmcs.add(num)
-                ext = (m_ref.group(2) or "").lower()
+                ext = _resolve_elsevier_ext(m_ref.group(2) or "", valid_exts)
                 if not ext:
-                    fmt = str(obj.get("@format", "") or obj.get("format", "") or obj.get("@mimetype", "")).lower()
-                    for e in valid_exts:
-                        if e in fmt:
-                            ext = e
-                            break
+                    obj_url = str(obj.get("$", "") or obj.get("@href", "") or "")
+                    m_url = re.search(r"mmc\d+\.([a-z0-9]+(?:\.[a-z0-9]+)?)", obj_url, re.IGNORECASE)
+                    if m_url:
+                        ext = _resolve_elsevier_ext(m_url.group(1), valid_exts)
+                if not ext:
+                    fmt = str(obj.get("@format", "") or obj.get("format", "") or obj.get("@mimetype", ""))
+                    ext = _mime_or_format_to_ext(fmt, valid_exts)
                 if ext and ext in valid_exts:
                     mmc_files.add((num, ext))
 
@@ -498,10 +689,10 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         comp_str = ecomp.group(0)
         for m in re.finditer(r'id=["\'](?:esmmc|mmc)(\d+)["\']', comp_str, re.IGNORECASE):
             detected_mmcs.add(int(m.group(1)))
-        for m in re.finditer(r'mmc(\d+)\.(\w+)', comp_str, re.IGNORECASE):
+        for m in re.finditer(r'mmc(\d+)\.([a-z0-9]+(?:\.[a-z0-9]+)?)', comp_str, re.IGNORECASE):
             num = int(m.group(1))
-            ext = m.group(2).lower()
-            if ext in valid_exts:
+            ext = _resolve_elsevier_ext(m.group(2), valid_exts)
+            if ext:
                 mmc_files.add((num, ext))
 
     if not mmc_files:
@@ -550,6 +741,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                             found_files.append(filepath)
                             continue
 
+                os.makedirs(output_dir, exist_ok=True)
                 with open(filepath, "wb") as f:
                     for chunk in dl_resp.iter_content(chunk_size=8192):
                         if chunk:
@@ -679,6 +871,7 @@ def try_elsevier_cdn_brute_force(
                                 found_any = True
                                 continue
 
+                    os.makedirs(output_dir, exist_ok=True)
                     with open(filepath, "wb") as f:
                         for chunk in dl_resp.iter_content(chunk_size=8192):
                             if chunk:
@@ -763,6 +956,9 @@ def is_html_file(filepath):
     return not is_valid
 
 
+MMC_NUM_REGEX = re.compile(r"(?:^|[^a-z0-9])(?:es)?mmc[-_\s]?([1-9]\d{0,2})(?=$|[^0-9])", re.IGNORECASE)
+
+
 def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None):
     """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session."""
     if isinstance(cand_or_url, Candidate):
@@ -772,6 +968,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         url = cand_or_url
         suggested_fname = ""
 
+    os.makedirs(output_dir, exist_ok=True)
     manifest = load_download_manifest(output_dir)
     fname = suggested_fname or extract_filename_from_url(url)
     fname = sanitize_filename(fname)
@@ -853,7 +1050,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             sc_args = {"headers": {"Referer": referer}} if referer else {}
             if cookies:
                 sc_args["cookies"] = cookies_to_dict(cookies, url)
-            resp = Fetcher.get(url, stealthy_headers=True, timeout=30000, **sc_args)
+            resp = Fetcher.get(url, stealthy_headers=True, timeout=30, **sc_args)
             if resp.status < 400 and resp.body:
                 hdr = {k.lower(): v for k, v in (resp.headers or {}).items()}
                 cd = hdr.get("content-disposition", "")
@@ -910,6 +1107,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime
         )
         if result:
+            filepath = ensure_inferred_extension_on_disk(
+                filepath, output_dir, url, manifest=manifest
+            )
+            fname = os.path.basename(filepath)
             manifest[fname] = url
             save_download_manifest(output_dir, manifest)
             print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
@@ -957,8 +1158,20 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             download.save_as(filepath)
             session_stealth.close()
 
+            filepath = ensure_inferred_extension_on_disk(
+                filepath, output_dir, url, manifest=manifest
+            )
+            fname = os.path.basename(filepath)
             is_val, reason = validate_downloaded_file(filepath)
             if is_val:
+                if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
+                    base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
+                    html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
+                    new_path = os.path.join(output_dir, html_name)
+                    if filepath != new_path:
+                        os.replace(filepath, new_path)
+                        filepath = new_path
+                        fname = html_name
                 manifest[fname] = url
                 save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
@@ -981,8 +1194,20 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         cmd = [curl_cmd, "-s", "-L", "-o", filepath, url]
         res = subprocess.run(cmd, timeout=120)
         if res.returncode == 0 and os.path.exists(filepath):
+            filepath = ensure_inferred_extension_on_disk(
+                filepath, output_dir, url, manifest=manifest
+            )
+            fname = os.path.basename(filepath)
             is_val, reason = validate_downloaded_file(filepath)
             if is_val:
+                if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
+                    base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
+                    html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
+                    new_path = os.path.join(output_dir, html_name)
+                    if filepath != new_path:
+                        os.replace(filepath, new_path)
+                        filepath = new_path
+                        fname = html_name
                 size_kb = os.path.getsize(filepath) / 1024
                 manifest[fname] = url
                 save_download_manifest(output_dir, manifest)
@@ -1042,7 +1267,7 @@ def fetch_page_html(
         try:
             wait_sel = None
             if force_browser:
-                wait_sel = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+                wait_sel = SUPP_WAIT_SELECTOR
             print(f"    (Attaching to live browser tab via CDP: {cdp_url} ...)")
             cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
                 cdp_url, url, wait_selector=wait_sel, timeout=60.0
@@ -1095,7 +1320,7 @@ def fetch_page_html(
             print(f"    (Connecting over CDP to live browser: {cdp_url})")
         if force_browser:
             print("    (Forcing browser rendering to execute client-side JS...)")
-            sc_args["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+            sc_args["wait_selector"] = SUPP_WAIT_SELECTOR
         if play_cookies:
             sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
 
@@ -1127,18 +1352,22 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config, bsk_r
     print(f"  Output: {os.path.abspath(article_dir)}")
 
     try:
-        title = _quick_title_lookup(doi, url)
-        if title and title != "supplements":
-            new_dir = os.path.join(args.output_dir, sanitize_filename(title))
-            if not os.path.exists(new_dir):
-                os.replace(article_dir, new_dir)
-                article_dir = new_dir
-                print(f"  Renamed to: {os.path.abspath(article_dir)}")
+        lookup_doi = doi if is_doi(extract_doi(doi) or "") else (config.get("_last_api_doi") or doi)
+        title = _quick_title_lookup(lookup_doi, url) or config.get("_last_api_title")
+        if title:
+            clean_t = sanitize_filename(title)
+            if not is_placeholder_or_blocked_title(clean_t) and clean_t.lower() != "supplements":
+                new_dir = os.path.join(args.output_dir, clean_t)
+                if os.path.abspath(new_dir) != os.path.abspath(article_dir):
+                    article_dir = migrate_or_merge_article_dir(article_dir, new_dir)
+                    print(f"  Renamed to: {os.path.abspath(article_dir)}")
     except Exception:
         pass
 
     print("\n  Checking for additional supplements via page scrape...")
-    _try_page_scrape_supplements(url, article_dir, config, args, files, bsk_runtime=bsk_runtime)
+    scraped_dir = _try_page_scrape_supplements(url, article_dir, config, args, files, bsk_runtime=bsk_runtime)
+    if scraped_dir:
+        article_dir = scraped_dir
 
     if getattr(args, "convert_markdown", False):
         print("\n  [Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
@@ -1188,26 +1417,17 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
     Falls back to browser rendering if raw HTML is blocked or incomplete (Fixing Issue #4).
     """
     try:
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        })
-        session.verify = False
+        cdp_target = getattr(args, "cdp_url", None)
+        session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
-        if HAS_SCANSCI and not args.no_cookies:
-            inject_cookies(session, config)
-            play_cookies = load_all_scansci_cookies(config, no_vpn=getattr(args, "no_vpn", False))
-        elif not args.no_cookies:
-            play_cookies = load_saved_cookies_standalone()
-            for c in play_cookies:
-                session.cookies.set(
-                    c.get("name", ""), c.get("value", ""),
-                    domain=c.get("domain") or None, path=c.get("path", "/"),
-                )
-        else:
-            play_cookies = []
-
-        html_content, status, final_url = fetch_page_html(url, session, play_cookies, args.headful, use_bsk=bool(bsk_runtime and args.browserskill), bsk_runtime=bsk_runtime)
+        html_content, status, final_url = fetch_page_html(
+            url,
+            session,
+            play_cookies,
+            args.headful,
+            use_bsk=bool(bsk_runtime and getattr(args, "browserskill", False)),
+            bsk_runtime=bsk_runtime,
+        )
 
         url_to_use = final_url or url
         effective_base = extract_effective_base_url(html_content, url_to_use)
@@ -1216,7 +1436,15 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         # Fallback to browser rendering if raw HTML yields no candidates or is incomplete
         if (not diag.candidates or diag.is_incomplete) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
             print("    Raw HTML incomplete or blocked. Retrying with browser rendering for page scrape...")
-            html_content_b, status_b, final_url_b = fetch_page_html(url, session, play_cookies, args.headful, force_browser=True, use_bsk=bool(bsk_runtime and bsk_runtime.enabled), bsk_runtime=bsk_runtime)
+            html_content_b, status_b, final_url_b = fetch_page_html(
+                url,
+                session,
+                play_cookies,
+                args.headful,
+                force_browser=True,
+                use_bsk=bool(bsk_runtime and bsk_runtime.enabled),
+                bsk_runtime=bsk_runtime,
+            )
             if html_content_b:
                 html_content = html_content_b
                 url_to_use = final_url_b or url_to_use
@@ -1225,7 +1453,18 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
 
         if not html_content:
             print("    Could not fetch page for additional links.")
-            return
+            return article_dir
+
+        # If folder is still a placeholder (e.g. "supplements" when input was a PII URL without DOI),
+        # upgrade to the article title discovered from the scraped HTML.
+        cur_basename = os.path.basename(os.path.normpath(article_dir))
+        if cur_basename.lower() == "supplements" or is_placeholder_or_blocked_title(cur_basename):
+            scraped_title = extract_article_title(html_content, default="")
+            if scraped_title and not is_placeholder_or_blocked_title(scraped_title):
+                new_dir = os.path.join(args.output_dir, scraped_title)
+                if os.path.abspath(new_dir) != os.path.abspath(article_dir):
+                    article_dir = migrate_or_merge_article_dir(article_dir, new_dir)
+                    print(f"    Renamed folder from HTML title to: {os.path.abspath(article_dir)}")
 
         manifest = load_download_manifest(article_dir)
         downloaded_urls = set(manifest.values())
@@ -1233,16 +1472,16 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         downloaded_mmcs = set()
         for k, v in manifest.items():
             for s in (k, v):
-                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
         for f in existing_files:
-            m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", os.path.basename(f), re.IGNORECASE)
+            m = MMC_NUM_REGEX.search(os.path.basename(f))
             if m:
                 downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
-                m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))
 
@@ -1255,7 +1494,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             if cand_fname in existing_basenames:
                 continue
             # Skip if candidate refers to an MMC file that was already downloaded
-            m_cand = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", cand.url + " " + cand_fname, re.IGNORECASE)
+            m_cand = MMC_NUM_REGEX.search(cand.url + " " + cand_fname)
             if m_cand and int(m_cand.group(1)) in downloaded_mmcs:
                 continue
             seen_cand_urls.add(cand.url)
@@ -1280,21 +1519,21 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         # Check if page mentions MMC files that were not caught by HTML links or CDN
         pii = extract_pii_from_url(url_to_use) or extract_pii_from_url(url)
         if pii and not getattr(args, "skip_cdn", False):
-            page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+            page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
             downloaded_mmcs = set()
             manifest = load_download_manifest(article_dir)
             for k, v in manifest.items():
                 for s in (k, v):
-                    m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                    m = MMC_NUM_REGEX.search(s)
                     if m:
                         downloaded_mmcs.add(int(m.group(1)))
             for f in existing_files:
-                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", os.path.basename(f), re.IGNORECASE)
+                m = MMC_NUM_REGEX.search(os.path.basename(f))
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
             if os.path.exists(article_dir):
                 for f in os.listdir(article_dir):
-                    m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                    m_f = MMC_NUM_REGEX.search(f)
                     if m_f:
                         downloaded_mmcs.add(int(m_f.group(1)))
             missing_mmcs = page_mmcs - downloaded_mmcs
@@ -1312,6 +1551,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         raise
     except Exception as e:
         print(f"    Page scrape error: {e}")
+    return article_dir
 
 
 # ── Main Logic ───────────────────────────────────────────────────────────────
@@ -1379,7 +1619,7 @@ def run_download(args, bsk_runtime):
     print(f"  Normalized:  {url}")
 
     # Extract PII for Elsevier CDN (before WebVPN transformation)
-    pii = extract_pii_from_url(url) or (extract_pii_from_url(doi) if is_doi(doi) else None)
+    pii = extract_pii_from_url(url) or extract_pii_from_url(doi)
 
     # WebVPN URL conversion if configured and not disabled
     if not args.no_vpn and HAS_SCANSCI and vpnsci_is_configured(config):
@@ -1394,11 +1634,16 @@ def run_download(args, bsk_runtime):
 
     # ── Step 2: Tier A — Elsevier API Campus-IP (fastest if on campus) ────
     article_dir = os.path.join(args.output_dir, "supplements")
-    os.makedirs(article_dir, exist_ok=True)
 
     api_files = []
     known_mmcs = set()
-    if not args.no_api and not args.list_only and "10.1016" in (doi if doi.startswith("10.") else url):
+    is_elsevier_target = (
+        "10.1016" in str(doi)
+        or "10.1016" in str(url)
+        or bool(pii)
+        or any(d in str(url).lower() for d in ("sciencedirect.com", "elsevier.com", "cell.com", "thelancet.com"))
+    )
+    if not args.no_api and not args.list_only and is_elsevier_target:
         api_files, detected_mmcs = try_elsevier_api_campus(doi, pii, article_dir, config)
         known_mmcs.update(detected_mmcs)
 
@@ -1423,52 +1668,7 @@ def run_download(args, bsk_runtime):
     # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
     print(f"\n[Tier 1/2] Fetching article page for supplement links...")
 
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
-    })
-    session.verify = False
-
-    if HAS_SCANSCI and not args.no_cookies:
-        inject_cookies(session, config)
-        cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
-        carsi_dir = cache_dir / "carsi_cookies"
-        if carsi_dir.is_dir():
-            for cf in carsi_dir.glob("*.json"):
-                try:
-                    for c in json.loads(cf.read_text(encoding="utf-8")):
-                        session.cookies.set(
-                            c.get("name", ""), c.get("value", ""),
-                            domain=c.get("domain", ""), path=c.get("path", "/"),
-                        )
-                except Exception:
-                    pass
-        play_cookies = load_all_scansci_cookies(config, no_vpn=args.no_vpn)
-    elif not args.no_cookies:
-        play_cookies = load_saved_cookies_standalone()
-        if play_cookies:
-            for c in play_cookies:
-                session.cookies.set(
-                    c.get("name", ""), c.get("value", ""),
-                    domain=c.get("domain") or None, path=c.get("path", "/"),
-                )
-    else:
-        play_cookies = []
-
-    if cdp_target and not args.no_cookies:
-        try:
-            live_cdp_c = extract_cdp_cookies(cdp_target)
-            if live_cdp_c:
-                print(f"  [CDP] Extracted {len(live_cdp_c)} live authenticated cookies from browser.")
-                for c in live_cdp_c:
-                    session.cookies.set(
-                        c.get("name", ""), c.get("value", ""),
-                        domain=c.get("domain") or None, path=c.get("path", "/"),
-                    )
-                play_cookies = merge_cookies(play_cookies, live_cdp_c)
-        except Exception:
-            pass
+    session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
     # Fetch page with redirect resolution (Fixing Issue #1)
     html_content, status, final_url = fetch_page_html(
@@ -1504,9 +1704,30 @@ def run_download(args, bsk_runtime):
 
     article_dirname = extract_article_title(html_content, default="downloaded_article")
     article_dir = os.path.join(args.output_dir, article_dirname)
-    os.makedirs(article_dir, exist_ok=True)
     print(f"  Title:     {article_dirname}")
     print(f"  Folder:    {article_dir}")
+
+    def _refresh_dir_from_html_or_title(new_html=None, raw_title=None):
+        nonlocal article_dirname, article_dir
+        new_t = ""
+        if raw_title and not is_placeholder_or_blocked_title(raw_title):
+            new_t = sanitize_filename(raw_title)
+        elif new_html:
+            extracted = extract_article_title(new_html, default="")
+            if extracted and not is_placeholder_or_blocked_title(extracted):
+                new_t = extracted
+        if not new_t or is_placeholder_or_blocked_title(new_t):
+            return
+        if is_placeholder_or_blocked_title(article_dirname) or new_t != article_dirname:
+            target_dir = os.path.join(args.output_dir, new_t)
+            if os.path.abspath(target_dir) != os.path.abspath(article_dir):
+                if os.path.exists(article_dir):
+                    article_dir = migrate_or_merge_article_dir(article_dir, target_dir)
+                else:
+                    article_dir = target_dir
+                article_dirname = os.path.basename(article_dir)
+                print(f"  Updated Title:  {article_dirname}")
+                print(f"  Updated Folder: {article_dir}")
 
     # Scan for candidates with unified rules and diagnostics
     print("\n  Scanning for supplementary data links...")
@@ -1531,24 +1752,12 @@ def run_download(args, bsk_runtime):
                 html_content = html_content_browser
                 diag = diag_b
                 print(f"  Found {len(new_candidates)} additional candidate(s) after browser rendering (total: {len(candidates)}).")
-
-                article_dirname = extract_article_title(html_content, default=article_dirname)
-                new_article_dir = os.path.join(args.output_dir, article_dirname)
-                if new_article_dir != article_dir:
-                    os.makedirs(new_article_dir, exist_ok=True)
-                    try:
-                        os.rmdir(article_dir)
-                    except Exception:
-                        pass
-                    article_dir = new_article_dir
-                    print(f"  Updated Title:  {article_dirname}")
-                    print(f"  Updated Folder: {article_dir}")
+                _refresh_dir_from_html_or_title(new_html=html_content)
 
     is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
 
-    # Tier 3 (CDP Live Browser Probe): If still no candidates/incomplete and CDP wasn't explicitly provided,
-    # probe if an active running browser is available to bypass Turnstile or inherit SSO
-    if (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
+    # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
+    if (args.cdp or args.cdp_url) and (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -1581,6 +1790,7 @@ def run_download(args, bsk_runtime):
                     diag = cdp_diag
                     html_content = cdp_html
                     effective_base = cdp_base
+                    _refresh_dir_from_html_or_title(new_html=cdp_html)
 
     is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
 
@@ -1609,21 +1819,27 @@ def run_download(args, bsk_runtime):
                     html_content = bsk_html
                     effective_base = bsk_base
                     url = bsk_final or url
+                    _refresh_dir_from_html_or_title(new_html=bsk_html)
         except Exception as e_bsk:
             if bsk_runtime.browser or bsk_runtime.tab_id:
                 raise
             print(f"  [Tier 3-BSK] Notice: {e_bsk}")
 
-    # Tier OA Penetration: If still no candidates or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
+    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+
+    # Tier OA Penetration: If still no candidates, incomplete, or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
     doi_val = (
         extract_doi(args.url_or_doi)
         or extract_doi(url)
         or extract_doi(effective_base)
         or extract_doi_from_html(html_content)
+        or config.get("_last_api_doi")
     )
-    if (not candidates or args.oa) and not getattr(args, "no_oa", False) and doi_val:
+    if (not candidates or is_inc or args.oa) and not getattr(args, "no_oa", False) and doi_val:
         print(f"  Attempting Open Access penetration for DOI {doi_val} (Unpaywall & OpenAlex)...")
         oa_info = resolve_oa_info(doi_val)
+        if oa_info and oa_info.title and is_placeholder_or_blocked_title(article_dirname):
+            _refresh_dir_from_html_or_title(raw_title=oa_info.title)
         if oa_info and oa_info.oa_landing_urls:
             print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
             for oa_url in oa_info.oa_landing_urls:
@@ -1646,11 +1862,12 @@ def run_download(args, bsk_runtime):
                         url = oa_final or oa_url
                         effective_base = oa_base
                         html_content = oa_html
+                        _refresh_dir_from_html_or_title(new_html=oa_html, raw_title=oa_info.title)
                         break
 
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
-            page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+            page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
             if page_mmcs:
                 print(f"  Page text/components reference MMC file(s) {sorted(page_mmcs)}. Probing CDN...")
                 cdn_extras = try_elsevier_cdn_brute_force(
@@ -1661,12 +1878,9 @@ def run_download(args, bsk_runtime):
                 )
                 if cdn_extras:
                     try:
-                        title = _quick_title_lookup(doi, url)
-                        if title and title != "supplements":
-                            new_dir = os.path.join(args.output_dir, sanitize_filename(title))
-                            if not os.path.exists(new_dir):
-                                os.replace(article_dir, new_dir)
-                                article_dir = new_dir
+                        title = _quick_title_lookup(doi, url) or config.get("_last_api_title")
+                        if title:
+                            _refresh_dir_from_html_or_title(raw_title=title)
                     except Exception:
                         pass
                     print(f"\n✓ Done: {len(cdn_extras)} files downloaded via targeted CDN probe to {os.path.abspath(article_dir)}")
@@ -1698,6 +1912,7 @@ def run_download(args, bsk_runtime):
         return
 
     # Download files
+    os.makedirs(article_dir, exist_ok=True)
     print(f"\n  Downloading {len(candidates)} file(s)...")
     success_count = 0
     for cand in candidates:
@@ -1715,17 +1930,17 @@ def run_download(args, bsk_runtime):
     # Check if page text references additional MMCs not in candidate URLs
     extra_cdn_files = []
     if pii and not args.skip_cdn and not args.list_only:
-        page_mmcs = {int(m.group(1)) for m in re.finditer(r"\bmmc[-_\s]?([1-9]\d{0,2})\b", html_content, re.IGNORECASE)}
+        page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
         downloaded_mmcs = set()
         manifest = load_download_manifest(article_dir)
         for k, v in manifest.items():
             for s in (k, v):
-                m = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", s, re.IGNORECASE)
+                m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
-                m_f = re.search(r"mmc[-_\s]?([1-9]\d{0,2})\b", f, re.IGNORECASE)
+                m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))
         missing_mmcs = page_mmcs - downloaded_mmcs
@@ -1741,12 +1956,10 @@ def run_download(args, bsk_runtime):
                 success_count += len(extra_cdn_files)
 
     try:
-        title = _quick_title_lookup(doi, url)
-        if title and title != "supplements":
-            new_dir = os.path.join(args.output_dir, sanitize_filename(title))
-            if not os.path.exists(new_dir):
-                os.replace(article_dir, new_dir)
-                article_dir = new_dir
+        if is_placeholder_or_blocked_title(article_dirname):
+            title = _quick_title_lookup(doi, url) or config.get("_last_api_title")
+            if title:
+                _refresh_dir_from_html_or_title(raw_title=title)
     except Exception:
         pass
 

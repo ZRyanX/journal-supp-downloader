@@ -698,7 +698,12 @@ class BrowserSkillSession:
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), {max(1, int(to * 1000))});
             try {{
-                const resp = await fetch({json.dumps(url)}, {{credentials: 'include', signal: controller.signal}});
+                let resp;
+                try {{
+                    resp = await fetch({json.dumps(url)}, {{credentials: 'include', signal: controller.signal}});
+                }} catch (fetchErr) {{
+                    resp = await fetch({json.dumps(url)}, {{credentials: 'omit', signal: controller.signal}});
+                }}
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 if (Number(resp.headers.get('content-length')) > {limit}) throw new Error('Native download required: file too large');
                 const reader = resp.body.getReader();
@@ -846,24 +851,49 @@ class BrowserSkillSession:
 ACCORDION_EXPANSION_SCRIPT = """
 (() => {
     try {
-        // Expand all details elements
-        document.querySelectorAll("details:not([open])").forEach(d => d.open = true);
-        // Click collapsed accordion / supplementary buttons
-        document.querySelectorAll("button[aria-expanded='false'], [role='button'][aria-expanded='false']").forEach(b => {
-            const txt = (b.innerText || b.getAttribute("aria-label") || "").toLowerCase();
-            if (
-                txt.includes("supp") ||
-                txt.includes("material") ||
-                txt.includes("data") ||
-                txt.includes("table") ||
-                txt.includes("appendix") ||
-                txt.includes("附") ||
-                txt.includes("补充")
-            ) {
-                try { b.click(); } catch(e) {}
+        let clicked = 0;
+        // Expand all closed details elements without re-closing via summary click
+        document.querySelectorAll("details:not([open])").forEach(d => {
+            d.open = true;
+            clicked++;
+        });
+        // Click collapsed accordion / supplementary buttons & tabs
+        const selectors = [
+            "button[aria-expanded='false']",
+            "a[aria-expanded='false']",
+            "[role='button'][aria-expanded='false']",
+            "[role='tab'][aria-expanded='false']",
+            "[data-toggle='collapse']:not([aria-expanded='true'])",
+            ".accordion-header:not([aria-expanded='true'])",
+            ".accordion-button.collapsed",
+            ".accordion-button[aria-expanded='false']"
+        ].join(", ");
+        const keywords = [
+            "supp", "appendi", "extended", "additional", "data",
+            "table", "material", "source", "esm", "file",
+            "附", "补充", "支撑"
+        ];
+        document.querySelectorAll(selectors).forEach(b => {
+            if (b.getAttribute("aria-expanded") === "true") return;
+            if (b.tagName && b.tagName.toLowerCase() === "summary") {
+                const parentDetails = b.closest("details");
+                if (parentDetails && parentDetails.open) return;
+            }
+            const txt = (b.innerText || b.textContent || b.getAttribute("aria-label") || b.getAttribute("title") || "").toLowerCase();
+            if (keywords.some(k => txt.includes(k))) {
+                try { b.click(); clicked++; } catch(e) {}
             }
         });
-    } catch(e) {}
+        try {
+            window.scrollTo(0, Math.min(document.body.scrollHeight || 3000, 4000));
+        } catch(e) {}
+        if (clicked > 0) {
+            return new Promise(resolve => setTimeout(() => resolve(clicked), 600));
+        }
+        return clicked;
+    } catch(e) {
+        return 0;
+    }
 })()
 """
 

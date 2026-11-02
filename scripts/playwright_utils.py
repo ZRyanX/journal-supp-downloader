@@ -469,17 +469,47 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
                     pass
 
             try:
-                page.evaluate("""
+                clicked_count = page.evaluate("""
                     () => {
-                        document.querySelectorAll("details:not([open])").forEach(d => d.open = true);
-                        document.querySelectorAll("button[aria-expanded='false']").forEach(b => {
-                            const txt = (b.innerText || "").toLowerCase();
-                            if (txt.includes("supp") || txt.includes("material") || txt.includes("data") || txt.includes("table")) {
-                                try { b.click(); } catch(e) {}
+                        let clicked = 0;
+                        document.querySelectorAll("details:not([open])").forEach(d => {
+                            d.open = true;
+                            clicked++;
+                        });
+                        const selectors = [
+                            "button[aria-expanded='false']",
+                            "a[aria-expanded='false']",
+                            "[role='button'][aria-expanded='false']",
+                            "[role='tab'][aria-expanded='false']",
+                            "[data-toggle='collapse']:not([aria-expanded='true'])",
+                            ".accordion-header:not([aria-expanded='true'])",
+                            ".accordion-button.collapsed",
+                            ".accordion-button[aria-expanded='false']"
+                        ].join(", ");
+                        const keywords = [
+                            "supp", "appendi", "extended", "additional", "data",
+                            "table", "material", "source", "esm", "file",
+                            "附", "补充", "支撑"
+                        ];
+                        document.querySelectorAll(selectors).forEach(el => {
+                            if (el.getAttribute("aria-expanded") === "true") return;
+                            if (el.tagName.toLowerCase() === "summary") {
+                                const parentDetails = el.closest("details");
+                                if (parentDetails && parentDetails.open) return;
+                            }
+                            const txt = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").toLowerCase();
+                            if (keywords.some(k => txt.includes(k))) {
+                                try { el.click(); clicked++; } catch(e) {}
                             }
                         });
+                        try {
+                            window.scrollTo(0, Math.min(document.body.scrollHeight || 3000, 4000));
+                        } catch(e) {}
+                        return clicked;
                     }
                 """)
+                if clicked_count:
+                    page.wait_for_timeout(800)
             except Exception:
                 pass
 

@@ -146,15 +146,20 @@ def query_unpaywall(
     if not publisher_url:
         publisher_url = data.get("doi_url") or f"https://doi.org/{doi_val}"
 
-    # Extract OA repository landing URLs
+    # Extract OA repository landing URLs (excluding direct PDF links)
     oa_urls: List[str] = []
     seen = set()
 
     for loc in data.get("oa_locations", []):
         if not isinstance(loc, dict):
             continue
-        landing = loc.get("url_for_landing_page") or loc.get("url") or ""
-        if landing and landing not in seen:
+        pdf_url = (loc.get("url_for_pdf") or "").strip()
+        landing = (loc.get("url_for_landing_page") or "").strip()
+        if not landing:
+            candidate_url = (loc.get("url") or "").strip()
+            if candidate_url and candidate_url != pdf_url and not _is_direct_pdf_url(candidate_url):
+                landing = candidate_url
+        if landing and landing not in seen and not _is_direct_pdf_url(landing):
             # Exclude doi.org itself from OA mirrors unless it's the only one
             if "doi.org" in landing:
                 continue
@@ -174,6 +179,26 @@ def query_unpaywall(
         source="unpaywall",
         extra={"publisher": data.get("publisher", "")},
     )
+
+
+def _is_direct_pdf_url(url: str) -> bool:
+    """Return True if a URL points directly to a PDF binary stream rather than an HTML landing page."""
+    if not url:
+        return False
+    parsed = urllib.parse.urlparse(url.strip())
+    path = (parsed.path or "").lower().rstrip("/")
+    query = (parsed.query or "").lower()
+    if (
+        path.endswith(".pdf")
+        or path.endswith("/pdf")
+        or "/pdf/" in path
+        or "/epdf/" in path
+        or path.endswith("/epdf")
+    ):
+        return True
+    if "blobtype=pdf" in query or "format=pdf" in query or "type=printable" in query:
+        return True
+    return False
 
 
 def query_openalex(
@@ -223,15 +248,21 @@ def query_openalex(
         primary_loc = {}
     publisher_url = primary_loc.get("landing_page_url") or f"https://doi.org/{clean_doi}"
 
-    # Extract OA repository landing URLs
+    # Extract OA repository landing URLs (excluding direct PDF links)
     oa_urls: List[str] = []
     seen = set()
 
     for loc in data.get("locations", []):
         if not isinstance(loc, dict):
             continue
-        landing = loc.get("landing_page_url") or loc.get("pdf_url") or ""
-        if landing and landing not in seen:
+        pdf_url = (loc.get("pdf_url") or "").strip()
+        landing = (loc.get("landing_page_url") or "").strip()
+        if (
+            landing
+            and landing != pdf_url
+            and landing not in seen
+            and not _is_direct_pdf_url(landing)
+        ):
             if "doi.org" in landing:
                 continue
             seen.add(landing)

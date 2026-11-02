@@ -2151,6 +2151,312 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertEqual(detect_declared_supplement_count("See Supplementary Figures and Tables S1-S5 for details."), 5)
         self.assertEqual(detect_declared_supplement_count("Supplementary Tables and Figures S1 to S4 provide cohort info."), 4)
 
+    def test_broadened_supp_table_labels_and_hierarchical_numbers(self):
+        """Intermediate words (Information/Material/Data), ESM/SI/Web/STable prefixes, hierarchical numbers, and Appendix Table A1."""
+        for valid_label in [
+            "Supplementary Information Table S1",
+            "Supporting Information Table 2",
+            "Supplemental Material Table S3",
+            "Supplementary Data Table 1",
+            "ESM Table 1",
+            "SI Table S2",
+            "Web Table 1",
+            "STable 1",
+            "S-Table 2",
+            "Table S1.1",
+            "Table S2-1",
+            "S1.1 Table",
+            "Table A1",
+            "Table A.1",
+            "Table B-2",
+        ]:
+            self.assertTrue(bool(TABLE_LABEL_PATTERN.search(valid_label)), f"Failed TABLE_LABEL_PATTERN: {valid_label}")
+            self.assertTrue(is_explicit_supp_table(valid_label), f"Failed is_explicit_supp_table: {valid_label}")
+
+        # Primary tables must NOT be treated as explicit supplementary tables
+        self.assertFalse(is_explicit_supp_table("Table 1"))
+        self.assertFalse(is_explicit_supp_table("Table 2"))
+
+    def test_nearby_context_following_sibling_and_section_isolation(self):
+        """Following sibling labels are recognized, and main-article links do not steal headings from sibling sections."""
+        html = """
+        <html><body>
+          <article class="article-content">
+            <header>
+              <a href="/journal/issue/download-guide.pdf">Download Guide</a>
+            </header>
+            <section id="main-text">
+              <h2>Results</h2>
+              <p>Main text paragraph with <a href="/articles/main-paper.pdf">PDF</a>.</p>
+            </section>
+            <section id="supplementary-materials">
+              <h2>Supplementary Materials</h2>
+              <div class="supp-row">
+                <a href="/download/attachment/101">Download</a>
+                <span>Supplementary Table S1.xlsx</span>
+              </div>
+              <div class="supp-row">
+                <button formaction="/download/attachment/102">Download Table S2</button>
+              </div>
+            </section>
+          </article>
+        </body></html>
+        """
+        diag = find_all_candidates(html, "https://publisher.example/articles/123")
+        urls = {c.url for c in diag.candidates}
+        self.assertIn("https://publisher.example/download/attachment/101", urls)
+        self.assertIn("https://publisher.example/download/attachment/102", urls)
+        self.assertNotIn("https://publisher.example/journal/issue/download-guide.pdf", urls)
+        self.assertNotIn("https://publisher.example/articles/main-paper.pdf", urls)
+
+    def test_repository_and_component_dois_allowed_while_reference_dois_excluded(self):
+        """Figshare, Zenodo, Dryad, Mendeley Data, OSF, and .s001 component DOIs are captured."""
+        html = """
+        <html><body>
+          <section id="supplementary-material">
+            <h2>Supplementary Information and Data Availability</h2>
+            <a href="https://doi.org/10.6084/m9.figshare.12345678.v1">Supplementary Dataset 1 (Figshare)</a>
+            <a href="https://doi.org/10.5281/zenodo.8765432">Supplementary Data (Zenodo)</a>
+            <a href="https://data.mendeley.com/datasets/abc123xyz/1">Supplementary Table S1 (Mendeley Data)</a>
+            <a href="https://doi.org/10.1371/journal.pone.0123456.s001">S1 Table</a>
+          </section>
+          <section id="references">
+            <h2>References</h2>
+            <a href="https://doi.org/10.1038/s41586-020-2649-2">1. Harris et al., Nature 2020</a>
+            <a href="https://www.mendeley.com/import/?url=https://publisher.example/123">Save to Mendeley</a>
+          </section>
+        </body></html>
+        """
+        diag = find_all_candidates(html, "https://journals.plos.org/plosone/article?id=10.1371/journal.pone.0123456")
+        urls = {c.url for c in diag.candidates}
+        self.assertIn("https://doi.org/10.6084/m9.figshare.12345678.v1", urls)
+        self.assertIn("https://doi.org/10.5281/zenodo.8765432", urls)
+        self.assertIn("https://data.mendeley.com/datasets/abc123xyz/1", urls)
+        self.assertIn("https://doi.org/10.1371/journal.pone.0123456.s001", urls)
+        self.assertNotIn("https://doi.org/10.1038/s41586-020-2649-2", urls)
+        self.assertNotIn("https://www.mendeley.com/import/?url=https://publisher.example/123", urls)
+
+    def test_embedded_json_ignores_prose_and_extracts_extensionless_supp_objects(self):
+        """JSON prose with '.csv' is ignored, while structured downloadUrl + fileName objects are extracted."""
+        html = """
+        <html><head>
+          <script type="application/json">
+            {
+              "abstract": "We analyzed 500 geochemical samples and exported .csv files for statistical modeling.",
+              "supplementaryMaterials": [
+                {
+                  "fileName": "Supplementary_Table_S1.xlsx",
+                  "label": "Supplementary Table S1",
+                  "downloadUrl": "/api/v1/articles/999/supplements/1/download"
+                }
+              ]
+            }
+          </script>
+        </head><body></body></html>
+        """
+        diag = find_all_candidates(html, "https://publisher.example/article/999")
+        urls = [c.url for c in diag.candidates]
+        self.assertEqual(urls, ["https://publisher.example/api/v1/articles/999/supplements/1/download"])
+        self.assertEqual(diag.candidates[0].filename, "Supplementary_Table_S1.xlsx")
+
+    def test_declared_count_with_inline_html_tags_and_max_across_patterns(self):
+        """detect_declared_supplement_count strips inline HTML tags/scripts and returns max across patterns."""
+        from supp_finder import detect_declared_supplement_count, is_result_obviously_incomplete, Candidate
+        html = """
+        <html>
+        <head><script>const table_s100 = "Table S99";</script></head>
+        <body>
+          <p>See Supplementary Table S1 for overview.</p>
+          <p>Detailed cohort metrics are provided in Supplementary Tables <b>S1</b>&#8211;<b>S6</b>.</p>
+          <section id="supplementary-material">
+            <h2>Supplementary Material</h2>
+          </section>
+        </body></html>
+        """
+        count = detect_declared_supplement_count(html)
+        self.assertEqual(count, 6)
+
+        # Even if 1 candidate came from embedded_json, an empty DOM #supplementary-material section is flagged incomplete
+        cands = [Candidate(url="https://example.com/1.xlsx", filename="1.xlsx", section="embedded_json", match_rule="embedded_json")]
+        inc, reason = is_result_obviously_incomplete(cands, html, declared_count=0)
+        self.assertTrue(inc)
+        self.assertIn("0 candidates extracted from it", reason)
+
+    def test_validate_downloaded_file_binary_magic_and_xls_html_export(self):
+        """Binary extensions (.xlsx, .pdf) reject non-magic text/JSON errors; .xls allows HTML table exports."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            # 1. Fake .xlsx containing plain text error message (no PK magic) -> must fail
+            bad_xlsx = os.path.join(td, "Table_S1.xlsx")
+            with open(bad_xlsx, "wb") as f:
+                f.write(b"Service temporarily unavailable. Please try again later.")
+            ok, reason = validate_downloaded_file(bad_xlsx)
+            self.assertFalse(ok)
+            self.assertIn("Expected binary .xlsx", reason)
+
+            # 2. Fake .pdf containing JSON error -> must fail
+            bad_pdf = os.path.join(td, "Supp_S1.pdf")
+            with open(bad_pdf, "wb") as f:
+                f.write(b'{"status": 500, "message": "Internal error"}')
+            ok_pdf, _ = validate_downloaded_file(bad_pdf)
+            self.assertFalse(ok_pdf)
+
+            # 3. Valid .xls exported as HTML <table> -> must pass
+            html_xls = os.path.join(td, "Table_S2.xls")
+            with open(html_xls, "wb") as f:
+                f.write(b"<html><body><table><tr><th>Sample</th><th>Value</th></tr><tr><td>A1</td><td>42</td></tr></table></body></html>")
+            ok_xls, reason_xls = validate_downloaded_file(html_xls)
+            self.assertTrue(ok_xls)
+            self.assertIn("HTML-table", reason_xls)
+
+            # 4. Standalone HTML table attachment with site nav ("Sign in") AND a genuine <table> -> must pass
+            html_table = os.path.join(td, "table_s3.html")
+            with open(html_table, "wb") as f:
+                f.write(b"<!DOCTYPE html><html><body><nav><a href='/login'>Sign in</a></nav><table><tr><td>Data 1</td></tr></table></body></html>")
+            ok_ht, reason_ht = validate_downloaded_file(html_table)
+            self.assertTrue(ok_ht)
+            self.assertIn("HTML table attachment", reason_ht)
+
+    def test_ensure_inferred_extension_and_migrate_or_merge_article_dir(self):
+        """ensure_inferred_extension_on_disk renames .bin files and migrate_or_merge_article_dir merges existing folders."""
+        import tempfile
+        from supp_finder import ensure_inferred_extension_on_disk, migrate_or_merge_article_dir, load_download_manifest, save_download_manifest
+        with tempfile.TemporaryDirectory() as td:
+            old_dir = os.path.join(td, "supplements")
+            new_dir = os.path.join(td, "Real Article Title")
+            os.makedirs(old_dir, exist_ok=True)
+            os.makedirs(new_dir, exist_ok=True)
+
+            # Create a .bin file in old_dir with XLSX magic bytes
+            bin_file = os.path.join(old_dir, "attachment_1.bin")
+            with open(bin_file, "wb") as f:
+                f.write(b"PK\x03\x04" + b"\x00" * 30 + b"xl/worksheets/sheet1.xml")
+            manifest = {}
+            renamed_path = ensure_inferred_extension_on_disk(
+                bin_file, old_dir, "https://example.com/dl/1", manifest=manifest
+            )
+            self.assertTrue(renamed_path.endswith("attachment_1.xlsx"))
+            self.assertTrue(os.path.exists(renamed_path))
+
+            # Pre-populate new_dir with another file
+            existing_file = os.path.join(new_dir, "existing.csv")
+            with open(existing_file, "wb") as f:
+                f.write(b"a,b\n1,2\n")
+            save_download_manifest(new_dir, {"existing.csv": "https://example.com/dl/existing"})
+
+            # Migrate old_dir into already-existing new_dir
+            final_dir = migrate_or_merge_article_dir(old_dir, new_dir)
+            self.assertEqual(os.path.abspath(final_dir), os.path.abspath(new_dir))
+            self.assertFalse(os.path.exists(old_dir))
+            self.assertTrue(os.path.exists(os.path.join(new_dir, "attachment_1.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(new_dir, "existing.csv")))
+            merged_manifest = load_download_manifest(new_dir)
+            self.assertEqual(merged_manifest.get("attachment_1.xlsx"), "https://example.com/dl/1")
+            self.assertEqual(merged_manifest.get("existing.csv"), "https://example.com/dl/existing")
+
+    def test_scansci_pii_extraction_url_normalization_and_mime_mapping(self):
+        """extract_pii_from_url strips hyphens/parens, normalize_url rewrites abs/pdfft, and _mime_or_format_to_ext avoids single-char bugs."""
+        from supp_finder import DATA_EXTENSIONS
+        from scansci_supp_downloader import extract_pii_from_url, normalize_url, _mime_or_format_to_ext
+        self.assertEqual(
+            extract_pii_from_url("https://www.sciencedirect.com/science/article/pii/S0012-821X(23)00123-4"),
+            "S0012821X23001234",
+        )
+        self.assertEqual(
+            extract_pii_from_url("https://www.cell.com/cell/fulltext/S0092-8674(23)00123-4"),
+            "S0092867423001234",
+        )
+        self.assertEqual(
+            normalize_url("https://www.sciencedirect.com/science/article/abs/pii/S0012-821X(23)00123-4"),
+            "https://www.sciencedirect.com/science/article/pii/S0012821X23001234",
+        )
+        self.assertEqual(
+            normalize_url("https://www.sciencedirect.com/science/article/pii/S0012821X23001234/pdfft?isDTMRedir=true"),
+            "https://www.sciencedirect.com/science/article/pii/S0012821X23001234",
+        )
+        valid_exts = {e.lstrip(".") for e in DATA_EXTENSIONS} | {"pdf"}
+        self.assertEqual(_mime_or_format_to_ext("application/vnd.ms-excel", valid_exts), "xls")
+        self.assertEqual(
+            _mime_or_format_to_ext("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", valid_exts),
+            "xlsx",
+        )
+        self.assertEqual(_mime_or_format_to_ext("application/msword", valid_exts), "doc")
+
+    def test_edge_cases_nested_js_json_scientific_validation_and_dir_collision(self):
+        """Cover deeply nested JS assignment JSON extraction, scientific format error validation, and merge collision."""
+        import tempfile
+        from supp_finder import migrate_or_merge_article_dir, load_download_manifest, save_download_manifest
+
+        # 1. Deeply nested JS assignment with inner nested metadata object
+        html = """
+        <html><head>
+          <script>
+            window.__INITIAL_STATE__ = {
+              "article": {
+                "supplements": [
+                  {
+                    "fileName": "Supplementary_Table_S1.xlsx",
+                    "downloadUrl": "/api/v2/dl/nested-101",
+                    "metadata": {"size": 2048, "verified": true}
+                  }
+                ]
+              }
+            };
+          </script>
+        </head><body></body></html>
+        """
+        diag = find_all_candidates(html, "https://publisher.example/articles/555")
+        self.assertEqual([c.url for c in diag.candidates], ["https://publisher.example/api/v2/dl/nested-101"])
+        self.assertEqual(diag.candidates[0].filename, "Supplementary_Table_S1.xlsx")
+
+        # 2. Scientific formats (.fasta, .cif, .bed) reject HTML wrappers and JSON/plain-text 403 errors
+        with tempfile.TemporaryDirectory() as td:
+            bad_fasta_json = os.path.join(td, "seq.fasta")
+            with open(bad_fasta_json, "wb") as f:
+                f.write(b'{"error": "Access Denied", "status": 403}')
+            ok_fj, reason_fj = validate_downloaded_file(bad_fasta_json)
+            self.assertFalse(ok_fj)
+            self.assertIn("JSON error", reason_fj)
+
+            bad_bed_txt = os.path.join(td, "peaks.bed")
+            with open(bad_bed_txt, "wb") as f:
+                f.write(b"403 Forbidden: Institutional subscription required")
+            ok_bt, reason_bt = validate_downloaded_file(bad_bed_txt)
+            self.assertFalse(ok_bt)
+            self.assertIn("Plain-text HTTP error", reason_bt)
+
+            bad_cif_html = os.path.join(td, "crystal.cif")
+            with open(bad_cif_html, "wb") as f:
+                f.write(b"data_global\n_cell_length_a 5.43\n")
+            ok_cif_html, _ = validate_downloaded_file(bad_cif_html, headers={"Content-Type": "text/html; charset=utf-8"})
+            self.assertFalse(ok_cif_html)
+
+            good_fasta = os.path.join(td, "valid.fasta")
+            with open(good_fasta, "wb") as f:
+                f.write(b">seq1\nATGCGTACGTAGCTAGCTAGCTAG\n")
+            ok_gf, _ = validate_downloaded_file(good_fasta)
+            self.assertTrue(ok_gf)
+
+            # 3. migrate_or_merge_article_dir disambiguates colliding filenames across old_dir and new_dir
+            old_dir = os.path.join(td, "old_supp")
+            new_dir = os.path.join(td, "new_title")
+            os.makedirs(old_dir, exist_ok=True)
+            os.makedirs(new_dir, exist_ok=True)
+            with open(os.path.join(new_dir, "mmc1.xlsx"), "wb") as f:
+                f.write(b"new_dir_version")
+            save_download_manifest(new_dir, {"mmc1.xlsx": "https://example.com/paper1/mmc1.xlsx"})
+            with open(os.path.join(old_dir, "mmc1.xlsx"), "wb") as f:
+                f.write(b"old_dir_version")
+            save_download_manifest(old_dir, {"mmc1.xlsx": "https://example.com/paper2/mmc1.xlsx"})
+
+            migrate_or_merge_article_dir(old_dir, new_dir)
+            self.assertTrue(os.path.exists(os.path.join(new_dir, "mmc1.xlsx")))
+            self.assertTrue(os.path.exists(os.path.join(new_dir, "mmc1_2.xlsx")))
+            with open(os.path.join(new_dir, "mmc1.xlsx"), "rb") as f:
+                self.assertEqual(f.read(), b"new_dir_version")
+            with open(os.path.join(new_dir, "mmc1_2.xlsx"), "rb") as f:
+                self.assertEqual(f.read(), b"old_dir_version")
+
 
 if __name__ == "__main__":
     unittest.main()

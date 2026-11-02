@@ -37,18 +37,22 @@ from supp_finder import (
     extract_filename_from_url,
     extract_filename_from_content_disposition,
     infer_file_extension,
+    ensure_inferred_extension_on_disk,
     cookies_to_dict,
     extract_effective_base_url,
     Candidate,
     FindingDiagnostics,
     DATA_EXTENSIONS,
     MMC_PATTERN,
+    SUPP_WAIT_SELECTOR,
     is_excluded_url,
     is_article_figure_url,
     load_download_manifest,
     save_download_manifest,
     disambiguate_target_filename,
     extract_article_title,
+    is_placeholder_or_blocked_title,
+    migrate_or_merge_article_dir,
     expand_page_accordions_action,
 )
 
@@ -162,7 +166,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     try:
-        get_kwargs = {"stealthy_headers": True, "timeout": 30000}
+        get_kwargs = {"stealthy_headers": True, "timeout": 30}
         if referer:
             get_kwargs["headers"] = {"Referer": referer}
         if cookies:
@@ -257,6 +261,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             if result:
                 manifest[fname] = url
                 save_download_manifest(output_dir, manifest)
+                filepath = ensure_inferred_extension_on_disk(filepath, output_dir, url, manifest=manifest)
                 print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
                 return filepath
         print(f"FAIL: {exc}")
@@ -389,6 +394,7 @@ def run_download(args, bsk_runtime):
         "timeout": args.timeout,
         "proxy": args.proxy,
         "wait_selector": args.wait_selector,
+        "page_action": expand_page_accordions_action,
         "google_search": False,
     }
     if cookies:
@@ -483,7 +489,7 @@ def run_download(args, bsk_runtime):
             if page is None:
                 print("  [Recovery] Attempting HTTP direct fetch fallback...")
                 try:
-                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout, 30000)}
+                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout / 1000.0, 30.0)}
                     if cookies:
                         http_kwargs["cookies"] = cookies_to_dict(cookies, fetch_url)
                     resp = Fetcher.get(fetch_url, **http_kwargs)
@@ -525,8 +531,25 @@ def run_download(args, bsk_runtime):
     if raw_title == "N/A":
         raw_title = extract_article_title(html_content, default="N/A")
     article_dirname = extract_article_title(html_content, default="supplements")
+    if is_placeholder_or_blocked_title(article_dirname):
+        article_dirname = "supplements"
     article_dir = os.path.join(args.output_dir, article_dirname)
     os.makedirs(article_dir, exist_ok=True)
+
+    def _refresh_title_and_dir_from_html_or_str(source_html_or_title: str, is_raw_title: bool = False):
+        nonlocal article_dirname, article_dir, raw_title
+        if not is_placeholder_or_blocked_title(article_dirname):
+            return
+        new_title = (
+            extract_article_title(f"<title>{source_html_or_title}</title>", default="")
+            if is_raw_title
+            else extract_article_title(source_html_or_title, default="")
+        )
+        if new_title and not is_placeholder_or_blocked_title(new_title):
+            article_dirname = new_title
+            raw_title = new_title
+            new_dir = os.path.join(args.output_dir, article_dirname)
+            article_dir = migrate_or_merge_article_dir(article_dir, new_dir)
 
     print(f"  Status:    {page.status}")
     print(f"  Input URL: {args.url}")
@@ -547,6 +570,7 @@ def run_download(args, bsk_runtime):
             retry_html, _, retry_url = fetch_page_via_browserskill(
                 fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
             )
+            _refresh_title_and_dir_from_html_or_str(retry_html)
             retry_base = extract_effective_base_url(retry_html, retry_url)
             retry_diag = find_all_candidates(retry_html, retry_base, original_url=args.url)
             seen = {c.url for c in candidates}
@@ -564,12 +588,13 @@ def run_download(args, bsk_runtime):
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
-        retry_kwargs["wait_selector"] = "#supplementary-material a[href], .supplementary-material a[href], #extended-data a[href], [data-section='supp-table'] a[href], [id*='suppl'] a[href], a[href*='supp'], a[href*='table'], #supplementary-material, .supplementary-material"
+        retry_kwargs["wait_selector"] = SUPP_WAIT_SELECTOR
         retry_kwargs["page_action"] = expand_page_accordions_action
         retry_kwargs["timeout"] = min(args.timeout, 30000)
         try:
             retry_page = StealthyFetcher.fetch(fetch_url, **retry_kwargs)
             retry_html = str(retry_page.html_content)
+            _refresh_title_and_dir_from_html_or_str(retry_html)
             retry_diag = find_all_candidates(retry_html, effective_base, original_url=args.url)
             if retry_diag.candidates:
                 existing_urls = {c.url for c in candidates}
@@ -592,9 +617,11 @@ def run_download(args, bsk_runtime):
         or extract_doi(effective_base)
         or extract_doi_from_html(html_content)
     )
-    if (not candidates or args.oa) and not args.no_oa and doi_val:
+    if (not candidates or diag.is_incomplete or args.oa) and not args.no_oa and doi_val:
         print(f"\n  [OA Penetration] Checking Open Access repositories for DOI {doi_val} (Unpaywall & OpenAlex)...")
         oa_info = resolve_oa_info(doi_val)
+        if oa_info and oa_info.title:
+            _refresh_title_and_dir_from_html_or_str(oa_info.title, is_raw_title=True)
         if oa_info and oa_info.oa_landing_urls:
             print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
             for oa_url in oa_info.oa_landing_urls:
@@ -603,7 +630,7 @@ def run_download(args, bsk_runtime):
                 oa_base = oa_url
                 # 1. Fast HTTP first (open repositories like PMC rarely require full browser rendering)
                 try:
-                    oa_resp = Fetcher.get(oa_url, stealthy_headers=True, timeout=20000)
+                    oa_resp = Fetcher.get(oa_url, stealthy_headers=True, timeout=20)
                     if oa_resp.status < 400 and oa_resp.text:
                         oa_html = oa_resp.text
                         oa_base = extract_effective_base_url(oa_html, getattr(oa_resp, "url", None) or oa_url)
@@ -623,6 +650,7 @@ def run_download(args, bsk_runtime):
                         print(f"  [OA Mirror] Fetch failed for {oa_url}: {e}")
 
                 if oa_html:
+                    _refresh_title_and_dir_from_html_or_str(oa_html)
                     oa_diag = find_all_candidates(oa_html, oa_base, original_url=oa_url)
                     if oa_diag.candidates:
                         print(f"  [OA Success] Discovered {len(oa_diag.candidates)} supplementary file(s) via {oa_url}!")
@@ -635,6 +663,7 @@ def run_download(args, bsk_runtime):
                         if not candidates:
                             candidates = list(oa_diag.candidates)
                         diag = oa_diag
+                        diag.candidates = candidates
                         break
 
     if not candidates:
