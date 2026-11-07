@@ -1,3 +1,4 @@
+from archive_fixture import office_archive
 """
 Unit and Regression Tests for Supplementary Material & Table Candidate Finder
 =============================================================================
@@ -280,7 +281,7 @@ class TestSuppFinder(unittest.TestCase):
         """Files with PK zip header (XLSX, DOCX) should be accepted even if small."""
         with tempfile.NamedTemporaryFile("wb", suffix=".xlsx", delete=False) as f:
             # Fake mini PK header
-            xlsx_content = b"PK\x03\x04\x14\x00\x00\x00\x08\x00" + b"A" * 200
+            xlsx_content = office_archive()
             f.write(xlsx_content)
             temp_path = f.name
 
@@ -632,7 +633,7 @@ class TestSuppFinder(unittest.TestCase):
                 resp = MagicMock()
                 resp.status_code = 200
                 resp.headers = {"content-disposition": ""}
-                resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"x" * 200])
+                resp.iter_content = MagicMock(return_value=[office_archive()])
                 return resp
 
             with patch("requests.Session.head", side_effect=fake_head), \
@@ -760,7 +761,7 @@ class TestSuppFinder(unittest.TestCase):
             fake_resp = MagicMock()
             fake_resp.status_code = 200
             fake_resp.headers = {"content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}
-            fake_resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"xl/worksheets" + b"0" * 200])
+            fake_resp.iter_content = MagicMock(return_value=[office_archive()])
             fake_session.get.return_value = fake_resp
 
             res = download_file(cand, tmpdir, session=fake_session)
@@ -815,7 +816,7 @@ class TestSuppFinder(unittest.TestCase):
             resp = MagicMock()
             resp.status_code = 200
             resp.headers = {"content-disposition": ""}
-            resp.iter_content = MagicMock(return_value=[b"PK\x03\x04" + b"x" * 200])
+            resp.iter_content = MagicMock(return_value=[office_archive()])
             return resp
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1045,7 +1046,7 @@ class TestSuppFinder(unittest.TestCase):
             "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             "content-disposition": 'attachment; filename="data.xlsx"',
         }
-        mock_resp.body = b"PK\x03\x04" + b"\x00" * 200
+        mock_resp.body = office_archive()
 
         with patch("journal_downloader.Fetcher.get", return_value=mock_resp):
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -1185,8 +1186,8 @@ class TestSuppFinder(unittest.TestCase):
     def test_d2_download_distinct_urls_same_filename_not_skipped(self):
         """D2: Distinct URLs with identical filenames are not skipped and are disambiguated."""
         import journal_downloader
-        mock_resp1 = MagicMock(status=200, headers={}, body=b"PK\x03\x04file1_content")
-        mock_resp2 = MagicMock(status=200, headers={}, body=b"PK\x03\x04file2_content")
+        mock_resp1 = MagicMock(status=200, headers={}, body=office_archive("file1"))
+        mock_resp2 = MagicMock(status=200, headers={}, body=office_archive("file2"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with patch("journal_downloader.Fetcher.get", side_effect=[mock_resp1, mock_resp2]):
@@ -1198,8 +1199,8 @@ class TestSuppFinder(unittest.TestCase):
                 self.assertTrue(f1.endswith("table_s1.xlsx"))
                 self.assertTrue(f2.endswith("table_s1_2.xlsx"))
                 with open(f1, "rb") as fp1, open(f2, "rb") as fp2:
-                    self.assertEqual(fp1.read(), b"PK\x03\x04file1_content")
-                    self.assertEqual(fp2.read(), b"PK\x03\x04file2_content")
+                    self.assertEqual(fp1.read(), office_archive("file1"))
+                    self.assertEqual(fp2.read(), office_archive("file2"))
 
     def test_e1_declared_count_appendix_data_oxford(self):
         """E1: detect_declared_supplement_count covers standalone Appendix, Data ranges, and Oxford commas."""
@@ -2330,7 +2331,7 @@ class TestCodebaseAuditFixes(unittest.TestCase):
             # Create a .bin file in old_dir with XLSX magic bytes
             bin_file = os.path.join(old_dir, "attachment_1.bin")
             with open(bin_file, "wb") as f:
-                f.write(b"PK\x03\x04" + b"\x00" * 30 + b"xl/worksheets/sheet1.xml")
+                f.write(office_archive())
             manifest = {}
             renamed_path = ensure_inferred_extension_on_disk(
                 bin_file, old_dir, "https://example.com/dl/1", manifest=manifest

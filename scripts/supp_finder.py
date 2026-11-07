@@ -11,6 +11,7 @@ import json
 import os
 import re
 import urllib.parse
+import zipfile
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple, Union
 from bs4 import BeautifulSoup
@@ -277,7 +278,8 @@ class Candidate:
     section: str = ""
     match_rule: str = ""
     source_tag: str = "a"
-    extra_info: Dict[str, str] = field(default_factory=dict)
+    extra_info: dict = field(default_factory=dict)
+    source_url: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -288,6 +290,7 @@ class Candidate:
             "match_rule": self.match_rule,
             "source_tag": self.source_tag,
             "extra_info": self.extra_info,
+            "source_url": self.source_url,
         }
 
 
@@ -933,6 +936,9 @@ def extract_target_url_from_tag(tag) -> Optional[str]:
     """
     # 1. Standard attributes
     for attr in [
+        "data-download-url",
+        "data-file-url",
+        "data-asset-url",
         "href",
         "formaction",
         "data",     # <object data="...">
@@ -1242,11 +1248,15 @@ def find_all_candidates(
     candidates: List[Candidate] = []
 
     def add_candidate(cand: Candidate):
+        cand.source_url = cand.source_url or base_url
+        evidence_attrs = cand.extra_info.get("attributes", {})
+        if not isinstance(evidence_attrs, dict):
+            evidence_attrs = {}
         raw_cand_url = (cand.url or "").strip()
         if not raw_cand_url:
             return
         # Check raw_cand_url BEFORE stripping '#' so in-page fragments are caught
-        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text):
+        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
             diag.excluded_links.append((raw_cand_url, "excluded_url_pattern"))
             return
         norm_url = raw_cand_url.split("#")[0].strip()
@@ -1255,10 +1265,10 @@ def find_all_candidates(
         if is_same_article_page_url(norm_url, page_urls):
             diag.excluded_links.append((norm_url, "same_article_page_url"))
             return
-        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text):
+        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
             diag.excluded_links.append((norm_url, "excluded_url_pattern"))
             return
-        if is_article_figure_url(norm_url, text=cand.link_text):
+        if is_article_figure_url(norm_url, text=cand.link_text, attrs=evidence_attrs):
             diag.excluded_links.append((norm_url, "article_figure_pattern"))
             return
         if norm_url in seen_urls:
@@ -1308,6 +1318,15 @@ def find_all_candidates(
     for tag in controls:
         target_raw = extract_target_url_from_tag(tag)
         if not target_raw:
+            selector = tag.get("data-journal-download-selector")
+            if selector:
+                control_label = tag.get("value") or tag.get_text(" ", strip=True) or tag.get("aria-label") or tag.get("title") or "download"
+                candidates.append(Candidate(
+                    url=base_url + "#" + tag.get("id", "download"),
+                    filename=sanitize_filename(control_label) + ".bin",
+                    link_text=control_label, section="supplementary_section",
+                    source_url=base_url, extra_info={"browser_selector": selector},
+                    match_rule="browser_download_control"))
             continue
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
@@ -1363,11 +1382,11 @@ def find_all_candidates(
             add_candidate(Candidate(
                 url=full_url,
                 filename=sanitize_filename(fname),
-                link_text=link_text[:80],
+                link_text=link_text,
                 section=section,
                 match_rule=rule,
                 source_tag=tag.name,
-                extra_info={"attributes": str(attrs)},
+                extra_info={"attributes": attrs},
             ))
 
     # ── Strategy 3: Publisher-Specific Extractors (Issue #6 & WebVPN compatibility) ──
@@ -1977,52 +1996,97 @@ _DOM_SUPP_SECTIONS = {
 }
 
 
-def is_result_obviously_incomplete(
-    candidates: List[Candidate],
-    html_content: Union[str, BeautifulSoup],
-    declared_count: Optional[int] = None,
-) -> Tuple[bool, str]:
-    """
-    Determine if the extraction result is obviously incomplete, requiring browser rendering.
-    Covers:
-      1. Supplementary container found in HTML but 0 DOM candidates extracted from it.
-      2. Zero candidates found overall.
-      3. Candidate count is less than declared count in page text.
-    """
-    if not html_content:
-        return bool(not candidates), "Empty page content"
+def supplementary_table_ids(text):
+    """Return namespaced identities (S1, A1), never bare ordinal counts."""
+    result = set()
+    text = str(text or "")
+    pattern = r'(?:tables?|附表)[\s_-]*([SA])\s*(\d+)((?:\s*(?:[-–—至]|,\s*(?:and\s+)?|and\s+)\s*(?:[SA]\s*)?\d+)*)'
+    for match in re.finditer(pattern, text, re.I):
+        prefix, number = match[1].upper(), int(match[2])
+        if not 0 < number <= 999:
+            continue
+        result.add(f'{prefix}{number}')
+        for item in re.finditer(r'([-–—至]|,\s*(?:and\s+)?|and)\s*([SA])?\s*(\d+)', match[3], re.I):
+            next_prefix, end = (item[2] or prefix).upper(), int(item[3])
+            if 0 < end <= 999:
+                if item[1] in '-–—至' and next_prefix == prefix and number <= end:
+                    result.update(f'{prefix}{i}' for i in range(number, end + 1))
+                else:
+                    result.add(f'{next_prefix}{end}')
+            prefix, number = next_prefix, end
+    return result
 
-    # Check if a supplementary section exists, but no candidates came from DOM supplementary sections (E2)
-    if isinstance(html_content, BeautifulSoup):
-        soup = html_content
-    else:
-        soup = BeautifulSoup(html_content, DEFAULT_PARSER)
-    supp_keywords = [
-        "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
-        "esm", "additional-file", "supplementary-material", "supplementary-data",
-        "extended-data", "extended_data", "补充", "附表", "附录", "支撑材料",
+
+def declared_file_count(text):
+    """Only explicit file counts; table ranges are a different constraint."""
+    patterns = [
+        r'\b(\d+)\s+(?:supplementary|supplemental|supporting|additional)\s+files?\b',
+        r'(?:supplementary|supplemental|supporting|additional)\s+files?\s*\(\s*(\d+)\s*\)',
+        r'(?:supplementary|supporting)\s+(?:information|material)\s*\(\s*(\d+)\s+files?\s*\)',
+        r'(\d+)\s*个?\s*(?:补充文件|补充附件|附加文件)',
     ]
-    supp_sections = soup.find_all(lambda el: el.name in ["section", "div"] and any(
-        kw in (el.get("id", "") + " " + " ".join(el.get("class", []))).lower()
-        for kw in supp_keywords
-    ))
-    if supp_sections:
-        cands_in_section = [c for c in candidates if c.section in _DOM_SUPP_SECTIONS]
-        meta_satisfies_declared = (
-            declared_count is not None
-            and declared_count > 0
-            and len([c for c in candidates if c.section == "meta_tags"]) >= declared_count
-        )
-        if not cands_in_section and not meta_satisfies_declared:
-            return True, "Supplementary container found in HTML but 0 candidates extracted from it"
+    values = [int(m[1]) for pattern in patterns for m in re.finditer(pattern, text, re.I)]
+    return max(values, default=0)
 
+
+def candidate_evidence(candidates):
+    """Expose inherited evidence only when every child in that group is present."""
+    urls = {c.url for c in candidates}
+    evidence = []
+    for candidate in candidates:
+        evidence.append(candidate.to_dict())
+        for parent in candidate.extra_info.get('parent_evidence', []):
+            if set(parent.get('required_urls', [])) <= urls:
+                evidence.append(parent)
+    return evidence
+
+
+def covered_table_ids(candidates):
+    covered = set()
+    for item in candidate_evidence(candidates):
+        for value in (item.get('link_text'), item.get('filename'), item.get('extra_info', {}).get('attributes', {})):
+            covered.update(supplementary_table_ids(value))
+    return covered
+
+
+def is_result_obviously_incomplete(candidates, html_content, declared_count=None):
+    if not html_content:
+        return (True, 'Empty page content') if not candidates else (False, '')
+    soup = html_content if isinstance(html_content, BeautifulSoup) else BeautifulSoup(html_content, DEFAULT_PARSER)
+    page_text = soup.get_text(' ', strip=True)
+    expected_tables = supplementary_table_ids(page_text)
+    missing = expected_tables - covered_table_ids(candidates)
+    file_count = declared_file_count(page_text)
+    # Deduplicate identical URLs but never substitute table counts for files.
+    if file_count and len({c.url for c in candidates}) < file_count:
+        return True, f'File count ({len({c.url for c in candidates})}) is less than declared count ({file_count} files)'
+    supp_keywords = ('supplement', 'suppl', 'appendix', 'supporting-info', 'supporting_info',
+                     'esm', 'additional-file', 'extended-data', 'extended_data', '补充', '附表', '附录', '支撑材料')
+    sections = soup.find_all(lambda el: el.name in ('section', 'div') and any(
+        kw in (el.get('id', '') + ' ' + ' '.join(el.get('class', []))).lower() for kw in supp_keywords))
+    evidence = candidate_evidence(candidates)
+    meta_satisfies = bool(declared_count and len([c for c in candidates if c.section == 'meta_tags']) >= declared_count)
+    for section in sections:
+        targets = [extract_target_url_from_tag(tag) for tag in section.find_all(['a','button','input','form','div','span','iframe','object','embed'])]
+        targets = [t for t in targets if t]
+        selectors = [tag.get('data-journal-download-selector') for tag in section.find_all(attrs={'data-journal-download-selector': True})]
+        matched = any(
+            (item.get('extra_info', {}).get('browser_selector') in selectors and bool(selectors))
+            or any(urllib.parse.urljoin(item.get('source_url') or item['url'], target).split('#')[0] == item['url'].split('#')[0] for target in targets)
+            for item in evidence)
+        if not matched and not meta_satisfies:
+            # A named section can be fulfilled by corresponding files on a mirror.
+            section_tables = supplementary_table_ids(section.get_text(' ', strip=True))
+            if not section_tables or not section_tables <= covered_table_ids(candidates):
+                return True, 'Supplementary container found in HTML but 0 candidates extracted from it (unresolved section)'
+    if missing:
+        return True, 'Missing supplementary tables: ' + ', '.join(sorted(missing))
     if not candidates:
-        return True, "Zero supplementary candidates found"
-
-    if declared_count is not None and len(candidates) < declared_count:
-        return True, f"Candidate count ({len(candidates)}) is less than declared count ({declared_count})"
-
-    return False, ""
+        return True, 'Zero supplementary candidates found'
+    # Retain legacy count hints only when there is no typed table declaration.
+    if not expected_tables and declared_count and len(candidates) < declared_count:
+        return True, f'Candidate count ({len(candidates)}) is less than declared count ({declared_count})'
+    return False, ''
 
 
 # ── File Validation (Issue #5: Removing Fixed 1 KB Threshold) ────────────────
@@ -2082,7 +2146,23 @@ def validate_downloaded_file(
     # 1. Binary Magic Bytes Verification
     # ZIP / XLSX / DOCX / PPTX: PK\x03\x04
     if header_bytes.startswith(b"PK\x03\x04") or header_bytes.startswith(b"PK\x05\x06"):
-        return True, f"Valid ZIP/Office document signature ({file_size} bytes)"
+        try:
+            with zipfile.ZipFile(filepath) as archive:
+                names = set(archive.namelist())
+                if not names:
+                    return False, "Empty ZIP archive"
+                required = {".xlsx": "xl/workbook.xml", ".docx": "word/document.xml", ".pptx": "ppt/presentation.xml"}
+                if ext in required and (required[ext] not in names or "[Content_Types].xml" not in names):
+                    return False, "Missing Office document structure"
+                # Validate CRC without allowing enormous archives to exhaust resources.
+                expanded = sum(item.file_size for item in archive.infolist())
+                if expanded > 512 * 1024 * 1024:
+                    return True, "Valid ZIP directory structure; CRC deferred for archives above 512 MiB"
+                if archive.testzip() is not None:
+                    return False, "ZIP member checksum mismatch"
+        except (OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError) as exc:
+            return False, f"Invalid ZIP/Office container: {exc}"
+        return True, f"Valid ZIP/Office document structure ({file_size} bytes)"
 
     # PDF: %PDF
     if header_bytes.startswith(b"%PDF"):
@@ -2190,7 +2270,7 @@ def validate_downloaded_file(
                     return False, f"HTML error/challenge/login page detected: {indicator.decode('latin1')}"
 
         if ext in HTML_EXTENSIONS or ext == ".bin" or not ext:
-            if has_table_structure or b"<table" in sample_lower or b"<tr" in sample_lower or b"<th" in sample_lower:
+            if has_table_structure:
                 return True, f"Valid standalone HTML table attachment ({file_size} bytes)"
             if ext in HTML_EXTENSIONS:
                 return False, f"Received HTML document without table structure ({file_size} bytes)"
@@ -2480,6 +2560,7 @@ def expand_page_accordions_action(page):
                         if (parentDetails && parentDetails.open) return;
                     }
                     const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+                    if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(text)) return;
                     const idClass = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
                     if (suppKeywords.some(kw => text.includes(kw) || idClass.includes(kw))) {
                         try { el.click(); clicked++; } catch (e) {}

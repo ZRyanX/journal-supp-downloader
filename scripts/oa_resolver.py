@@ -306,23 +306,23 @@ def resolve_oa_info(
     )
 
     res1 = primary_fn(doi, timeout=timeout, session=session)
-    if not res1 or not res1.has_oa_mirror:
-        res2 = fallback_fn(doi, timeout=timeout, session=session)
-        if res2:
-            if not res1:
-                return res2
-            # Merge: take title/publisher if missing, and combine OA landing URLs
-            if not res1.title and res2.title:
-                res1.title = res2.title
-            if not res1.publisher_url and res2.publisher_url:
-                res1.publisher_url = res2.publisher_url
-            for u in res2.oa_landing_urls:
-                if u not in res1.oa_landing_urls:
-                    res1.oa_landing_urls.append(u)
-            res1.oa_landing_urls.sort(key=_score_oa_url, reverse=True)
-            if res2.is_oa:
-                res1.is_oa = True
-            return res1
+    # Merge independent catalogues; one mirror is not proof of completeness.
+    res2 = fallback_fn(doi, timeout=timeout, session=session)
+    if res2:
+        if not res1:
+            return res2
+        # Merge: take title/publisher if missing, and combine OA landing URLs
+        if not res1.title and res2.title:
+            res1.title = res2.title
+        if not res1.publisher_url and res2.publisher_url:
+            res1.publisher_url = res2.publisher_url
+        for u in res2.oa_landing_urls:
+            if u not in res1.oa_landing_urls:
+                res1.oa_landing_urls.append(u)
+        res1.oa_landing_urls.sort(key=_score_oa_url, reverse=True)
+        if res2.is_oa:
+            res1.is_oa = True
+        return res1
 
     if not res1:
         return OAResult(

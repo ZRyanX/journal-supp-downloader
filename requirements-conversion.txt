@@ -1,0 +1,2 @@
+-r requirements.txt
+markitdown[docx,xlsx,xls,pptx,pdf]>=0.1.0,<0.2

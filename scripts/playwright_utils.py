@@ -498,6 +498,7 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
                                 if (parentDetails && parentDetails.open) return;
                             }
                             const txt = (el.innerText || el.textContent || el.getAttribute("aria-label") || el.getAttribute("title") || "").toLowerCase();
+                            if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(txt)) return;
                             if (keywords.some(k => txt.includes(k))) {
                                 try { el.click(); clicked++; } catch(e) {}
                             }

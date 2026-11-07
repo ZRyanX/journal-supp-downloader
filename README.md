@@ -31,6 +31,8 @@
   - **Tier OA (全新增强)**：Unpaywall & OpenAlex 全球开放获取穿透直取（自动探测 PubMed Central / Europe PMC 等公开合法镜像，从可访问的公开来源查找附表，需核对其完整性）。
 * **智能过滤**：自动识别真实的数据文件（支持 Parquet、Feather、Arrow、压缩表格等，排除插图 `gr1.jpg`、参考文献、页面广告等）。
 * **可选 MarkItDown 结构化副本**：支持 `--convert-markdown`，利用微软 MarkItDown 将下载的附表（`.docx`, `.xlsx`, `.pdf`）一键解包转换为 Markdown 副本及摘要索引，100% 保护原始科研数据完整性。
+  启用前安装格式依赖：`pip install -r requirements-conversion.txt`。基础安装不包含转换组件；旧式 `.doc`/`.ppt` 不在内置转换支持范围内。
+
 * **自动重命名与归档**：使用 Unpaywall / OpenAlex / CrossRef API 自动查询文献标题并规范化命名文件夹，将所有附件统一整理。
 
 ---
@@ -294,3 +296,13 @@ A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚�
 | **Selenium** | 备用浏览器驱动（scansci-pdf 内部使用） | [https://github.com/SeleniumHQ/selenium](https://github.com/SeleniumHQ/selenium) |
 | **Zotero Table Extractor** | 学术正文表格提取技能；正在持续优化中 | [https://github.com/ZRyanX/zotero-table-extractor](https://github.com/ZRyanX/zotero-table-extractor) |
 
+
+## 附表完整性与恢复边界
+
+完整性检查分别核对明确的文件数、S/A 表编号和每个补充区块；文件数不能由工作簿中的表数量抵扣。同一来源重试后采用最新区块状态，并保留已发现的编号声明。同表的多个格式不能补足其他表；明确标注 S1–S10 的单个工作簿可以覆盖该范围。无法证明完整时会保留缺漏提示。
+
+API、CDN 和开放获取镜像的部分结果会保留并继续补查。候选记录各自的来源页，用于解析相对地址及下载 Referer。仓储介绍页会在两层、最多 16 页、单页 2 MiB 的限制内继续寻找附件；未解析成功的来源仍会报告。仓储父链接的附表证据会保留，只有对应子文件均成功取得时才计入覆盖。文件传输失败后也会补查 OA 镜像，同一轮不重复请求已尝试的文件地址；`--no-oa` 禁用这项补救。
+
+BrowserSkill 仅将明确标注下载的附表控件加入自动下载，并在点击前重新核验；删除、编辑等操作会被排除。挂起下载会持续等待同一个操作，检查失败、超时及实际落盘状态。alert 可以继续；confirm 仅在明确询问下载且不包含其他操作时接受，其余对话框报告需要明确决定。真实网站登录与扩展协议仍需要实机验证。
+
+ZIP/Office 文件检查容器目录和必要文档成员；解压后总量不超过 512 MiB 时额外检查 CRC，超过时仅检查目录结构并明确说明校验范围。Markdown 转换保留原文件，适合作为阅读副本。

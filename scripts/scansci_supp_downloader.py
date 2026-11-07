@@ -109,6 +109,8 @@ from browserskill_adapter import (
 )
 
 
+from discovery_state import DiscoveryEvidence, MirrorDiscovery, download_with_recovery
+from repository_resolver import expand_repository_candidates
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
 
@@ -964,6 +966,21 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     if isinstance(cand_or_url, Candidate):
         url = cand_or_url.url
         suggested_fname = cand_or_url.filename
+        referer = cand_or_url.source_url or referer
+        selector = cand_or_url.extra_info.get("browser_selector")
+        if selector:
+            if bsk_session is None and not (bsk_runtime and bsk_runtime.enabled):
+                print(f"  [Unresolved] Browser session required: {cand_or_url.link_text}")
+                return None
+            manifest = load_download_manifest(output_dir)
+            name = disambiguate_target_filename(output_dir, suggested_fname, url, manifest)
+            path = os.path.join(output_dir, name)
+            result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
+            if result:
+                manifest[name] = url
+                save_download_manifest(output_dir, manifest)
+                return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
+            return None
     else:
         url = cand_or_url
         suggested_fname = ""
@@ -1191,7 +1208,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # Method 4: curl (cross-platform fallback)
     try:
         curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
-        cmd = [curl_cmd, "-s", "-L", "-o", filepath, url]
+        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", filepath, url]
         res = subprocess.run(cmd, timeout=120)
         if res.returncode == 0 and os.path.exists(filepath):
             filepath = ensure_inferred_extension_on_disk(
@@ -1375,13 +1392,13 @@ def _finish_success(tier_name, files, article_dir, doi, url, args, config, bsk_r
         print(f"  Converted {len(converted)} file(s) to Markdown sidecars.")
 
 
-def _quick_title_lookup(doi, url):
+def _quick_title_lookup(doi, url, allow_oa=True):
     """Try to get article title from Unpaywall / OpenAlex / CrossRef APIs (fast, no auth)."""
     try:
         doi_clean = extract_doi(doi) or extract_doi(url)
         if doi_clean:
             # First check Unpaywall & OpenAlex
-            oa_res = resolve_oa_info(doi_clean, timeout=6)
+            oa_res = resolve_oa_info(doi_clean, timeout=6) if allow_oa else None
             if oa_res and oa_res.title:
                 clean_title = html.unescape(oa_res.title)
                 clean_title = re.sub(r'[\\/*?:"<>|]', "_", clean_title)
@@ -1647,13 +1664,14 @@ def run_download(args, bsk_runtime):
         api_files, detected_mmcs = try_elsevier_api_campus(doi, pii, article_dir, config)
         known_mmcs.update(detected_mmcs)
 
-    if api_files:
-        _finish_success("Tier A (API+CDN)", api_files, article_dir, doi, url, args, config, bsk_runtime=bsk_runtime)
-        return
+    # Partial API success must still pass through CDN, page and OA discovery.
 
     # ── Step 3: Tier 0 — CDN Brute-Force (fast, no auth) ─────────────────
     cdn_files = []
-    if pii and not args.skip_cdn and not args.list_only:
+    api_mmc_ids = {int(match.group(1)) for path in api_files
+                   if (match := MMC_NUM_REGEX.search(os.path.basename(path)))}
+    api_missing_mmcs = known_mmcs - api_mmc_ids
+    if pii and not args.skip_cdn and not args.list_only and (not api_files or api_missing_mmcs):
         cdn_files = try_elsevier_cdn_brute_force(
             pii, article_dir,
             max_mmc=args.max_mmc,
@@ -1661,9 +1679,7 @@ def run_download(args, bsk_runtime):
             known_mmcs=known_mmcs,
         )
 
-    if cdn_files:
-        _finish_success("Tier 0 (CDN)", cdn_files, article_dir, doi, url, args, config, bsk_runtime=bsk_runtime)
-        return
+    # Keep successful artifacts while discovering remaining sources.
 
     # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
     print(f"\n[Tier 1/2] Fetching article page for supplement links...")
@@ -1691,8 +1707,9 @@ def run_download(args, bsk_runtime):
             print(f"  [BrowserSkill] Recovery failed: {exc}")
     if not html_content:
         print("  ERROR: Failed to fetch article page.")
-        print("  Possible causes: Cloudflare block, network issue, or authentication required.")
-        return
+        print("  Continuing with OA discovery where a DOI is available.")
+        html_content = ""
+        final_url = final_url or url
 
     url = final_url
     effective_base = extract_effective_base_url(html_content, url)
@@ -1702,8 +1719,9 @@ def run_download(args, bsk_runtime):
     if effective_base != url:
         print(f"  Base URL:  {effective_base}")
 
-    article_dirname = extract_article_title(html_content, default="downloaded_article")
-    article_dir = os.path.join(args.output_dir, article_dirname)
+    article_dirname = extract_article_title(html_content, default="supplements")
+    target_dir = os.path.join(args.output_dir, article_dirname)
+    article_dir = migrate_or_merge_article_dir(article_dir, target_dir) if os.path.exists(article_dir) else target_dir
     print(f"  Title:     {article_dirname}")
     print(f"  Folder:    {article_dir}")
 
@@ -1733,9 +1751,11 @@ def run_download(args, bsk_runtime):
     print("\n  Scanning for supplementary data links...")
     diag = find_all_candidates(html_content, effective_base, original_url=args.url_or_doi)
     candidates = diag.candidates
+    evidence = DiscoveryEvidence()
+    evidence.observe("publisher", html_content, effective_base)
 
     # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
-    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+    is_inc, inc_reason = evidence.check(candidates)
     if (not candidates or is_inc) and HAS_SCRAPLING and session and not args.browserskill:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
@@ -1744,6 +1764,7 @@ def run_download(args, bsk_runtime):
         if html_content_browser:
             url = final_url_browser or url
             effective_base_b = extract_effective_base_url(html_content_browser, url)
+            evidence.observe("publisher", html_content_browser, effective_base_b)
             diag_b = find_all_candidates(html_content_browser, effective_base_b, original_url=args.url_or_doi)
             seen_urls = {c.url for c in candidates}
             new_candidates = [c for c in diag_b.candidates if c.url not in seen_urls]
@@ -1754,7 +1775,7 @@ def run_download(args, bsk_runtime):
                 print(f"  Found {len(new_candidates)} additional candidate(s) after browser rendering (total: {len(candidates)}).")
                 _refresh_dir_from_html_or_title(new_html=html_content)
 
-    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+    is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
     if (args.cdp or args.cdp_url) and (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
@@ -1779,6 +1800,7 @@ def run_download(args, bsk_runtime):
             )
             if cdp_html:
                 cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
+                evidence.observe("publisher", cdp_html, cdp_base)
                 cdp_diag = find_all_candidates(cdp_html, cdp_base, original_url=args.url_or_doi)
                 if cdp_diag.candidates:
                     print(f"  ✓ Tier 3 CDP success! Found {len(cdp_diag.candidates)} supplementary file(s) via live browser.")
@@ -1792,7 +1814,7 @@ def run_download(args, bsk_runtime):
                     effective_base = cdp_base
                     _refresh_dir_from_html_or_title(new_html=cdp_html)
 
-    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+    is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
     if (not candidates or is_inc) and bsk_runtime.enabled:
@@ -1807,6 +1829,7 @@ def run_download(args, bsk_runtime):
             )
             if bsk_html and bsk_status < 400:
                 bsk_base = extract_effective_base_url(bsk_html, bsk_final or url)
+                evidence.observe("publisher", bsk_html, bsk_base)
                 bsk_diag = find_all_candidates(bsk_html, bsk_base, original_url=args.url_or_doi)
                 if bsk_diag.candidates:
                     print(f"  ✓ Tier 3-BSK success! Found {len(bsk_diag.candidates)} supplementary file(s) via BrowserSkill.")
@@ -1825,7 +1848,7 @@ def run_download(args, bsk_runtime):
                 raise
             print(f"  [Tier 3-BSK] Notice: {e_bsk}")
 
-    is_inc, inc_reason = is_result_obviously_incomplete(candidates, html_content, diag.declared_count)
+    is_inc, inc_reason = evidence.check(candidates)
 
     # Tier OA Penetration: If still no candidates, incomplete, or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
     doi_val = (
@@ -1835,35 +1858,16 @@ def run_download(args, bsk_runtime):
         or extract_doi_from_html(html_content)
         or config.get("_last_api_doi")
     )
-    if (not candidates or is_inc or args.oa) and not getattr(args, "no_oa", False) and doi_val:
-        print(f"  Attempting Open Access penetration for DOI {doi_val} (Unpaywall & OpenAlex)...")
-        oa_info = resolve_oa_info(doi_val)
-        if oa_info and oa_info.title and is_placeholder_or_blocked_title(article_dirname):
-            _refresh_dir_from_html_or_title(raw_title=oa_info.title)
-        if oa_info and oa_info.oa_landing_urls:
-            print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
-            for oa_url in oa_info.oa_landing_urls:
-                print(f"  Trying OA mirror: {oa_url} ...")
-                oa_html, oa_status, oa_final = fetch_page_html(oa_url, session, play_cookies, args.headful)
-                if oa_html:
-                    oa_base = extract_effective_base_url(oa_html, oa_final or oa_url)
-                    oa_diag = find_all_candidates(oa_html, oa_base, original_url=oa_url)
-                    if oa_diag.candidates:
-                        print(f"  ✓ Open Access penetration success! Found {len(oa_diag.candidates)} supplementary file(s) via {oa_url}")
-                        seen_urls = {c.url for c in candidates}
-                        new_cands = [c for c in oa_diag.candidates if c.url not in seen_urls]
-                        if args.oa:
-                            candidates = new_cands + [c for c in candidates if c.url not in {x.url for x in new_cands}]
-                        else:
-                            candidates.extend(new_cands)
-                        if not candidates:
-                            candidates = list(oa_diag.candidates)
-                        diag = oa_diag
-                        url = oa_final or oa_url
-                        effective_base = oa_base
-                        html_content = oa_html
-                        _refresh_dir_from_html_or_title(new_html=oa_html, raw_title=oa_info.title)
-                        break
+    def fetch_mirror(oa_url):
+        return fetch_page_html(oa_url, session, play_cookies, args.headful)
+
+    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    if not candidates or is_inc or args.oa:
+        known = {c.url for c in candidates}
+        additions = [c for c in mirrors.discover() if c.url not in known]
+        candidates = additions + candidates if args.oa else candidates + additions
+    if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
+        _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
 
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
@@ -1878,7 +1882,8 @@ def run_download(args, bsk_runtime):
                 )
                 if cdn_extras:
                     try:
-                        title = _quick_title_lookup(doi, url) or config.get("_last_api_title")
+                        title = ((mirrors.info.title if mirrors.info else None) or config.get("_last_api_title")
+                             or _quick_title_lookup(doi, url, allow_oa=False))
                         if title:
                             _refresh_dir_from_html_or_title(raw_title=title)
                     except Exception:
@@ -1886,14 +1891,22 @@ def run_download(args, bsk_runtime):
                     print(f"\n✓ Done: {len(cdn_extras)} files downloaded via targeted CDN probe to {os.path.abspath(article_dir)}")
                     return
 
+        if api_files or cdn_files:
+            print(f"  Preserved {len(set(api_files + cdn_files))} API/CDN file(s); page completeness remains unverified.")
+            if args.convert_markdown:
+                convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
         if diag.incomplete_reason:
             print(f"  [Diagnostic] {diag.incomplete_reason}")
         if diag.excluded_links:
             print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
-        if pii:
+        if pii and not (api_files or cdn_files):
             print("  (CDN brute-force also found nothing — this paper may have no supplements.)")
         return
+
+    candidates = expand_repository_candidates(candidates)
+    diag.candidates = candidates
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 
     print(f"  Found {len(candidates)} potential supplementary file(s):")
     for i, cand in enumerate(candidates, 1):
@@ -1903,8 +1916,8 @@ def run_download(args, bsk_runtime):
             print(f"        Text:    {cand.link_text}")
         print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
 
-    if diag.declared_count:
-        print(f"  [Info] Article declares {diag.declared_count} supplementary item(s).")
+    if evidence.describe():
+        print(f"  [Info] {evidence.describe()}")
     if diag.is_incomplete:
         print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
 
@@ -1914,18 +1927,15 @@ def run_download(args, bsk_runtime):
     # Download files
     os.makedirs(article_dir, exist_ok=True)
     print(f"\n  Downloading {len(candidates)} file(s)...")
-    success_count = 0
-    for cand in candidates:
-        res = download_file(
-            cand,
-            article_dir,
-            session,
-            play_cookies,
-            bsk_runtime=bsk_runtime,
-            referer=url,
-        )
-        if res:
-            success_count += 1
+    successful, attempted = download_with_recovery(
+        candidates,
+        lambda cand: download_file(cand, article_dir, session, play_cookies,
+                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url),
+        mirrors, expand_repository_candidates)
+    success_count = len(successful)
+    incomplete, reason = evidence.check(successful)
+    if incomplete:
+        print(f"  [Warning] Downloaded set remains incomplete: {reason}")
 
     # Check if page text references additional MMCs not in candidate URLs
     extra_cdn_files = []
@@ -1957,13 +1967,14 @@ def run_download(args, bsk_runtime):
 
     try:
         if is_placeholder_or_blocked_title(article_dirname):
-            title = _quick_title_lookup(doi, url) or config.get("_last_api_title")
+            title = ((mirrors.info.title if mirrors.info else None) or config.get("_last_api_title")
+                             or _quick_title_lookup(doi, url, allow_oa=False))
             if title:
                 _refresh_dir_from_html_or_title(raw_title=title)
     except Exception:
         pass
 
-    total_target = len(candidates) + len(extra_cdn_files)
+    total_target = attempted + len(extra_cdn_files)
     print(f"\n✓ Done: {success_count}/{total_target} files downloaded to {os.path.abspath(article_dir)}")
 
     # Step 5: Optional MarkItDown conversion

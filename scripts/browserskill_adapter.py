@@ -785,9 +785,51 @@ class BrowserSkillSession:
                         }})()""", timeout=min(to, 10.0))
                         native_target = "#" + anchor_id
                     cmd = [self.bsk_bin, "download", native_target, "--session", self.session_id,
-                           "--out", staged, "--timeout", f"{max(1, int(to * 1000))}ms"] + self._target_args()
+                           "--out", staged, "--json", "--timeout", f"{max(1, int(to * 1000))}ms"] + self._target_args()
                     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                             text=True, timeout=to + 5)
+                    operation = None
+                    deadline = time.monotonic() + to
+                    while True:
+                        payload = _parse_json_safely(result.stdout) or {}
+                        data = payload.get("data") or payload.get("error", {}).get("data") or payload
+                        if isinstance(payload.get("result"), dict) and "state" in payload["result"]:
+                            data = payload["result"]
+                        if result.returncode == 6:
+                            dialog = data.get("dialog") or {}
+                            operation = data.get("operation_id") or payload.get("operation_id") or operation
+                            kind = dialog.get("type") or dialog.get("kind")
+                            dialog_id = dialog.get("id") or dialog.get("dialog_id")
+                            message = str(dialog.get("message") or "")
+                            safe_confirm = bool(re.search(r"\bdownload\b|下载", message, re.I)) and not re.search(
+                                r"\b(?:delete|remove|edit|upload|publish|submit|purchase|pay)\b|删除|移除|编辑|上传|发布|支付|购买", message, re.I)
+                            if not operation or not dialog_id or (kind != "alert" and not (kind == "confirm" and safe_confirm)):
+                                raise BrowserSkillExecutionError("Download dialog needs an explicit decision; it was not automatically accepted")
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise BrowserSkillExecutionError("Timed out waiting for suspended download")
+                            decision = subprocess.run([self.bsk_bin, "dialog", "accept", str(dialog_id), "--session", self.session_id, "--json"],
+                                                      capture_output=True, text=True, timeout=remaining)
+                            if decision.returncode:
+                                raise BrowserSkillExecutionError("Could not resolve download dialog")
+                        elif operation and result.returncode == 0:
+                            state = data.get("state")
+                            if state == "completed":
+                                if not isinstance(data.get("result"), dict) or data["result"].get("saved") is not True:
+                                    raise BrowserSkillExecutionError("Completed download was not saved")
+                                break
+                            if state == "failed":
+                                raise BrowserSkillExecutionError(f"Suspended download failed: {data.get('error')}")
+                            if state != "running":
+                                raise BrowserSkillExecutionError("Unknown suspended download state")
+                            time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+                        else:
+                            break
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise BrowserSkillExecutionError("Timed out waiting for suspended download")
+                        result = subprocess.run([self.bsk_bin, "operation", "await", str(operation), "--session", self.session_id,
+                                                 "--out", staged, "--json"], capture_output=True, text=True, timeout=remaining)
                     if result.returncode != 0:
                         raise BrowserSkillExecutionError(f"Native download failed: {result.stderr.strip() or result.stdout.strip()}")
                 if not os.path.isfile(staged) or os.path.getsize(staged) == 0:
@@ -880,6 +922,7 @@ ACCORDION_EXPANSION_SCRIPT = """
                 if (parentDetails && parentDetails.open) return;
             }
             const txt = (b.innerText || b.textContent || b.getAttribute("aria-label") || b.getAttribute("title") || "").toLowerCase();
+            if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(txt)) return;
             if (keywords.some(k => txt.includes(k))) {
                 try { b.click(); clicked++; } catch(e) {}
             }
@@ -897,13 +940,27 @@ ACCORDION_EXPANSION_SCRIPT = """
 })()
 """
 
+SAFE_DOWNLOAD_CONTROL = r"""
+(el) => {
+    if (!el || el.disabled || el.hasAttribute('aria-expanded')) return false;
+    const label = [el.textContent, el.value, el.getAttribute('aria-label'), el.title].join(' ');
+    if (/\b(delete|remove|edit|upload|publish|submit|purchase|pay|replace)\b|删除|移除|编辑|上传|发布|提交|购买|支付|替换/i.test(label)) return false;
+    return /\bdownload\b|下载/i.test(label);
+}
+"""
+
 PAGE_EXTRACTION_SCRIPT = """
 (() => {
-    return JSON.stringify({
-        html: document.documentElement.outerHTML,
-        url: window.location.href,
-        title: document.title
+    const safeDownload = """ + SAFE_DOWNLOAD_CONTROL + """;
+    document.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"]').forEach((el, i) => {
+        el.removeAttribute('data-journal-download-selector');
+        const label = [el.textContent, el.value, el.getAttribute('aria-label'), el.title].join(' ');
+        if (safeDownload(el) && /(?:supplement|supporting|附表|补充|table\\s*[SA]\\d+)/i.test(label)) {
+            if (!el.id) el.id = 'journal-download-control-' + i;
+            el.setAttribute('data-journal-download-selector', '[id=' + JSON.stringify(el.id) + ']');
+        }
     });
+    return JSON.stringify({html: document.documentElement.outerHTML, url: window.location.href, title: document.title});
 })()
 """
 
@@ -1062,6 +1119,7 @@ def download_file_via_browserskill(
     bsk_bin: Optional[str] = None,
     timeout: float = 60.0,
     runtime=None,
+    verify_control: bool = False,
 ) -> Optional[str]:
     """
     Downloads a supplementary file using BrowserSkill within an authenticated session.
@@ -1094,6 +1152,10 @@ def download_file_via_browserskill(
         os.makedirs(os.path.dirname(output_abs), exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".bsk-validate-", dir=os.path.dirname(output_abs)) as staging:
             staged = os.path.join(staging, os.path.basename(output_abs))
+            if verify_control:
+                checked = sess.evaluate("(" + SAFE_DOWNLOAD_CONTROL + ")(document.querySelector(" + json.dumps(url_or_ref) + "))", timeout=min(timeout, 10.0))
+                if checked is not True:
+                    raise BrowserSkillExecutionError("Control is not an explicit, safe download action")
             sess.download(url_or_ref, staged, timeout=timeout)
             valid, reason = validate_downloaded_file(staged)
             if not valid:

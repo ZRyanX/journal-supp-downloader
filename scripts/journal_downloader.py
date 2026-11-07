@@ -32,6 +32,7 @@ if scripts_dir not in sys.path:
 from scrapling.fetchers import Fetcher, StealthyFetcher
 from supp_finder import (
     find_all_candidates,
+    is_result_obviously_incomplete,
     validate_downloaded_file,
     sanitize_filename,
     extract_filename_from_url,
@@ -84,6 +85,8 @@ from browserskill_adapter import (
 )
 
 
+from discovery_state import DiscoveryEvidence, MirrorDiscovery, download_with_recovery
+from repository_resolver import expand_repository_candidates
 from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
 
@@ -147,6 +150,21 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
     if isinstance(cand_or_url, Candidate):
         url = cand_or_url.url
         suggested_fname = cand_or_url.filename
+        referer = cand_or_url.source_url or referer
+        selector = cand_or_url.extra_info.get("browser_selector")
+        if selector:
+            if bsk_session is None and not (bsk_runtime and bsk_runtime.enabled):
+                print(f"  [Unresolved] Browser session required: {cand_or_url.link_text}")
+                return None
+            manifest = load_download_manifest(output_dir)
+            name = disambiguate_target_filename(output_dir, suggested_fname, url, manifest)
+            path = os.path.join(output_dir, name)
+            result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
+            if result:
+                manifest[name] = url
+                save_download_manifest(output_dir, manifest)
+                return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
+            return None
     else:
         url = cand_or_url
         suggested_fname = ""
@@ -493,7 +511,7 @@ def run_download(args, bsk_runtime):
                     if cookies:
                         http_kwargs["cookies"] = cookies_to_dict(cookies, fetch_url)
                     resp = Fetcher.get(fetch_url, **http_kwargs)
-                    if resp.status < 400 and resp.text:
+                    if resp.status < 400 and (getattr(resp, "html_content", None) or resp.text):
                         page = resp
                 except Exception as e3:
                     print(f"  [Recovery] HTTP direct fetch failed: {e3}")
@@ -512,8 +530,8 @@ def run_download(args, bsk_runtime):
             print(f"  [Recovery] BrowserSkill: {exc}")
 
     if page is None:
-        print(f"Error: Unable to fetch page content from {fetch_url}.")
-        return
+        print(f"Warning: Unable to fetch publisher page; checking available alternatives.")
+        page = type("UnavailablePage", (), {"url": fetch_url, "html_content": "", "text": "", "status": 0})()
 
     # Resolve effective base URL (Fixing Issue #1: DOI redirect resolution)
     final_url = getattr(page, "url", None) or fetch_url
@@ -564,6 +582,8 @@ def run_download(args, bsk_runtime):
     print("\n[2/3] Scanning for supplementary data links...")
     diag = find_all_candidates(html_content, effective_base, original_url=args.url)
     candidates = diag.candidates
+    evidence = DiscoveryEvidence()
+    evidence.observe("publisher", html_content, effective_base)
 
     if (not candidates or diag.is_incomplete) and bsk_runtime.enabled and not args.wait_selector:
         try:
@@ -572,6 +592,7 @@ def run_download(args, bsk_runtime):
             )
             _refresh_title_and_dir_from_html_or_str(retry_html)
             retry_base = extract_effective_base_url(retry_html, retry_url)
+            evidence.observe("publisher", retry_html, retry_base)
             retry_diag = find_all_candidates(retry_html, retry_base, original_url=args.url)
             seen = {c.url for c in candidates}
             candidates.extend(c for c in retry_diag.candidates if c.url not in seen)
@@ -584,6 +605,7 @@ def run_download(args, bsk_runtime):
                 raise
             print(f"  [Recovery] BrowserSkill: {exc}")
 
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
     if diag.is_incomplete and not args.wait_selector and not args.browserskill:
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
@@ -595,7 +617,9 @@ def run_download(args, bsk_runtime):
             retry_page = StealthyFetcher.fetch(fetch_url, **retry_kwargs)
             retry_html = str(retry_page.html_content)
             _refresh_title_and_dir_from_html_or_str(retry_html)
-            retry_diag = find_all_candidates(retry_html, effective_base, original_url=args.url)
+            retry_base = extract_effective_base_url(retry_html, getattr(retry_page, "url", None) or fetch_url)
+            evidence.observe("publisher", retry_html, retry_base)
+            retry_diag = find_all_candidates(retry_html, retry_base, original_url=args.url)
             if retry_diag.candidates:
                 existing_urls = {c.url for c in candidates}
                 new_cands = [c for c in retry_diag.candidates if c.url not in existing_urls]
@@ -617,54 +641,28 @@ def run_download(args, bsk_runtime):
         or extract_doi(effective_base)
         or extract_doi_from_html(html_content)
     )
-    if (not candidates or diag.is_incomplete or args.oa) and not args.no_oa and doi_val:
-        print(f"\n  [OA Penetration] Checking Open Access repositories for DOI {doi_val} (Unpaywall & OpenAlex)...")
-        oa_info = resolve_oa_info(doi_val)
-        if oa_info and oa_info.title:
-            _refresh_title_and_dir_from_html_or_str(oa_info.title, is_raw_title=True)
-        if oa_info and oa_info.oa_landing_urls:
-            print(f"  [OA Info] Discovered {len(oa_info.oa_landing_urls)} OA repository location(s) (Status: {oa_info.oa_status}).")
-            for oa_url in oa_info.oa_landing_urls:
-                print(f"  [OA Mirror] Probing: {oa_url} ...")
-                oa_html = ""
-                oa_base = oa_url
-                # 1. Fast HTTP first (open repositories like PMC rarely require full browser rendering)
-                try:
-                    oa_resp = Fetcher.get(oa_url, stealthy_headers=True, timeout=20)
-                    if oa_resp.status < 400 and oa_resp.text:
-                        oa_html = oa_resp.text
-                        oa_base = extract_effective_base_url(oa_html, getattr(oa_resp, "url", None) or oa_url)
-                except Exception:
-                    pass
+    def fetch_mirror(oa_url):
+        try:
+            response = Fetcher.get(oa_url, stealthy_headers=True, timeout=20)
+            document = getattr(response, "html_content", None) or response.text
+            if response.status < 400 and document:
+                return str(document), response.status, getattr(response, "url", None) or oa_url
+        except Exception:
+            pass
+        kwargs = dict(fetch_kwargs)
+        kwargs.pop("wait_selector", None)
+        kwargs.pop("cookies", None)
+        response = StealthyFetcher.fetch(oa_url, **kwargs)
+        return str(response.html_content), response.status, getattr(response, "url", None) or oa_url
 
-                # 2. Browser fallback without publisher wait_selector or cookies
-                if not oa_html:
-                    try:
-                        oa_fetch_kwargs = dict(fetch_kwargs)
-                        oa_fetch_kwargs.pop("wait_selector", None)
-                        oa_fetch_kwargs.pop("cookies", None)
-                        oa_page = StealthyFetcher.fetch(oa_url, **oa_fetch_kwargs)
-                        oa_html = str(oa_page.html_content)
-                        oa_base = extract_effective_base_url(oa_html, getattr(oa_page, "url", None) or oa_url)
-                    except Exception as e:
-                        print(f"  [OA Mirror] Fetch failed for {oa_url}: {e}")
-
-                if oa_html:
-                    _refresh_title_and_dir_from_html_or_str(oa_html)
-                    oa_diag = find_all_candidates(oa_html, oa_base, original_url=oa_url)
-                    if oa_diag.candidates:
-                        print(f"  [OA Success] Discovered {len(oa_diag.candidates)} supplementary file(s) via {oa_url}!")
-                        existing_urls = {c.url for c in candidates}
-                        new_cands = [c for c in oa_diag.candidates if c.url not in existing_urls]
-                        if args.oa:
-                            candidates = new_cands + [c for c in candidates if c.url not in {x.url for x in new_cands}]
-                        else:
-                            candidates.extend(new_cands)
-                        if not candidates:
-                            candidates = list(oa_diag.candidates)
-                        diag = oa_diag
-                        diag.candidates = candidates
-                        break
+    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
+    if not candidates or diag.is_incomplete or args.oa:
+        known = {c.url for c in candidates}
+        additions = [c for c in mirrors.discover() if c.url not in known]
+        candidates = additions + candidates if args.oa else candidates + additions
+    if mirrors.info and mirrors.info.title:
+        _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
 
     if not candidates:
         print("  No supplementary data links found.")
@@ -675,6 +673,10 @@ def run_download(args, bsk_runtime):
         print("  Try running with --headful and --no-cloudflare to debug.")
         return
 
+    candidates = expand_repository_candidates(candidates)
+    diag.candidates = candidates
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
+
     print(f"  Found {len(candidates)} potential supplementary file(s):")
     for i, cand in enumerate(candidates, 1):
         print(f"    [{i}] {cand.filename}")
@@ -683,8 +685,8 @@ def run_download(args, bsk_runtime):
             print(f"        Text:    {cand.link_text}")
         print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
 
-    if diag.declared_count:
-        print(f"  [Info] Article declares {diag.declared_count} supplementary item(s).")
+    if evidence.describe():
+        print(f"  [Info] {evidence.describe()}")
     if diag.is_incomplete:
         print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
 
@@ -693,15 +695,17 @@ def run_download(args, bsk_runtime):
 
     # --- Step 3: Download files ---
     print(f"\n[3/3] Downloading {len(candidates)} file(s)...")
-    success = 0
-    for cand in candidates:
-        result = download_file(
-            cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime, referer=final_url
-        )
-        if result:
-            success += 1
-
-    print(f"\nDone: {success}/{len(candidates)} files downloaded to {os.path.abspath(article_dir)}")
+    successful, attempted = download_with_recovery(
+        candidates,
+        lambda cand: download_file(cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime,
+                                   referer=cand.source_url or final_url),
+        mirrors, expand_repository_candidates)
+    if mirrors.info and mirrors.info.title:
+        _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
+    incomplete, reason = evidence.check(successful)
+    if incomplete:
+        print(f"  [Warning] Downloaded set remains incomplete: {reason}")
+    print(f"\nDone: {len(successful)}/{attempted} file transfers succeeded in {os.path.abspath(article_dir)}")
 
     # --- Step 4: Optional MarkItDown conversion ---
     if args.convert_markdown:

@@ -14,11 +14,12 @@ Safety Guarantee:
 
 import os
 import sys
+import zipfile
 from typing import List, Optional, Tuple
 
 
 CONVERTIBLE_EXTENSIONS = {
-    ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt",
+    ".docx", ".xlsx", ".xls", ".pptx",
     ".pdf", ".csv", ".tsv", ".json", ".xml", ".zip",
     ".html", ".htm",
 }
@@ -82,12 +83,18 @@ def convert_file_to_markdown(
         return None
 
     if not is_markitdown_available():
-        print("  [markitdown] Note: 'markitdown' is not installed. Run 'pip install markitdown' to enable Markdown conversion.")
+        print("  [markitdown] Note: 'markitdown' is not installed. Run 'pip install -r requirements-conversion.txt' to enable Markdown conversion.")
         return None
 
     # Guard against huge scientific packages / raw archives blowing up memory
     try:
         file_size = os.path.getsize(input_path)
+        if input_path.lower().endswith(".zip") and zipfile.is_zipfile(input_path):
+            with zipfile.ZipFile(input_path) as archive:
+                expanded_size = sum(member.file_size for member in archive.infolist())
+            if expanded_size > max_file_size_bytes:
+                print(f"  [markitdown] Notice: Skipping archive whose expanded size exceeds conversion limit: {input_path}")
+                return None
         if file_size > max_file_size_bytes:
             print(f"  [markitdown] Notice: Skipping {os.path.basename(input_path)} ({file_size / (1024*1024):.1f} MB > {max_file_size_bytes / (1024*1024):.0f} MB limit) to prevent memory exhaustion.")
             return None
@@ -217,7 +224,7 @@ def main():
         sys.exit(1)
 
     if not is_markitdown_available():
-        print("Error: 'markitdown' is not installed. Run 'pip install markitdown' first.", file=sys.stderr)
+        print("Error: 'markitdown' is not installed. Run 'pip install -r requirements-conversion.txt' first.", file=sys.stderr)
         sys.exit(1)
 
     if os.path.isdir(args.target):

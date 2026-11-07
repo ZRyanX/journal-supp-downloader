@@ -1,3 +1,4 @@
+from archive_fixture import office_archive
 """
 Unit tests for Tencent BrowserSkill (bsk) adapter and downloader integration.
 Tests discovery, status checking, session lifecycle, DOM extraction, CLI, and fallbacks.
@@ -416,7 +417,7 @@ class TestBrowserSkillSession(unittest.TestCase):
     def test_download_url_authenticated_success(self):
         sess = BrowserSkillSession(bsk_bin="/bin/bsk")
         sess.session_id = "sess_dl_url"
-        sample_data = b"PK\x03\x04sample_xlsx_data"
+        sample_data = office_archive()
         b64_str = base64.b64encode(sample_data).decode("ascii")
         eval_proc = MagicMock(
             returncode=0,
