@@ -90,9 +90,15 @@ def find_playwright_chromium():
                             if "Contents/MacOS" in test_path:
                                 return test_path
             else:
-                exe_path = os.path.join(chrom_dir, "chrome-linux", "chrome")
-                if os.path.exists(exe_path):
-                    return exe_path
+                # Newer Playwright ships the Linux build as
+                # chrome-linux64/chrome instead of chrome-linux/chrome
+                # (e.g. chromium-1254); accept any chrome-linux* layout,
+                # sorted so the classic chrome-linux/ still wins when
+                # both are present.
+                matches = sorted(glob.glob(
+                    os.path.join(chrom_dir, "chrome-linux*", "chrome")))
+                if matches:
+                    return matches[0]
 
     return None
 
@@ -388,7 +394,7 @@ def merge_cookies(existing_cookies, new_cookies) -> List[Dict[str, Any]]:
     return list(cookie_dict.values())
 
 
-def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optional[str] = None, timeout: float = 30.0) -> Tuple[str, int, str, List[Dict[str, Any]]]:
+def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optional[str] = None, timeout: float = 30.0) -> Tuple[str, Optional[int], str, List[Dict[str, Any]]]:
     """
     Fetches or attaches to a page via a live CDP connection to the user's browser:
     1. Inspects existing tabs in browser.contexts[0]. If target_url (or its DOI/PII)
@@ -398,6 +404,9 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
     3. Runs in-page expansion for accordions/supplementary details if available.
     4. Captures HTML content, effective URL, and retrieves live session cookies.
     Returns a tuple: (html_content, status_code, final_url, live_cookies).
+    status_code is the real navigation response.status for a fresh navigation
+    (H1: never a hardcoded 200). Reusing an already-open tab performs no
+    fresh navigation, so its status is None (unknown, not success).
     """
     if not endpoint_or_port:
         raise ValueError("CDP endpoint or port must be specified.")
@@ -453,11 +462,16 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
 
         created_new_page = False
         page = matched_page
+        nav_status = None
         if not page:
             page = context.new_page()
             created_new_page = True
             try:
-                page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                nav_response = page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
+                resp_status = getattr(nav_response, "status", None) if nav_response is not None else None
+                # H1: only a real integer navigation status counts; a missing
+                # response (e.g. about:blank) leaves the status unknown.
+                nav_status = resp_status if isinstance(resp_status, int) else None
             except Exception:
                 pass
 
@@ -516,7 +530,7 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
 
             html_content = page.content()
             final_url = page.url or target_url
-            status_code = 200
+            status_code = nav_status
         finally:
             if created_new_page and page:
                 try:

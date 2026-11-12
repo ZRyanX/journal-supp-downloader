@@ -50,11 +50,19 @@ from supp_finder import (
     is_article_figure_url,
     load_download_manifest,
     save_download_manifest,
+    manifest_entry_url,
+    record_manifest_entry,
     disambiguate_target_filename,
     extract_article_title,
     is_placeholder_or_blocked_title,
     migrate_or_merge_article_dir,
     expand_page_accordions_action,
+    is_blocked_page,
+    page_fetch_is_failure,
+    temp_path_for,
+    commit_temp_file,
+    discard_temp_file,
+    write_bytes_chunked,
 )
 
 
@@ -161,13 +169,16 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             path = os.path.join(output_dir, name)
             result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
             if result:
-                manifest[name] = url
+                record_manifest_entry(manifest, name, url, source_url=referer or "", table_ids=sorted(cand_or_url.covered_table_ids))
                 save_download_manifest(output_dir, manifest)
                 return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
             return None
     else:
         url = cand_or_url
         suggested_fname = ""
+
+    # Table ids the candidate is known to cover (H6), for the manifest record.
+    cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
 
     manifest = load_download_manifest(output_dir)
     fname = suggested_fname or extract_filename_from_url(url)
@@ -176,13 +187,17 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
     filepath = os.path.join(output_dir, fname)
 
     # Check if already exists and is valid for this exact URL
-    if os.path.exists(filepath) and manifest.get(fname) == url:
+    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
             return filepath
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
+    # H9: the body is written in bounded chunks to a same-directory temp
+    # file, validated, then committed with os.replace; the final path
+    # never holds a partial file and a failure only discards the temp.
+    tmp_path = None
     try:
         get_kwargs = {"stealthy_headers": True, "timeout": 30}
         if referer:
@@ -228,7 +243,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             target_fname = sanitize_filename(cd_name)
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
-            if os.path.exists(filepath) and manifest.get(fname) == url:
+            if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                 is_val, _ = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"[SKIP] {fname} (already exists)")
@@ -242,12 +257,12 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 fname = disambiguate_target_filename(output_dir, f"{base}{inferred_ext}", url, manifest)
                 filepath = os.path.join(output_dir, fname)
 
-        with open(filepath, "wb") as f:
-            f.write(resp.body)
+        tmp_path = temp_path_for(filepath)
+        write_bytes_chunked(tmp_path, resp.body)
 
         # Validate file based on signature and response headers (Fixing Issue #5, D1)
         is_valid, reason = validate_downloaded_file(
-            filepath,
+            tmp_path,
             content_bytes=resp.body,
             response_status=resp.status,
             headers=resp.headers,
@@ -260,24 +275,24 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
                 new_path = os.path.join(output_dir, html_name)
                 if filepath != new_path:
-                    os.replace(filepath, new_path)
                     filepath = new_path
                     fname = html_name
-            manifest[fname] = url
+            commit_temp_file(tmp_path, filepath)
+            tmp_path = None
+            record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
             save_download_manifest(output_dir, manifest)
             print(f"OK ({size_kb:.1f} KB - {reason})")
             return filepath
         raise RuntimeError(reason)
 
     except Exception as exc:
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        discard_temp_file(tmp_path)
         if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
             result = download_file_via_browserskill(
                 url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime
             )
             if result:
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 filepath = ensure_inferred_extension_on_disk(filepath, output_dir, url, manifest=manifest)
                 print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
@@ -431,7 +446,7 @@ def run_download(args, bsk_runtime):
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 print("  [BrowserSkill] Successfully retrieved page DOM from live browser session.")
                 page = type("BrowserSkillPage", (), {
                     "html_content": bsk_html,
@@ -471,7 +486,7 @@ def run_download(args, bsk_runtime):
             cdp_html, cdp_status, cdp_final_url, cdp_c = fetch_page_via_cdp(
                 cdp_target, fetch_url, wait_selector=args.wait_selector, timeout=args.timeout / 1000.0
             )
-            if cdp_html and cdp_status < 400:
+            if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 print("  [CDP] Successfully retrieved page DOM from live browser session.")
                 if cdp_c:
                     cookies = merge_cookies(cookies, cdp_c)
@@ -517,7 +532,12 @@ def run_download(args, bsk_runtime):
                     print(f"  [Recovery] HTTP direct fetch failed: {e3}")
 
 
-    if (page is None or getattr(page, "status", 200) >= 400) and bsk_runtime.enabled and not args.browserskill:
+    # H1: a blocked page (challenge / login wall) is a failed fetch even
+    # when the transport reported status < 400, and an unknown status
+    # (None, from BrowserSkill/CDP) must not crash the comparison.
+    _page_html = str(getattr(page, "html_content", None) or getattr(page, "text", "") or "") if page is not None else ""
+    _page_status = getattr(page, "status", None) if page is not None else None
+    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill:
         try:
             html, status, landing = fetch_page_via_browserskill(
                 fetch_url, wait_selector=args.wait_selector,
@@ -531,6 +551,13 @@ def run_download(args, bsk_runtime):
 
     if page is None:
         print(f"Warning: Unable to fetch publisher page; checking available alternatives.")
+        page = type("UnavailablePage", (), {"url": fetch_url, "html_content": "", "text": "", "status": 0})()
+
+    # A page that is still blocked after every fetch tier must not be
+    # parsed as an article: a challenge page mentioning "Table S1" would
+    # otherwise be recorded as declared-but-missing evidence.
+    if page is not None and is_blocked_page(str(getattr(page, "html_content", None) or getattr(page, "text", "") or "")):
+        print("  [Warning] Fetched page is a challenge / login wall; treating it as no usable article page.")
         page = type("UnavailablePage", (), {"url": fetch_url, "html_content": "", "text": "", "status": 0})()
 
     # Resolve effective base URL (Fixing Issue #1: DOI redirect resolution)
@@ -585,7 +612,16 @@ def run_download(args, bsk_runtime):
     evidence = DiscoveryEvidence()
     evidence.observe("publisher", html_content, effective_base)
 
-    if (not candidates or diag.is_incomplete) and bsk_runtime.enabled and not args.wait_selector:
+    # H3: force a browser render when the static page shows dynamic
+    # signals (diag.needs_browser) but the candidate set is empty or the
+    # evidence check still reports missing files. The evidence verdict is
+    # used here, not supp_finder's own is_incomplete: the two can
+    # disagree (e.g. a singular "Additional file (7)" declaration is
+    # seen by the legacy evidence file count but not by the H5 file
+    # count). When the supplements are already complete, do not force.
+    _ev_inc, _ = evidence.check(candidates)
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or _ev_inc)
+    if (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector:
         try:
             retry_html, _, retry_url = fetch_page_via_browserskill(
                 fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
@@ -606,7 +642,10 @@ def run_download(args, bsk_runtime):
             print(f"  [Recovery] BrowserSkill: {exc}")
 
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
-    if diag.is_incomplete and not args.wait_selector and not args.browserskill:
+    # H3 (recomputed after any BSK retry above): diag.is_incomplete is
+    # the evidence verdict here, so the flag again follows the task rule.
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or diag.is_incomplete)
+    if (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill:
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
@@ -695,11 +734,16 @@ def run_download(args, bsk_runtime):
 
     # --- Step 3: Download files ---
     print(f"\n[3/3] Downloading {len(candidates)} file(s)...")
+    # H8: no separate transport exists at this call site -- download_file
+    # already cascades Fetcher -> requests -> BrowserSkill internally, so
+    # there is no distinct retry_download to wire in. A transient failure
+    # therefore retries the same download once, with backoff
+    # (max_retries=1); a bare None/False with no reason is not retried.
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime,
                                    referer=cand.source_url or final_url),
-        mirrors, expand_repository_candidates)
+        mirrors, expand_repository_candidates, max_retries=1)
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
     incomplete, reason = evidence.check(successful)

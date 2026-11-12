@@ -493,12 +493,14 @@ class TestSuppFinder(unittest.TestCase):
             self.assertIsNotNone(m, f"Failed to match plural/range table label: '{l}'")
 
     def test_chinese_declared_counts(self):
-        """Detect Chinese declared supplementary counts and ranges."""
+        """Detect Chinese declared supplementary counts and ranges (H5 split readings)."""
+        from supp_finder import detect_declared_file_count, detect_declared_table_range
         self.assertEqual(detect_declared_supplement_count("本文共 4 个补充文件。"), 4)
-        self.assertEqual(detect_declared_supplement_count("包含 5 个附表及相关数据。"), 5)
+        self.assertEqual(detect_declared_table_range("包含 5 个附表及相关数据。"), {"S1", "S2", "S3", "S4", "S5"})
+        self.assertIsNone(detect_declared_file_count("包含 5 个附表及相关数据。"))
         self.assertEqual(detect_declared_supplement_count("提供 3个附件。"), 3)
-        self.assertEqual(detect_declared_supplement_count("详见附表 1-5。"), 5)
-        self.assertEqual(detect_declared_supplement_count("见附表 1 至 6。"), 6)
+        self.assertEqual(detect_declared_table_range("详见附表 1-5。"), {"S1", "S2", "S3", "S4", "S5"})
+        self.assertEqual(detect_declared_table_range("见附表 1 至 6。"), {"S1", "S2", "S3", "S4", "S5", "S6"})
 
     def test_nearby_heading_context_recognition(self):
         """Table labels in enclosing or preceding headings are attributed to download links."""
@@ -1062,16 +1064,21 @@ class TestSuppFinder(unittest.TestCase):
                 self.assertEqual(os.path.basename(res2), "data_2.xlsx")
 
     def test_e1_declared_count_comprehensive_patterns(self):
-        """E1: detect_declared_supplement_count covers ranges, non-contiguous tables, and lists."""
-        self.assertEqual(detect_declared_supplement_count("Tables S1-S3 in Supplementary Information"), 3)
-        self.assertEqual(detect_declared_supplement_count("Supplementary Table S1 and S2"), 2)
-        self.assertEqual(detect_declared_supplement_count("见附表1至附表6"), 6)
-        self.assertEqual(detect_declared_supplement_count("see Supplementary Tables 2-5"), 4)
+        """E1: detect_declared_table_range covers ranges, non-contiguous tables, and lists (H5 split readings)."""
+        from supp_finder import detect_declared_table_range
+        self.assertEqual(detect_declared_table_range("Tables S1-S3 in Supplementary Information"), {"S1", "S2", "S3"})
+        self.assertEqual(detect_declared_table_range("Supplementary Table S1 and S2"), {"S1", "S2"})
+        self.assertEqual(detect_declared_table_range("见附表1至附表6"), {"S1", "S2", "S3", "S4", "S5", "S6"})
+        self.assertEqual(detect_declared_table_range("see Supplementary Tables 2-5"), {"S2", "S3", "S4", "S5"})
         self.assertEqual(
-            detect_declared_supplement_count("Supplementary Materials and Methods, Figures S1-S3, Tables S1-S4"),
-            4,
+            detect_declared_table_range("Supplementary Materials and Methods, Figures S1-S3, Tables S1-S4"),
+            {"S1", "S2", "S3", "S4"},
         )
-        self.assertEqual(detect_declared_supplement_count("附表1、附表2和附表3"), 3)
+        self.assertEqual(detect_declared_table_range("附表1、附表2和附表3"), {"S1", "S2", "S3"})
+        # None of these declare a file count.
+        for text in ("Tables S1-S3 in Supplementary Information", "Supplementary Table S1 and S2",
+                     "见附表1至附表6", "see Supplementary Tables 2-5"):
+            self.assertIsNone(detect_declared_supplement_count(text), text)
 
     def test_e2_obviously_incomplete_not_falsely_triggered_by_meta_or_publisher(self):
         """E2: When meta or publisher extractors yield candidates, don't falsely claim 0 candidates."""
@@ -1203,14 +1210,15 @@ class TestSuppFinder(unittest.TestCase):
                     self.assertEqual(fp2.read(), office_archive("file2"))
 
     def test_e1_declared_count_appendix_data_oxford(self):
-        """E1: detect_declared_supplement_count covers standalone Appendix, Data ranges, and Oxford commas."""
-        self.assertEqual(detect_declared_supplement_count("Tables S1, S2, and S3"), 3)
-        self.assertEqual(detect_declared_supplement_count("see Appendix 1-4"), 4)
-        self.assertEqual(detect_declared_supplement_count("Appendix 1 to 5"), 5)
-        self.assertEqual(detect_declared_supplement_count("Data S1-S3"), 3)
-        self.assertEqual(detect_declared_supplement_count("Supplementary Data S1-S4"), 4)
-        self.assertEqual(detect_declared_supplement_count("见附录 1-4"), 4)
-        self.assertEqual(detect_declared_supplement_count("附录1至附录5"), 5)
+        """E1: detect_declared_table_range covers standalone Appendix, Data ranges, and Oxford commas (H5 split readings)."""
+        from supp_finder import detect_declared_table_range
+        self.assertEqual(detect_declared_table_range("Tables S1, S2, and S3"), {"S1", "S2", "S3"})
+        self.assertEqual(detect_declared_table_range("see Appendix 1-4"), {"A1", "A2", "A3", "A4"})
+        self.assertEqual(detect_declared_table_range("Appendix 1 to 5"), {"A1", "A2", "A3", "A4", "A5"})
+        self.assertEqual(detect_declared_table_range("Data S1-S3"), {"S1", "S2", "S3"})
+        self.assertEqual(detect_declared_table_range("Supplementary Data S1-S4"), {"S1", "S2", "S3", "S4"})
+        self.assertEqual(detect_declared_table_range("见附录 1-4"), {"A1", "A2", "A3", "A4"})
+        self.assertEqual(detect_declared_table_range("附录1至附录5"), {"A1", "A2", "A3", "A4", "A5"})
 
     def test_a1_appendix_variations_and_chinese_numerals(self):
         """A1: is_explicit_supp_table covers Appendix without space and Chinese numerals."""
@@ -1370,17 +1378,21 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertEqual(rule, "wiley_supp_link")
 
     def test_p1_detect_declared_count_rejects_main_text_tables(self):
-        """P1: detect_declared_supplement_count rejects bare 'Tables 1 to 3' but matches 'Tables S1-S3'."""
-        from supp_finder import detect_declared_supplement_count
+        """P1: the split readings reject bare 'Tables 1 to 3' but match 'Tables S1-S3' as a table range."""
+        from supp_finder import detect_declared_supplement_count, detect_declared_table_range
 
-        # Bare main text tables MUST return None
+        # Bare main text tables MUST return None / empty
         self.assertIsNone(detect_declared_supplement_count("As seen in Tables 1 to 3, the results indicate..."))
         self.assertIsNone(detect_declared_supplement_count("Tables 1, 2, and 3 describe the primary cohort."))
+        self.assertEqual(detect_declared_table_range("As seen in Tables 1 to 3, the results indicate..."), set())
+        self.assertEqual(detect_declared_table_range("Tables 1, 2, and 3 describe the primary cohort."), set())
 
-        # Supplementary tables with S or modifier MUST match
-        self.assertEqual(detect_declared_supplement_count("See Tables S1-S3 for raw data."), 3)
-        self.assertEqual(detect_declared_supplement_count("Supplementary Tables 1 to 4 provide details."), 4)
-        self.assertEqual(detect_declared_supplement_count("Tables S1, S2, and S3 list the antibodies."), 3)
+        # Supplementary tables with S or modifier MUST match as a table range, not a file count
+        self.assertEqual(detect_declared_table_range("See Tables S1-S3 for raw data."), {"S1", "S2", "S3"})
+        self.assertEqual(detect_declared_table_range("Supplementary Tables 1 to 4 provide details."), {"S1", "S2", "S3", "S4"})
+        self.assertEqual(detect_declared_table_range("Tables S1, S2, and S3 list the antibodies."), {"S1", "S2", "S3"})
+        self.assertIsNone(detect_declared_supplement_count("See Tables S1-S3 for raw data."))
+        self.assertIsNone(detect_declared_supplement_count("Supplementary Tables 1 to 4 provide details."))
 
     def test_p1_exclude_main_article_pdf_springer_and_plos(self):
         """P1: _extract_springer_nature_candidates excludes main article PDF and _extract_plos_candidates excludes printable."""
@@ -1794,11 +1806,18 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertIn("https://example.com/files/Extended Methods.docx", urls)
 
     def test_scenario8_declared_count_pattern8(self):
-        """Scenario 8: Declared supplement count pattern 8 matches highest explicit table mention."""
+        """Scenario 8: a highest explicit table mention is a table-range reading, not a count (H5).
+
+        'Supplementary Table S5' declares S5 only; it no longer inflates the
+        declared count to 5 the way the old max() did.
+        """
+        from supp_finder import detect_declared_table_range
         text1 = "Clinical characteristics are presented in Supplementary Table S5."
-        self.assertEqual(detect_declared_supplement_count(text1), 5)
+        self.assertEqual(detect_declared_table_range(text1), {"S5"})
+        self.assertIsNone(detect_declared_supplement_count(text1))
         text2 = "Detailed metrics are available in Table S1-S4."
-        self.assertEqual(detect_declared_supplement_count(text2), 4)
+        self.assertEqual(detect_declared_table_range(text2), {"S1", "S2", "S3", "S4"})
+        self.assertIsNone(detect_declared_supplement_count(text2))
 
     def test_ole2_binary_magic_bytes(self):
         """Legacy Office 97-2003 OLE2 binary files must be recognized by infer_file_extension and validate_downloaded_file."""
@@ -2010,11 +2029,12 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertNotIn("https://example.com/static/js/main.bundle.js", urls)
 
     def test_declared_count_s_prefixed_and_chinese_numerals(self):
-        """detect_declared_supplement_count supports S-prefixed table formats and Chinese numerals."""
-        self.assertEqual(detect_declared_supplement_count("Results presented in S4 Table."), 4)
-        self.assertEqual(detect_declared_supplement_count("见附表一至附表四"), 4)
+        """Split readings support S-prefixed table formats and Chinese numerals (H5)."""
+        from supp_finder import detect_declared_table_range
+        self.assertEqual(detect_declared_table_range("Results presented in S4 Table."), {"S4"})
+        self.assertEqual(detect_declared_table_range("见附表一至附表四"), {"S1", "S2", "S3", "S4"})
         self.assertEqual(detect_declared_supplement_count("共四个补充文件"), 4)
-        self.assertEqual(detect_declared_supplement_count("详见附表四"), 4)
+        self.assertEqual(detect_declared_table_range("详见附表四"), {"S4"})
 
     def test_manifest_aware_mmc_deduplication_after_rename(self):
         """_try_page_scrape_supplements skips candidate MMC if already downloaded and recorded in manifest under renamed filename."""
@@ -2138,7 +2158,7 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertTrue(bool(SUPP_KEYWORD_PATTERN.search("Supplementary Code")))
 
     def test_explicit_supp_figures_and_tables(self):
-        from supp_finder import detect_declared_supplement_count
+        from supp_finder import detect_declared_table_range
         self.assertTrue(is_explicit_supp_table("Supplementary Figures and Tables"))
         self.assertTrue(is_explicit_supp_table("Supplementary Tables and Figures"))
         self.assertTrue(is_explicit_supp_table("Supporting Figures and Tables"))
@@ -2149,8 +2169,8 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         m2 = TABLE_LABEL_PATTERN.search("Supplementary Tables and Figures S1-S5")
         self.assertTrue(bool(m2))
         self.assertIn("S1-S5", m2.group(0))
-        self.assertEqual(detect_declared_supplement_count("See Supplementary Figures and Tables S1-S5 for details."), 5)
-        self.assertEqual(detect_declared_supplement_count("Supplementary Tables and Figures S1 to S4 provide cohort info."), 4)
+        self.assertEqual(detect_declared_table_range("See Supplementary Figures and Tables S1-S5 for details."), {"S1", "S2", "S3", "S4", "S5"})
+        self.assertEqual(detect_declared_table_range("Supplementary Tables and Figures S1 to S4 provide cohort info."), {"S1", "S2", "S3", "S4"})
 
     def test_broadened_supp_table_labels_and_hierarchical_numbers(self):
         """Intermediate words (Information/Material/Data), ESM/SI/Web/STable prefixes, hierarchical numbers, and Appendix Table A1."""
@@ -2261,8 +2281,8 @@ class TestCodebaseAuditFixes(unittest.TestCase):
         self.assertEqual(diag.candidates[0].filename, "Supplementary_Table_S1.xlsx")
 
     def test_declared_count_with_inline_html_tags_and_max_across_patterns(self):
-        """detect_declared_supplement_count strips inline HTML tags/scripts and returns max across patterns."""
-        from supp_finder import detect_declared_supplement_count, is_result_obviously_incomplete, Candidate
+        """Split readings strip inline HTML tags/scripts; table ranges come from visible text only (H5)."""
+        from supp_finder import detect_declared_supplement_count, detect_declared_table_range, is_result_obviously_incomplete, Candidate
         html = """
         <html>
         <head><script>const table_s100 = "Table S99";</script></head>
@@ -2274,8 +2294,9 @@ class TestCodebaseAuditFixes(unittest.TestCase):
           </section>
         </body></html>
         """
-        count = detect_declared_supplement_count(html)
-        self.assertEqual(count, 6)
+        # No file-count statement is present, and the script-only 'Table S99' must not leak in.
+        self.assertIsNone(detect_declared_supplement_count(html))
+        self.assertEqual(detect_declared_table_range(html), {"S1", "S2", "S3", "S4", "S5", "S6"})
 
         # Even if 1 candidate came from embedded_json, an empty DOM #supplementary-material section is flagged incomplete
         cands = [Candidate(url="https://example.com/1.xlsx", filename="1.xlsx", section="embedded_json", match_rule="embedded_json")]
@@ -2321,7 +2342,7 @@ class TestCodebaseAuditFixes(unittest.TestCase):
     def test_ensure_inferred_extension_and_migrate_or_merge_article_dir(self):
         """ensure_inferred_extension_on_disk renames .bin files and migrate_or_merge_article_dir merges existing folders."""
         import tempfile
-        from supp_finder import ensure_inferred_extension_on_disk, migrate_or_merge_article_dir, load_download_manifest, save_download_manifest
+        from supp_finder import ensure_inferred_extension_on_disk, migrate_or_merge_article_dir, load_download_manifest, save_download_manifest, manifest_entry_url
         with tempfile.TemporaryDirectory() as td:
             old_dir = os.path.join(td, "supplements")
             new_dir = os.path.join(td, "Real Article Title")
@@ -2352,8 +2373,8 @@ class TestCodebaseAuditFixes(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(new_dir, "attachment_1.xlsx")))
             self.assertTrue(os.path.exists(os.path.join(new_dir, "existing.csv")))
             merged_manifest = load_download_manifest(new_dir)
-            self.assertEqual(merged_manifest.get("attachment_1.xlsx"), "https://example.com/dl/1")
-            self.assertEqual(merged_manifest.get("existing.csv"), "https://example.com/dl/existing")
+            self.assertEqual(manifest_entry_url(merged_manifest.get("attachment_1.xlsx")), "https://example.com/dl/1")
+            self.assertEqual(manifest_entry_url(merged_manifest.get("existing.csv")), "https://example.com/dl/existing")
 
     def test_scansci_pii_extraction_url_normalization_and_mime_mapping(self):
         """extract_pii_from_url strips hyphens/parens, normalize_url rewrites abs/pdfft, and _mime_or_format_to_ext avoids single-char bugs."""

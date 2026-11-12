@@ -10,10 +10,12 @@ import html
 import json
 import os
 import re
+import sys
+import tempfile
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from bs4 import BeautifulSoup
 
 
@@ -280,6 +282,11 @@ class Candidate:
     source_tag: str = "a"
     extra_info: dict = field(default_factory=dict)
     source_url: str = ""
+    # Table ids this candidate is known to cover (H6). Filled during
+    # extraction from the link label / filename / nearby item text; the
+    # coverage check prefers this field and falls back to inferring ids
+    # from link_text/filename when it is empty.
+    covered_table_ids: Set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict:
         return {
@@ -291,6 +298,7 @@ class Candidate:
             "source_tag": self.source_tag,
             "extra_info": self.extra_info,
             "source_url": self.source_url,
+            "covered_table_ids": sorted(self.covered_table_ids),
         }
 
 
@@ -306,6 +314,10 @@ class FindingDiagnostics:
     candidates: List[Candidate] = field(default_factory=list)
     excluded_links: List[Tuple[str, str]] = field(default_factory=list)
     strategy_counts: Dict[str, int] = field(default_factory=dict)
+    # H3: static parsing could not settle the page; a browser render is
+    # needed (supplementary heading/section with no candidates, or inline
+    # JSON such as __NEXT_DATA__ from which no URL was parsed).
+    needs_browser: bool = False
 
 
 # ── URL & Filename Utilities ─────────────────────────────────────────────────
@@ -1016,31 +1028,188 @@ def extract_target_url_from_tag(tag) -> Optional[str]:
     return None
 
 
-# ── Manifest & Collision Management (D2) ────────────────────────────────────
+# ── Manifest & Collision Management (D2, H6) ─────────────────────────────────
 
-def load_download_manifest(output_dir: str) -> Dict[str, str]:
-    """Load download manifest mapping filename -> URL (D2)."""
+# Manifest entries are filename -> {url, source_url, table_ids, size, sha256, status}.
+# Older manifests stored filename -> URL string; they are normalized on load/save.
+_MANIFEST_ENTRY_DEFAULTS = {
+    "url": "",
+    "source_url": "",
+    "table_ids": [],
+    "size": None,
+    "sha256": None,
+    "status": "downloaded",
+}
+
+
+def manifest_entry_url(entry: Any) -> str:
+    """Return the URL recorded in a manifest entry, old (str) or new (dict) format."""
+    if isinstance(entry, dict):
+        return str(entry.get("url") or "")
+    if isinstance(entry, str):
+        return entry
+    return ""
+
+
+def _normalize_manifest_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Coerce a manifest entry to the structured dict format; None when unusable."""
+    if isinstance(entry, str):
+        if not entry:
+            return None
+        normalized = dict(_MANIFEST_ENTRY_DEFAULTS)
+        normalized["url"] = entry
+        return normalized
+    if isinstance(entry, dict):
+        url = str(entry.get("url") or "")
+        if not url:
+            return None
+        normalized = dict(_MANIFEST_ENTRY_DEFAULTS)
+        normalized.update(entry)
+        normalized["url"] = url
+        normalized["source_url"] = str(entry.get("source_url") or "")
+        table_ids = entry.get("table_ids") or []
+        if isinstance(table_ids, str):
+            table_ids = [table_ids]
+        normalized["table_ids"] = sorted({str(t) for t in table_ids if t})
+        return normalized
+    return None
+
+
+def record_manifest_entry(
+    manifest: Dict[str, Any],
+    filename: str,
+    url: str,
+    *,
+    source_url: str = "",
+    table_ids: Any = (),
+    size: Optional[int] = None,
+    sha256: Optional[str] = None,
+    status: str = "downloaded",
+) -> Dict[str, Any]:
+    """Record one download in structured form (H6); returns the stored entry."""
+    entry = {
+        "url": url,
+        "source_url": source_url or "",
+        "table_ids": sorted({str(t) for t in (table_ids or ()) if t}),
+        "size": size,
+        "sha256": sha256,
+        "status": status,
+    }
+    manifest[filename] = entry
+    return entry
+
+
+def load_download_manifest(output_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Load download manifest mapping filename -> structured entry dict (D2, H6).
+
+    A corrupt manifest file prints a warning and returns {} instead of
+    silently discarding the saved entries.
+    """
     manifest_path = os.path.join(output_dir, ".download_manifest.json")
     if os.path.exists(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[Warning] Corrupt download manifest {manifest_path}: {exc}; ignoring saved entries", file=sys.stderr)
             return {}
+        if not isinstance(data, dict):
+            print(f"[Warning] Corrupt download manifest {manifest_path}: expected a JSON object; ignoring saved entries", file=sys.stderr)
+            return {}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for fname, entry in data.items():
+            coerced = _normalize_manifest_entry(entry)
+            if coerced is None:
+                print(f"[Warning] Skipping unusable manifest entry for {fname!r} in {manifest_path}", file=sys.stderr)
+                continue
+            normalized[fname] = coerced
+        return normalized
     return {}
 
 
-def save_download_manifest(output_dir: str, manifest: Dict[str, str]):
-    """Save download manifest mapping filename -> URL (D2)."""
+def save_download_manifest(output_dir: str, manifest: Dict[str, Any]):
+    """Save download manifest atomically via temp file + os.replace (D2, H6)."""
     manifest_path = os.path.join(output_dir, ".download_manifest.json")
+    normalized = {}
+    for fname, entry in (manifest or {}).items():
+        coerced = _normalize_manifest_entry(entry)
+        if coerced is not None:
+            normalized[fname] = coerced
+    tmp_path = None
     try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-    except Exception:
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".download_manifest.", suffix=".tmp", dir=output_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(normalized, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, manifest_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except Exception as exc:
+        print(f"[Warning] Could not save download manifest {manifest_path}: {exc}", file=sys.stderr)
+
+
+# ── Atomic download landing (H9) ─────────────────────────────────────────────
+# Every download path writes to a same-directory temporary file, validates
+# it, then commits with os.replace and only afterwards updates the
+# manifest. The temp name keeps the target extension (so
+# validate_downloaded_file's extension-specific checks still apply) and
+# is dot-prefixed with a random token, so it can never collide with the
+# final file and is never registered in the manifest.
+
+def temp_path_for(final_path: str) -> str:
+    """Create an empty temp file next to *final_path* and return its path.
+
+    Name shape: ``.<stem>.<random><ext>`` in the same directory, so the
+    commit is a same-filesystem os.replace and the extension is preserved
+    for validation. The caller owns the file and must commit or discard it.
+    """
+    directory = os.path.dirname(os.path.abspath(final_path))
+    base = os.path.basename(final_path)
+    stem, ext = os.path.splitext(base)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{stem}.", suffix=ext, dir=directory)
+    os.close(fd)
+    return tmp_path
+
+
+def commit_temp_file(tmp_path: str, final_path: str) -> None:
+    """Atomically publish a validated temp file at *final_path*."""
+    os.replace(tmp_path, final_path)
+
+
+def discard_temp_file(tmp_path: Optional[str]) -> None:
+    """Best-effort removal of a temp file (failed / invalid download)."""
+    if not tmp_path:
+        return
+    try:
+        os.remove(tmp_path)
+    except OSError:
         pass
 
 
-def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, str]) -> str:
+def write_bytes_chunked(path: str, data: bytes, chunk_size: int = 65536) -> int:
+    """Write *data* to *path* in bounded chunks instead of one shot.
+
+    The bytes are already in memory (e.g. a Fetcher response body); the
+    point is to avoid a single huge write call and to keep the write path
+    uniform with the streaming downloaders.
+    """
+    written = 0
+    view = memoryview(data)
+    with open(path, "wb") as f:
+        for offset in range(0, len(data), chunk_size):
+            written += f.write(view[offset:offset + chunk_size])
+    return written
+
+
+def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, Any]) -> str:
     """
     Ensure fname does not collide with an existing file on disk downloaded for a different URL (D2).
     """
@@ -1049,7 +1218,7 @@ def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest
     idx = 2
     while os.path.exists(os.path.join(output_dir, target)):
         # If this exact file on disk was downloaded for this exact URL, no rename needed
-        if manifest.get(target) == url:
+        if manifest_entry_url(manifest.get(target)) == url:
             break
         target = f"{base}_{idx}{ext}"
         idx += 1
@@ -1221,6 +1390,120 @@ def should_match_candidate(
 
 # ── Core Candidate Scanner ───────────────────────────────────────────────────
 
+# Query parameters that only mark a link as a download request (or analytics
+# tracking) and never identify a distinct file. Two URLs that differ ONLY in
+# these parameters point at the same file and must dedup to one candidate.
+# Normalization rule (H6): a marker parameter is dropped only when its value
+# is a generic flag (empty, a bare number, true/yes/download/attachment);
+# a value that names a file ('download=S2.xlsx') is kept, as are all other
+# parameters (id, attachmentId, file, type, ...), which may identify
+# distinct files. Remaining parameters are sorted so their order does not
+# matter. Scheme/host are lowercased; the path is left untouched.
+_DOWNLOAD_MARKER_PARAMS = {"download", "dl", "attachment", "force_download", "force-download"}
+_DOWNLOAD_MARKER_VALUES = {"", "true", "yes", "download", "attachment"}
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    """Dedup key for a candidate URL: fragment stripped, marker params dropped (H6)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    kept = [
+        (k, v) for k, v in params
+        if not (
+            k.lower() in _DOWNLOAD_MARKER_PARAMS
+            and (v.lower() in _DOWNLOAD_MARKER_VALUES or v.isdigit())
+        )
+        and not k.lower().startswith("utm_")
+    ]
+    kept.sort()
+    query = urllib.parse.urlencode(kept)
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
+def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
+    """Table ids named by a candidate's own label, filename, or attributes (H6)."""
+    ids: Set[str] = set()
+    for value in (link_text, filename):
+        ids |= supplementary_table_ids(value)
+    for value in (attrs or {}).values():
+        if isinstance(value, str):
+            ids |= supplementary_table_ids(value)
+        elif isinstance(value, list):
+            for item in value:
+                ids |= supplementary_table_ids(str(item))
+    return ids
+
+
+def _parent_direct_table_ids(tag) -> Set[str]:
+    """Table ids in the immediate parent's own text nodes (H6).
+
+    E.g. '<li>Table S2 <a>Download</a></li>' attributes S2 to the link.
+    Only when the parent is a single item row (li/td/p/...) holding exactly
+    one download control, so a section that lists several tables never
+    donates its whole declaration ('Tables S1.1 and S1.2') to one link.
+    """
+    parent = getattr(tag, "parent", None)
+    if parent is None or not hasattr(parent, "find_all"):
+        return set()
+    parent_name = getattr(parent, "name", "") or ""
+    if parent_name in ("section", "article", "main", "body", "html", "ul", "ol", "table", "figure"):
+        return set()
+    if parent_name == "div":
+        attrs = " ".join(
+            [str(parent.get("id") or "")] + [str(c) for c in (parent.get("class") or [])]
+        ).lower()
+        if any(kw in attrs for kw in ("supplement", "suppl", "appendix", "extended-data", "extended_data", "附表", "附录")):
+            return set()
+    try:
+        controls = [
+            c for c in parent.find_all(["a", "button", "input"], recursive=False)
+            if extract_target_url_from_tag(c)
+        ]
+        if len(controls) != 1:
+            return set()
+        direct_text = " ".join(
+            s.strip() for s in parent.find_all(string=True, recursive=False) if s.strip()
+        )
+    except Exception:
+        return set()
+    if not direct_text:
+        return set()
+    return supplementary_table_ids(direct_text)
+
+
+# Inline JSON payloads whose URLs static parsing may miss (H3).
+_INLINE_JSON_MARKERS = ("__NEXT_DATA__", "__INITIAL_STATE__", "__NUXT__", "__PRELOADED_STATE__")
+
+_SUPP_SIGNAL_KEYWORDS = (
+    "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
+    "esm", "additional-file", "extended-data", "extended_data",
+    "补充", "附表", "附录", "支撑材料",
+)
+
+
+def _page_has_supplementary_signal(soup) -> bool:
+    """True when the page shows a supplementary heading, section, or collapsed control (H3)."""
+    for el in soup.find_all(["section", "div", "aside", "details", "figure"]):
+        ident = (el.get("id", "") + " " + " ".join(el.get("class", []))).lower()
+        if any(kw in ident for kw in _SUPP_SIGNAL_KEYWORDS):
+            return True
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if SUPP_KEYWORD_PATTERN.search(heading.get_text(" ", strip=True) or ""):
+            return True
+    for el in soup.find_all(["button", "a", "summary"]):
+        text = " ".join([
+            el.get_text(" ", strip=True) or "",
+            str(el.get("aria-label") or ""),
+            str(el.get("title") or ""),
+        ])
+        if SUPP_KEYWORD_PATTERN.search(text):
+            return True
+    return False
+
+
 def find_all_candidates(
     html_content: str,
     base_url: str,
@@ -1271,10 +1554,21 @@ def find_all_candidates(
         if is_article_figure_url(norm_url, text=cand.link_text, attrs=evidence_attrs):
             diag.excluded_links.append((norm_url, "article_figure_pattern"))
             return
-        if norm_url in seen_urls:
-            # Upgrade existing candidate if this one has a more specific filename
-            for i, existing in enumerate(candidates):
-                if existing.url.split("#")[0].strip() == norm_url:
+        # H6: record the table ids this link is known to cover, then dedup on
+        # the query-normalized URL so download-marker differences do not
+        # inflate the candidate count.
+        cand.covered_table_ids = set(cand.covered_table_ids) | _infer_candidate_table_ids(
+            cand.link_text, cand.filename, evidence_attrs
+        )
+        dedup_key = _normalize_url_for_dedup(norm_url)
+        if dedup_key in seen_urls:
+            # H6: same file reached twice (e.g. once as 'Table S1', once as
+            # 'Table S2') keeps ONE candidate but merges both labels/table ids.
+            for existing in candidates:
+                if _normalize_url_for_dedup(existing.url.split("#")[0].strip()) == dedup_key:
+                    existing.covered_table_ids |= cand.covered_table_ids
+                    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
+                        existing.link_text = cand.link_text
                     is_existing_generic = (
                         existing.filename.endswith(".bin")
                         or existing.filename.startswith("download_")
@@ -1286,10 +1580,10 @@ def find_all_candidates(
                         or cand.filename.startswith("attachment_")
                     )
                     if is_existing_generic and is_cand_specific:
-                        candidates[i] = cand
+                        existing.filename = cand.filename
                     break
             return
-        seen_urls.add(norm_url)
+        seen_urls.add(dedup_key)
         candidates.append(cand)
 
     # ── Strategy 1: Targeted Meta & Link Tags (Highwire, Nature, etc.) ────
@@ -1326,7 +1620,8 @@ def find_all_candidates(
                     filename=sanitize_filename(control_label) + ".bin",
                     link_text=control_label, section="supplementary_section",
                     source_url=base_url, extra_info={"browser_selector": selector},
-                    match_rule="browser_download_control"))
+                    match_rule="browser_download_control",
+                    covered_table_ids=supplementary_table_ids(control_label)))
             continue
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
@@ -1387,6 +1682,7 @@ def find_all_candidates(
                 match_rule=rule,
                 source_tag=tag.name,
                 extra_info={"attributes": attrs},
+                covered_table_ids=_parent_direct_table_ids(tag),
             ))
 
     # ── Strategy 3: Publisher-Specific Extractors (Issue #6 & WebVPN compatibility) ──
@@ -1447,6 +1743,17 @@ def find_all_candidates(
     is_inc, inc_reason = is_result_obviously_incomplete(candidates, soup, diag.declared_count)
     diag.is_incomplete = is_inc
     diag.incomplete_reason = inc_reason
+
+    # ── H3: dynamic 'not loaded' signal ───────────────────────────────────
+    # Supplementary heading/section present but nothing extracted, or inline
+    # JSON (__NEXT_DATA__ / __INITIAL_STATE__ / ...) present but no URL was
+    # parsed out of it: static parsing cannot settle the page, so a browser
+    # render is needed. Callers should treat this as a must-render signal.
+    embedded_found = any(c.match_rule.startswith("embedded_") for c in candidates)
+    has_inline_json = any(marker in html_content for marker in _INLINE_JSON_MARKERS)
+    diag.needs_browser = (not candidates and _page_has_supplementary_signal(soup)) or (
+        has_inline_json and not embedded_found
+    )
 
     return diag
 
@@ -1805,28 +2112,51 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
 
 # ── Completeness & Incomplete Result Detection (Issue #4) ────────────────────
 
-def detect_declared_supplement_count(html_content: str) -> Optional[int]:
-    """
-    Detect whether the article page declares a specific count of supplementary files (E1).
-    e.g., '4 Supplementary Files', 'Supplementary Tables S1-S5', 'Supporting Information (3)',
-    '共 4 个补充文件', '附表 1-5', '附表1至附表6', '附录 1-4', 'Supplementary Table S1 and S2',
-    'Tables S1-S3 in Supplementary Information', 'see Supplementary Tables 2-5',
-    'Appendix 1-4', 'Data S1-S3', 'Tables S1, S2, and S3'.
-    Strips inline HTML tags before matching and returns the maximum count found across all patterns.
-    """
-    if not html_content:
-        return None
-
-    # Strip <script> and <style> blocks and inline HTML tags so 'Tables <a>S1</a>-<a>S4</a>' is matched cleanly
+def _clean_text_for_declarations(html_content: str) -> str:
+    """Strip <script>/<style> blocks and tags so declarations are matched on visible text."""
     cleaned = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html_content, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = html.unescape(cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned)
 
+
+_CN_DECLARATION_DIGITS = {
+    '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+    '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+}
+
+
+def _parse_declared_numeral(s: str) -> Optional[int]:
+    """Convert an Arabic or Chinese numeral (一二三四五六七八九十) to int, else None."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    if s in _CN_DECLARATION_DIGITS:
+        return _CN_DECLARATION_DIGITS[s]
+    if s.startswith('十') and len(s) == 2 and s[1] in _CN_DECLARATION_DIGITS:
+        return 10 + _CN_DECLARATION_DIGITS[s[1]]
+    return None
+
+
+def detect_declared_file_count(html_content: str) -> Optional[int]:
+    """
+    Detect an explicit declared number of supplementary *files* (H5, file-count reading).
+
+    Only statements that count files are recognised, e.g. '3 Supplementary Files',
+    'Supplementary Material (4 files)', '共 4 个补充文件', '提供 3 个附件'.
+    Table identifiers and table ranges ('Tables S1-S3', 'Supplementary Table S10',
+    '5 个附表') are deliberately NOT counted here; see detect_declared_table_range.
+    Returns None when no file-count statement is present.
+    """
+    if not html_content:
+        return None
+    cleaned = _clean_text_for_declarations(html_content)
     found_counts: List[int] = []
 
-    # Pattern 1: 'N Supplementary Files' / 'N Supplementary Tables'
-    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|tables?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
+    # Pattern 1: 'N Supplementary Files' / 'N Supplementary Materials' (never 'N Supplementary Tables')
+    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
@@ -1834,9 +2164,20 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 2: 'Supporting Information (N)' or 'Supplementary Material (4 files)'
+    # Pattern 1b: 'N attachments' / 'Total N files'
+    for m in re.finditer(r'\b(\d{1,2})\s+attachments?\b|\btotal\s+(\d{1,2})\s+files?\b', cleaned, re.IGNORECASE):
+        try:
+            val = int(m.group(1) or m.group(2))
+            if 1 <= val <= 99:
+                found_counts.append(val)
+        except ValueError:
+            pass
+
+    # Pattern 2: 'Supporting Information (N)' / 'Supplementary Material (4 files)'.
+    # A bare parenthesised number after an Information/Material heading counts files;
+    # an explicit '(N tables)' belongs to the table reading instead.
     for m in re.finditer(
-        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+(?:Information|Material|Materials|Data|Files|Tables)\s*\(\s*([1-9]\d?)(?:\s+(?:files?|tables?|items?|datasets?))?\s*\)',
+        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+(?:Information|Material|Materials|Data|Files)\s*\(\s*([1-9]\d?)(?:\s+files?)?\s*\)',
         cleaned,
         re.IGNORECASE,
     ):
@@ -1847,139 +2188,85 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables S1 to S4' (E1)
-    # Modifier and 'S' cannot both be omitted (e.g. 'Tables 1 to 3' is main text, not supplementary)
+    # Pattern 5: Chinese file counts: '共 4 个补充文件', '3 个附件', '共四个补充文件'.
+    # The supplement qualifier (补充/附录/附加) is mandatory: bare '本文包含 4 个表格'
+    # is a main-text table count, not a supplementary declaration (H5).
     for m in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data|appendix)(?:\s+(?:information|info|materials?|data))?\s+(?:(?:figures?|figs?\.?)\s+(?:and|&)\s+)?tables?(?:\s+(?:and|&)\s+(?:figures?|figs?\.?))?\s+s?0?(\d{1,2})|tables?\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(?:补充|附录|附加)(?:文件|材料|附件|数据)'
+        r'|([0-9一二两三四五六七八九十]+)\s*个?附件',
         cleaned,
-        re.IGNORECASE,
     ):
-        try:
-            start_num = int(m.group(1) or m.group(2))
-            end_num = int(m.group(3))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Pattern 3b: Standalone Appendix range: 'Appendix 1-4', 'Appendix 1 to 5' (A1, E1)
-    for m in re.finditer(
-        r'\bappendix\s+0?(\d{1,2})\s*(?:[-–至~到]|to)\s*0?(\d{1,2})\b',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        try:
-            start_num = int(m.group(1))
-            end_num = int(m.group(2))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Pattern 3c: Data/Dataset range: 'Data S1-S3', 'Supplementary Data S1-S4', 'Dataset 1 to 4' (A3, E1)
-    for m in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting)\s+(?:datasets?|data|files?)\s+s?0?(\d{1,2})|(?:datasets?|data|files?)\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        try:
-            start_num = int(m.group(1) or m.group(2))
-            end_num = int(m.group(3))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Helper for converting Arabic or Chinese numerals (一二三四五六七八九十)
-    cn_digits = {
-        '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
-        '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
-    }
-    def _parse_count_val(s: str) -> Optional[int]:
-        if not s:
-            return None
-        s = s.strip()
-        if s.isdigit():
-            return int(s)
-        if s in cn_digits:
-            return cn_digits[s]
-        if s.startswith('十') and len(s) == 2 and s[1] in cn_digits:
-            return 10 + cn_digits[s[1]]
-        return None
-
-    # Pattern 4: Chinese range: '附表 1-5', '附表1至附表6', '补充表 S1-S6', '附录 1-4', '附表一至附表四'
-    for m in re.finditer(
-        r'(?:附表|补充表|附录表|补充表格|附录)\s*s?0?([0-9一二两三四五六七八九十]+)\s*(?:[-–至~到]|to)\s*(?:附表|补充表|附录表|补充表格|附录)?\s*s?0?([0-9一二两三四五六七八九十]+)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        s_num = _parse_count_val(m.group(1))
-        e_num = _parse_count_val(m.group(2))
-        if s_num is not None and e_num is not None and e_num >= s_num and (e_num - s_num + 1) <= 99:
-            found_counts.append(e_num - s_num + 1)
-
-    # Pattern 5: Chinese counts: '共 4 个补充文件', '4 个附表', '3个附件', '含 5 个附表', '共四个补充文件'
-    for m in re.finditer(r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(?:补充|附录|附加)?(?:文件|材料|表格|数据|附件|附表|补充表)', cleaned):
-        c_num = _parse_count_val(m.group(1))
+        c_num = _parse_declared_numeral(m.group(1) or m.group(2))
         if c_num is not None and 1 <= c_num <= 99:
             found_counts.append(c_num)
 
-    # Pattern 6a: List of tables: 'Supplementary Table S1 and S2', 'Tables S1, S2 and S3', 'Tables S1, S2, and S3' (E1)
-    for m_list in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data|appendix)\s+tables?\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
-        r'|tables?\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        nums = re.findall(r'\d{1,2}', m_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 6b: List of data files: 'Data S1 and S2', 'Supplementary Data S1, S2, and S3' (E1)
-    for m_data_list in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting)\s+(?:datasets?|data|files?)\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
-        r'|(?:datasets?|data|files?)\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        nums = re.findall(r'\d{1,2}', m_data_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 7: Chinese table/appendix list: '附表1、附表2和附表3', '附录1、附录2及附录3' (E1)
-    for m_cn_list in re.finditer(
-        r'(?:附表|补充表|附录)\s*\d{1,2}(?:[、,，]\s*(?:附表|补充表|附录)?\s*\d{1,2})*\s*(?:和|及|与)\s*(?:附表|补充表|附录)?\s*(\d{1,2})',
-        cleaned,
-    ):
-        nums = re.findall(r'\d{1,2}', m_cn_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 8: Highest explicit supplementary table mention (including single Table S1 / Supplementary Table S1)
-    # e.g. "see Supplementary Table S4", "Table S1", "S4 Table", "附表1", "附表四"
-    # Requires explicit supplementary prefix or 'S' numbering to avoid matching bare primary 'Table 1-3'.
-    m_high = re.findall(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data)(?:\s+(?:information|info|materials?|data))?\s+tables?\s+s?0?(\d{1,2})'
-        r'|tables?\s+s0?(\d{1,2})'
-        r'|\bs0?(\d{1,2})\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?)'
-        r'|附表\s*s?0?([0-9一二两三四五六七八九十]+))\b',
-        cleaned,
-        re.IGNORECASE,
-    )
-    if m_high:
-        nums = []
-        for g in m_high:
-            for val in g:
-                if val:
-                    n = _parse_count_val(val)
-                    if n is not None and 1 <= n <= 99:
-                        nums.append(n)
-        if nums:
-            max_val = max(nums)
-            if max_val >= 1:
-                found_counts.append(max_val)
-
     return max(found_counts) if found_counts else None
+
+
+def detect_declared_table_range(html_content: str) -> Set[str]:
+    """
+    Detect the table identities a page declares (H5, table-range reading).
+
+    Returns the set of namespaced table ids (e.g. {'S1', 'S2', 'S3'}) from
+    ranges ('Tables S1-S3', 'Tables S1 to S3'), lists ('Tables S1, S2, and S3'),
+    single mentions ('Supplementary Table S10' -> {'S10'} only, never S1..S10)
+    and bare table counts ('5 个附表' / '3 Supplementary Tables' -> S1..S5 / S1..S3).
+    A bare table count expands from 1 because such a statement declares that
+    many tables without naming them; a single numbered mention does not imply
+    the tables below it. Returns an empty set when nothing is declared.
+    """
+    if not html_content:
+        return set()
+    cleaned = _clean_text_for_declarations(html_content)
+    declared = set(supplementary_table_ids(cleaned))
+
+    # Bare table counts with no ids: '3 Supplementary Tables', 'Supplementary Tables (5)'.
+    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+tables?\b', cleaned, re.IGNORECASE):
+        try:
+            count = int(m.group(1))
+            if 1 <= count <= 99:
+                declared.update(f"S{i}" for i in range(1, count + 1))
+        except ValueError:
+            pass
+    for m in re.finditer(
+        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+Tables?\s*\(\s*([1-9]\d?)(?:\s+tables?)?\s*\)',
+        cleaned,
+        re.IGNORECASE,
+    ):
+        try:
+            count = int(m.group(1))
+            if 1 <= count <= 99:
+                declared.update(f"S{i}" for i in range(1, count + 1))
+        except ValueError:
+            pass
+
+    # Bare Chinese table counts: '5 个附表' -> S1..S5, '5 个附录' -> A1..A5.
+    for m in re.finditer(
+        r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(附表|补充表|附录表|附加表|附录)',
+        cleaned,
+    ):
+        c_num = _parse_declared_numeral(m.group(1))
+        if c_num is not None and 1 <= c_num <= 99:
+            prefix = "A" if m.group(2) == "附录" else "S"
+            declared.update(f"{prefix}{i}" for i in range(1, c_num + 1))
+
+    return declared
+
+
+def detect_declared_supplement_count(html_content: str) -> Optional[int]:
+    """
+    Compatibility entry point: now returns the *file-count* reading only.
+
+    Historically this returned max() across file counts, table ranges and the
+    highest table mention, which inflated the declared number (e.g. a page
+    with '3 Supplementary Files' plus a mention of 'Table S10' reported 10).
+    It is kept so existing callers keep working, but its semantics changed in
+    the P0 H5 fix: it is exactly detect_declared_file_count(). For the
+    table-range reading use detect_declared_table_range(), and for the
+    completeness verdict use is_result_obviously_incomplete(), which
+    consults both readings separately instead of mixing them.
+    """
+    return detect_declared_file_count(html_content)
 
 
 _DOM_SUPP_SECTIONS = {
@@ -1996,24 +2283,175 @@ _DOM_SUPP_SECTIONS = {
 }
 
 
+_CN_TABLE_DIGITS = {
+    '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+    '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+}
+
+
+def _parse_table_number(raw: str) -> Optional[str]:
+    """Normalize a table number to its canonical digit form ('01' -> '1', '一' -> '1').
+
+    Hierarchical numbers keep their dotted parts ('1.1' stays '1.1').
+    Returns None for values that are not a plain or Chinese numeral.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw[0].isdigit():
+        parts = raw.split(".")
+        try:
+            return ".".join(str(int(p)) for p in parts)
+        except ValueError:
+            return None
+    if all(ch in _CN_TABLE_DIGITS for ch in raw):
+        if '十' in raw:
+            head, _, tail = raw.partition('十')
+            tens = _CN_TABLE_DIGITS.get(head, 1) if head else 1
+            ones = _CN_TABLE_DIGITS.get(tail, 0) if tail else 0
+            return str(tens * 10 + ones)
+        if len(raw) == 1:
+            return str(_CN_TABLE_DIGITS[raw])
+    return None
+
+
+# One table-id token: an optional table-word prefix, an optional S/A/E letter,
+# and a (possibly hierarchical or Chinese) number. A trailing table word
+# ('S4 Table') also counts as explicit table context.
+_TABLE_TOKEN_RE = re.compile(
+    r"(?:(?P<pw>(?:supplementary|supplemental|supporting|additional|extended\s+data|appendix)"
+    r"\b(?:\s+(?:information|info|materials?|data))?(?:\s+tables?)?"
+    r"|附表|附录|tables?|tabs?\.?|tbls?\.?)\s*)?"
+    r"(?:(?P<letter>[SAE])[-_.\s]*)?(?P<num>\d+(?:\.\d+)*|[一二两三四五六七八九十]+)"
+    r"(?P<post>\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?|表格|数据|文件))?",
+    re.IGNORECASE,
+)
+_TABLE_RANGE_SEP_RE = re.compile(r"^\s*(?:-|\bto\b|至|~|到)\s*$", re.IGNORECASE)
+_TABLE_LIST_SEP_RE = re.compile(r"^\s*(?:[,、，/]\s*)?(?:and|&|和|及|与)?\s*$", re.IGNORECASE)
+
+
+def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optional[str]) -> Optional[str]:
+    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides."""
+    if letter:
+        return letter.upper()
+    if pw:
+        low = pw.lower()
+        if "appendix" in low or "附录" in pw:
+            return "A"
+        if "extended" in low:
+            return "E"
+        if any(w in low for w in ("supplement", "supporting", "additional", "附表")):
+            return "S"
+    if post:
+        return None
+    return None
+
+
+def _expand_table_range(start: str, end: str) -> Optional[List[str]]:
+    """Expand '1'->'3' to ['1','2','3'] and '1.1'->'1.3' to ['1.1','1.2','1.3'] (same major)."""
+    if "." not in start and "." not in end:
+        try:
+            s, e = int(start), int(end)
+        except ValueError:
+            return None
+        if 1 <= s <= e <= 999 and e - s <= 99:
+            return [str(i) for i in range(s, e + 1)]
+        return None
+    s_parts, e_parts = start.split("."), end.split(".")
+    if len(s_parts) == len(e_parts) == 2 and s_parts[0] == e_parts[0]:
+        try:
+            s, e = int(s_parts[1]), int(e_parts[1])
+            major = int(s_parts[0])
+        except ValueError:
+            return None
+        if 1 <= major <= 999 and 0 <= s <= e <= 999 and e - s <= 99:
+            return [f"{major}.{i}" for i in range(s, e + 1)]
+    return None
+
+
 def supplementary_table_ids(text):
-    """Return namespaced identities (S1, A1), never bare ordinal counts."""
+    """Return namespaced table identities (S1, S1.1, A1, E1), never bare ordinal counts.
+
+    Hierarchical numbers keep their suffix ('Table S1.1' -> 'S1.1', not 'S1').
+    Ranges expand: 'Tables S1 to S3', bare 'S1-S3', 'Appendix A1-A3' and
+    'Extended Data Tables 1-3' all enumerate every member. Lists ('S1, S2 and S3')
+    enumerate their members. A bare 'S1' with no table context or range/list
+    neighbour is ignored, as is a bare main-text 'Table 1'.
+    """
     result = set()
     text = str(text or "")
-    pattern = r'(?:tables?|附表)[\s_-]*([SA])\s*(\d+)((?:\s*(?:[-–—至]|,\s*(?:and\s+)?|and\s+)\s*(?:[SA]\s*)?\d+)*)'
-    for match in re.finditer(pattern, text, re.I):
-        prefix, number = match[1].upper(), int(match[2])
-        if not 0 < number <= 999:
+    # Normalize unicode dashes so range separators are uniform.
+    text = re.sub(r"[‐‑‒–—―]", "-", text)
+    tokens = []  # (namespace-or-None, number, has_context, start, end)
+    for m in _TABLE_TOKEN_RE.finditer(text):
+        pw = m.group("pw")
+        letter = m.group("letter")
+        post = m.group("post")
+        num = _parse_table_number(m.group("num"))
+        if num is None:
             continue
-        result.add(f'{prefix}{number}')
-        for item in re.finditer(r'([-–—至]|,\s*(?:and\s+)?|and)\s*([SA])?\s*(\d+)', match[3], re.I):
-            next_prefix, end = (item[2] or prefix).upper(), int(item[3])
-            if 0 < end <= 999:
-                if item[1] in '-–—至' and next_prefix == prefix and number <= end:
-                    result.update(f'{prefix}{i}' for i in range(number, end + 1))
-                else:
-                    result.add(f'{next_prefix}{end}')
-            prefix, number = next_prefix, end
+        # A Latin prefix word glued to a bare number ('Supplementary3') is not
+        # a table id unless an S/A/E letter is present; Chinese 附表/附录
+        # legitimately take the number with no space.
+        if pw and not letter and pw not in ("附表", "附录"):
+            id_start = m.start("num")
+            if id_start == m.end("pw"):
+                continue
+        # A bare number with neither a prefix word, a letter, nor a trailing
+        # table word is not a table id on its own; kept as a weak token so it
+        # can still inherit the namespace of a range/list neighbour
+        # ('Supplementary Tables 2-5' -> S2..S5).
+        if not pw and not letter and not post:
+            tokens.append({"ns": None, "num": num, "context": False, "start": m.start(), "end": m.end()})
+            continue
+        ns = _table_token_namespace(pw, letter, post)
+        if ns is None:
+            continue
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "start": m.start(), "end": m.end()})
+
+    # Group consecutive tokens joined only by a range/list separator.
+    groups = []  # each: [(token, sep_from_previous)] with sep None for the first
+    for tok in tokens:
+        if not groups:
+            groups.append([(tok, None)])
+            continue
+        prev_tok = groups[-1][-1][0]
+        between = text[prev_tok["end"]:tok["start"]]
+        if _TABLE_RANGE_SEP_RE.match(between):
+            groups[-1].append((tok, "range"))
+        elif between.strip() and _TABLE_LIST_SEP_RE.match(between):
+            groups[-1].append((tok, "list"))
+        else:
+            groups.append([(tok, None)])
+
+    for group in groups:
+        if len(group) == 1:
+            tok = group[0][0]
+            # A lone bare 'S1' (no table word anywhere) is not evidence.
+            if tok["context"]:
+                result.add(f"{tok['ns']}{tok['num']}")
+            continue
+        # Weak (bare-number) members inherit the namespace of the nearest
+        # preceding namespaced member of the same group.
+        resolved = []
+        last_ns = None
+        for tok, sep in group:
+            ns = tok["ns"] or last_ns
+            if ns is None:
+                continue
+            last_ns = ns
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"]}, sep))
+        expanded: Set[str] = set()
+        for idx, (tok, sep) in enumerate(resolved):
+            if sep == "range" and idx > 0:
+                prev_tok = resolved[idx - 1][0]
+                if prev_tok["ns"] == tok["ns"]:
+                    span = _expand_table_range(prev_tok["num"], tok["num"])
+                    if span is not None:
+                        expanded.update(f"{tok['ns']}{n}" for n in span)
+                        continue
+            expanded.add(f"{tok['ns']}{tok['num']}")
+        result.update(expanded)
     return result
 
 
@@ -2042,8 +2480,18 @@ def candidate_evidence(candidates):
 
 
 def covered_table_ids(candidates):
+    """Table ids covered by candidates (H6).
+
+    Prefers each candidate's explicit covered_table_ids field (filled during
+    extraction); when a candidate has no explicit ids, falls back to inferring
+    them from its link text, filename, and attributes, as before.
+    """
     covered = set()
     for item in candidate_evidence(candidates):
+        explicit = item.get('covered_table_ids')
+        if explicit:
+            covered.update(str(t) for t in explicit)
+            continue
         for value in (item.get('link_text'), item.get('filename'), item.get('extra_info', {}).get('attributes', {})):
             covered.update(supplementary_table_ids(value))
     return covered
@@ -2053,10 +2501,13 @@ def is_result_obviously_incomplete(candidates, html_content, declared_count=None
     if not html_content:
         return (True, 'Empty page content') if not candidates else (False, '')
     soup = html_content if isinstance(html_content, BeautifulSoup) else BeautifulSoup(html_content, DEFAULT_PARSER)
-    page_text = soup.get_text(' ', strip=True)
-    expected_tables = supplementary_table_ids(page_text)
+    raw_html = html_content if isinstance(html_content, str) else str(html_content)
+    # H5: the two readings are judged separately, both on visible text only
+    # (script/style content is not a declaration). A table range or a high
+    # table number is never treated as a file count.
+    expected_tables = detect_declared_table_range(raw_html)
     missing = expected_tables - covered_table_ids(candidates)
-    file_count = declared_file_count(page_text)
+    file_count = detect_declared_file_count(raw_html)
     # Deduplicate identical URLs but never substitute table counts for files.
     if file_count and len({c.url for c in candidates}) < file_count:
         return True, f'File count ({len({c.url for c in candidates})}) is less than declared count ({file_count} files)'
@@ -2103,6 +2554,102 @@ _ZIP_MAGIC_EXTS = {".xlsx", ".docx", ".pptx", ".zip", ".npz"}
 _GZIP_MAGIC_SUFFIXES = (".gz", ".tgz")
 _BZIP2_MAGIC_SUFFIXES = (".bz2",)
 _XZ_MAGIC_SUFFIXES = (".xz", ".txz")
+
+
+# ── Blocked-page detection (H1) ──────────────────────────────────────────────
+# A fetched article page is "blocked" when it is a Cloudflare / Turnstile
+# challenge, an access-denied page, or a login wall rather than the article.
+# Kept here (next to file validation) so both downloaders and the
+# BrowserSkill adapter can use it without a circular import: supp_finder
+# imports neither browserskill_adapter nor playwright_utils, while both of
+# those are imported by the downloaders. The title markers below subsume
+# the four keywords BrowserSkill used to check on its own
+# ("just a moment" / "access denied" / "attention required" /
+# "verify you are human").
+
+_BLOCKED_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "access denied",
+    "403 forbidden",
+    "security check",
+    "checking your browser",
+    "please verify",
+    "are you human",
+    "human verification",
+    "sign in to",
+    "log in to",
+    "institutional login",
+    "login required",
+    "sign in required",
+    "please sign in",
+    "please log in",
+)
+
+_BLOCKED_TITLE_EXACT = {"sign in", "log in", "login", "sign-in", "log-in"}
+
+# Body phrases that only appear when the page itself is a challenge / login
+# wall. Deliberately NOT included: a bare "Sign in" navigation link, which
+# normal article pages carry in their header.
+_BLOCKED_BODY_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "please verify you are human",
+    "checking your browser",
+    "challenge-platform",
+    "cf-browser-verification",
+    "turnstile",
+    "human verification",
+    "access denied",
+    "403 forbidden",
+    "sign in to access",
+    "log in to access",
+    "sign in to view",
+    "log in to view",
+    "sign in to continue",
+    "log in to continue",
+    "login required",
+    "sign-in required",
+    "authentication required",
+    "you must be logged in",
+    "institutional login",
+)
+
+
+def is_blocked_page(page_html: Optional[str]) -> bool:
+    """True if *page_html* looks like a challenge / access-denied / login-wall page.
+
+    Checks the <title> and the visible body text. A normal article page
+    that merely links to a sign-in page is not blocked.
+    """
+    if not page_html or not isinstance(page_html, str):
+        return False
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.I | re.S)
+    title = (title_match.group(1) if title_match else "").strip().lower()
+    if title:
+        if title in _BLOCKED_TITLE_EXACT:
+            return True
+        if any(marker in title for marker in _BLOCKED_TITLE_MARKERS):
+            return True
+    text = re.sub(r"<[^>]+>", " ", page_html)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return any(marker in text for marker in _BLOCKED_BODY_MARKERS)
+
+
+def page_fetch_is_failure(html: Optional[str], status: Optional[int] = None) -> bool:
+    """Caller rule for H1: a page fetch failed when the HTTP status is an
+    error (>= 400), or when the page is a blocked page. An unknown status
+    (None, e.g. BrowserSkill exposes no navigation status) is only a
+    failure when the page shows challenge / login features; on its own it
+    is accepted, since no better signal exists. A ``status < 400`` alone
+    must never be treated as success without this check.
+    """
+    if status is not None and status >= 400:
+        return True
+    return bool(html) and is_blocked_page(html)
 
 
 def validate_downloaded_file(
@@ -2344,7 +2891,7 @@ def ensure_inferred_extension_on_disk(
     filepath: str,
     output_dir: str,
     url: str,
-    manifest: Optional[Dict[str, str]] = None,
+    manifest: Optional[Dict[str, Any]] = None,
     content_type: str = "",
 ) -> str:
     """
@@ -2382,7 +2929,7 @@ def ensure_inferred_extension_on_disk(
 
     if fname in m and final_fname != fname:
         m.pop(fname, None)
-    m[final_fname] = url
+    record_manifest_entry(m, final_fname, url)
     save_download_manifest(output_dir, m)
     return new_filepath
 
@@ -2450,15 +2997,16 @@ def migrate_or_merge_article_dir(old_dir: str, new_dir: str) -> str:
                 continue
             src_path = os.path.join(old_abs, entry)
             if os.path.isfile(src_path):
-                url = old_manifest.get(entry, "")
+                old_entry = _normalize_manifest_entry(old_manifest.get(entry))
+                url = manifest_entry_url(old_entry)
                 dest_fname = disambiguate_target_filename(
                     new_abs, entry, url or f"__migrated__:{src_path}", new_manifest
                 )
                 dest_path = os.path.join(new_abs, dest_fname)
                 try:
                     os.replace(src_path, dest_path)
-                    if url:
-                        new_manifest[dest_fname] = url
+                    if old_entry is not None:
+                        new_manifest[dest_fname] = old_entry
                 except Exception:
                     pass
     except Exception:
@@ -2523,59 +3071,118 @@ def extract_article_title(page_or_html, default: str = "unknown_article") -> str
     return title or default
 
 
+# JS: count links that look like supplementary downloads (M13 settle signal).
+_SUPP_LINK_COUNT_JS = """() => {
+    return document.querySelectorAll(
+        "a[href*='supp'], a[href*='mmc'], a[href*='esm'], " +
+        "a[href$='.xlsx'], a[href$='.xls'], a[href$='.csv'], a[href$='.zip'], " +
+        "[data-test*='supplementary'], [data-test*='source-data']"
+    ).length;
+}"""
+
+# JS: open closed <details> and click collapsed supplementary triggers (M13).
+# Scrolling is driven from Python (segmented scroll) instead of here.
+_ACCORDION_CLICK_JS = """() => {
+    let clicked = 0;
+    // 1. Open only closed <details> elements (and do not click their <summary> afterward)
+    document.querySelectorAll('details:not([open])').forEach(d => {
+        d.open = true;
+        clicked++;
+    });
+
+    // 2. Click collapsed buttons, tabs, or accordion triggers matching supplementary keywords
+    const suppKeywords = [
+        'supp', 'appendi', 'extended', 'additional', 'data',
+        'table', 'material', 'source', 'esm', 'file',
+        '附', '补充', '支撑'
+    ];
+    const selectors = [
+        'button[aria-expanded="false"]',
+        'a[aria-expanded="false"]',
+        '[role="button"][aria-expanded="false"]',
+        '[role="tab"][aria-expanded="false"]',
+        '[data-toggle="collapse"]:not([aria-expanded="true"])',
+        '.accordion-header:not([aria-expanded="true"])',
+        '.accordion-button.collapsed',
+        '.accordion-button[aria-expanded="false"]'
+    ].join(', ');
+    document.querySelectorAll(selectors).forEach(el => {
+        if (el.getAttribute('aria-expanded') === 'true') return;
+        if (el.classList && (el.classList.contains('active') || el.classList.contains('is-open'))) return;
+        if (el.tagName && el.tagName.toLowerCase() === 'summary') {
+            const parentDetails = el.closest('details');
+            if (parentDetails && parentDetails.open) return;
+        }
+        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+        if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(text)) return;
+        const idClass = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
+        if (suppKeywords.some(kw => text.includes(kw) || idClass.includes(kw))) {
+            try { el.click(); clicked++; } catch (e) {}
+        }
+    });
+    return clicked;
+}"""
+
+
+def _js_int(page, expr: str, default: int = 0) -> int:
+    """Evaluate a JS expression returning an int; default when unavailable (M13)."""
+    try:
+        return int(page.evaluate(expr))
+    except Exception:
+        return default
+
+
 def expand_page_accordions_action(page):
-    """Playwright page action for Scrapling: expand details, tabs, and accordion panels without re-closing open ones."""
+    """Playwright page action for Scrapling: expand details, tabs, and accordion panels without re-closing open ones.
+
+    M13: after expanding, scroll to the bottom in viewport-sized segments
+    (pausing at each step so lazy loading can trigger), then wait until the
+    DOM settles -- the supplementary-link count must stay unchanged across
+    two consecutive polls -- with a bounded total wait (~5s) instead of a
+    single fixed 600-1000ms sleep. The caller signature is unchanged.
+    """
     try:
         clicked_count = 0
-        if hasattr(page, "evaluate"):
-            clicked_count = page.evaluate("""() => {
-                let clicked = 0;
-                // 1. Open only closed <details> elements (and do not click their <summary> afterward)
-                document.querySelectorAll('details:not([open])').forEach(d => {
-                    d.open = true;
-                    clicked++;
-                });
-
-                // 2. Click collapsed buttons, tabs, or accordion triggers matching supplementary keywords
-                const suppKeywords = [
-                    'supp', 'appendi', 'extended', 'additional', 'data',
-                    'table', 'material', 'source', 'esm', 'file',
-                    '附', '补充', '支撑'
-                ];
-                const selectors = [
-                    'button[aria-expanded="false"]',
-                    'a[aria-expanded="false"]',
-                    '[role="button"][aria-expanded="false"]',
-                    '[role="tab"][aria-expanded="false"]',
-                    '[data-toggle="collapse"]:not([aria-expanded="true"])',
-                    '.accordion-header:not([aria-expanded="true"])',
-                    '.accordion-button.collapsed',
-                    '.accordion-button[aria-expanded="false"]'
-                ].join(', ');
-                document.querySelectorAll(selectors).forEach(el => {
-                    if (el.getAttribute('aria-expanded') === 'true') return;
-                    if (el.classList && (el.classList.contains('active') || el.classList.contains('is-open'))) return;
-                    if (el.tagName && el.tagName.toLowerCase() === 'summary') {
-                        const parentDetails = el.closest('details');
-                        if (parentDetails && parentDetails.open) return;
-                    }
-                    const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
-                    if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(text)) return;
-                    const idClass = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
-                    if (suppKeywords.some(kw => text.includes(kw) || idClass.includes(kw))) {
-                        try { el.click(); clicked++; } catch (e) {}
-                    }
-                });
-
-                // 3. Scroll down to trigger lazy loading
-                try {
-                    window.scrollTo(0, document.body.scrollHeight / 2);
-                    window.scrollTo(0, document.body.scrollHeight);
-                } catch (e) {}
-                return clicked;
-            }""")
-        if hasattr(page, "wait_for_timeout"):
+        has_evaluate = hasattr(page, "evaluate")
+        has_wait = hasattr(page, "wait_for_timeout")
+        if has_evaluate:
+            clicked_count = _js_int(page, _ACCORDION_CLICK_JS, 0)
+        if not has_wait:
+            return
+        if not has_evaluate:
+            # No JS evaluation available: keep the old fixed wait.
             page.wait_for_timeout(1000 if clicked_count else 600)
+            return
+        # Segmented scroll to the bottom to trigger lazy loading.
+        height = _js_int(page, "() => (document.body ? document.body.scrollHeight : 0)", 0)
+        viewport = _js_int(page, "() => (window.innerHeight || 800)", 800)
+        if height > 0 and viewport > 0:
+            pos = 0
+            while pos < height:
+                pos += viewport
+                try:
+                    page.evaluate(f"() => window.scrollTo(0, {min(pos, height)})")
+                except Exception:
+                    break
+                page.wait_for_timeout(250)
+            try:
+                page.evaluate(f"() => window.scrollTo(0, {height})")
+            except Exception:
+                pass
+        # Debounced settle wait: stop once the supplementary-link count is
+        # stable across two polls; give up after 10 polls (~5s).
+        prev_count = None
+        stable_polls = 0
+        for _ in range(10):
+            count = _js_int(page, _SUPP_LINK_COUNT_JS, -1)
+            if count == prev_count:
+                stable_polls += 1
+                if stable_polls >= 1:
+                    break
+            else:
+                stable_polls = 0
+                prev_count = count
+            page.wait_for_timeout(500)
     except Exception:
         pass
 

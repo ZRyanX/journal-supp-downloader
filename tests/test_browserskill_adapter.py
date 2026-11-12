@@ -464,7 +464,9 @@ class TestFetchPageViaBrowserSkill(unittest.TestCase):
                     "10.1016/j.sample.2026.01",
                     expand_accordions=True,
                 )
-                self.assertEqual(status, 200)
+                # H1: BrowserSkill exposes no navigation HTTP status,
+                # so it returns None instead of a synthetic 200.
+                self.assertIsNone(status)
                 self.assertIn("Sample Article", html)
                 self.assertEqual(final_url, "https://www.sciencedirect.com/science/article/pii/S12345678")
 
@@ -499,7 +501,7 @@ class TestFetchPageViaBrowserSkill(unittest.TestCase):
                     tab_id="tab_88",
                     expand_accordions=False,
                 )
-                self.assertEqual(status, 200)
+                self.assertIsNone(status)
                 self.assertIn("Borrowed Tab Article", html)
                 self.assertEqual(final_url, "https://nature.com/articles/sample")
 

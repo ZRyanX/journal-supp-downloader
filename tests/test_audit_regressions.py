@@ -1,8 +1,9 @@
 """Behavioral regressions for the supplementary completeness audit."""
 import sys
+import os
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 import io
 import json
 import zipfile
@@ -10,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from supp_finder import Candidate, find_all_candidates, validate_downloaded_file
 from repository_resolver import expand_repository_candidates
+from archive_fixture import office_archive
 
 BASE = 'https://journal.example/article'
 
@@ -155,3 +157,764 @@ def test_redirected_retry_uses_new_base(tmp_path, capsys):
     with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--no-bsk', '--no-oa', '--list-only']), patch.object(j, 'load_saved_cookies', return_value=[]), patch.object(j.StealthyFetcher, 'fetch', side_effect=[first, retry]):
         j.main()
     assert 'https://mirror.example/paper/files/S1.xlsx' in capsys.readouterr().out
+
+
+# ── P0 H4: table ids keep hierarchy, 'to' ranges, Appendix / Extended Data ──
+
+def test_h4_hierarchical_table_ids_do_not_collapse():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Table S1.1 and Table S1.2') == {'S1.1', 'S1.2'}
+
+
+def test_h4_to_range_is_expanded():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Tables S1 to S3') == {'S1', 'S2', 'S3'}
+
+
+def test_h4_bare_s_range_is_expanded():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('S1-S3') == {'S1', 'S2', 'S3'}
+
+
+def test_h4_appendix_and_extended_data_prefixes():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Appendix A1-A3') == {'A1', 'A2', 'A3'}
+    assert supplementary_table_ids('Extended Data Table 1') == {'E1'}
+    assert supplementary_table_ids('Extended Data Tables 1-3') == {'E1', 'E2', 'E3'}
+
+
+def test_h4_to_range_missing_member_is_reported():
+    result = find_all_candidates('<section id="supplementary">Tables S1 to S3<a href="/S1.xlsx">Table S1</a><a href="/S2.xlsx">Table S2</a></section>', BASE)
+    assert result.is_incomplete and 'S3' in result.incomplete_reason
+
+
+def test_h4_hierarchical_missing_member_is_reported():
+    result = find_all_candidates('<section id="supplementary">Tables S1.1 and S1.2<a href="/S1-1.xlsx">Table S1.1</a></section>', BASE)
+    assert result.is_incomplete and 'S1.2' in result.incomplete_reason
+
+
+# ── P0 H5: file-count and table-range declarations are separate ──
+
+def test_h5_file_count_ignores_table_mention():
+    from supp_finder import detect_declared_supplement_count, detect_declared_file_count, detect_declared_table_range
+    text = '3 Supplementary Files. Detailed metrics are available in Supplementary Table S10.'
+    assert detect_declared_file_count(text) == 3
+    assert detect_declared_table_range(text) == {'S10'}
+    # Compat entry keeps the file-count reading only; the S10 mention must not inflate it.
+    assert detect_declared_supplement_count(text) == 3
+
+
+def test_h5_single_table_mention_is_not_a_count_of_ten():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_supplement_count('See Supplementary Table S10.') is None
+    assert detect_declared_table_range('See Supplementary Table S10.') == {'S10'}
+
+
+def test_h5_chinese_table_word_without_supplement_qualifier_is_ignored():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_supplement_count('本文包含 4 个表格。') is None
+    assert detect_declared_table_range('本文包含 4 个表格。') == set()
+
+
+def test_h5_bare_table_count_expands_from_one():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_table_range('包含 5 个附表及相关数据。') == {'S1', 'S2', 'S3', 'S4', 'S5'}
+    assert detect_declared_supplement_count('包含 5 个附表及相关数据。') is None
+
+
+def test_h5_table_range_does_not_count_as_files():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_table_range('Tables S1-S3 in Supplementary Information') == {'S1', 'S2', 'S3'}
+    assert detect_declared_supplement_count('Tables S1-S3 in Supplementary Information') is None
+
+
+def test_h5_high_table_number_does_not_fake_incompleteness():
+    # A 'Table S99' that only exists inside a <script> block is not a visible
+    # declaration, and a high table number must never inflate the file count:
+    # 3 declared files with 3 candidates is complete.
+    html = ('<html><head><script>const ref = "Table S99";</script></head><body>'
+            '<section id="supplementary">3 Supplementary Files.'
+            '<a href="/a.xlsx">Table S1</a><a href="/b.xlsx">Table S2</a><a href="/c.xlsx">Table S3</a>'
+            '</section></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert not result.is_incomplete
+
+
+def test_h5_table_range_still_drives_missing_check():
+    html = '<section id="supplementary">Tables S1-S3<a href="/S1.xlsx">Table S1</a><a href="/S2.xlsx">Table S2</a></section>'
+    result = find_all_candidates(html, BASE)
+    assert result.is_incomplete and 'S3' in result.incomplete_reason
+
+
+# ── P0 H6: explicit candidate table ids, dedup merge, structured manifest ──
+
+def test_h6_same_url_two_labels_keeps_both_table_ids():
+    html = ('<section id="supplementary">Tables S1-S2'
+            '<a href="/all.xlsx">Table S1</a><a href="/all.xlsx">Table S2</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].covered_table_ids == {'S1', 'S2'}
+    assert not result.is_incomplete
+
+
+def test_h6_download_marker_query_params_do_not_duplicate():
+    html = ('<section id="supplementary">'
+            '<a href="/all.xlsx?download=1">Table S1</a>'
+            '<a href="/all.xlsx?download=2">Table S1</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+
+
+def test_h6_distinct_query_params_are_not_merged():
+    html = ('<section id="supplementary">'
+            '<a href="/dl?id=1">Table S1</a><a href="/dl?id=2">Table S2</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 2
+
+
+def test_h6_parent_text_label_is_recorded_on_candidate():
+    html = '<section id="supplementary"><ul><li>Table S2 <a href="/dl">Download</a></li></ul></section>'
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert 'S2' in result.candidates[0].covered_table_ids
+
+
+def test_h6_covered_table_ids_prefers_explicit_field():
+    from supp_finder import Candidate, covered_table_ids
+    cand = Candidate(url='https://journal.example/dl', filename='dl.bin', link_text='Download',
+                     covered_table_ids={'S9'})
+    assert covered_table_ids([cand]) == {'S9'}
+
+
+def test_h6_manifest_is_structured_and_atomic(tmp_path):
+    from supp_finder import save_download_manifest, load_download_manifest
+    manifest = {}
+    manifest['S1.xlsx'] = {'url': 'https://journal.example/S1.xlsx', 'source_url': BASE,
+                           'table_ids': ['S1'], 'size': 12, 'sha256': 'ab' * 32, 'status': 'downloaded'}
+    save_download_manifest(str(tmp_path), manifest)
+    assert not [p for p in tmp_path.iterdir() if p.suffix == '.tmp']
+    loaded = load_download_manifest(str(tmp_path))
+    entry = loaded['S1.xlsx']
+    assert entry['url'] == 'https://journal.example/S1.xlsx'
+    assert entry['source_url'] == BASE
+    assert entry['table_ids'] == ['S1']
+    assert entry['size'] == 12 and entry['sha256'] == 'ab' * 32 and entry['status'] == 'downloaded'
+
+
+def test_h6_corrupt_manifest_warns_instead_of_silently_empty(tmp_path, capsys):
+    from supp_finder import load_download_manifest
+    (tmp_path / '.download_manifest.json').write_text('{not json')
+    assert load_download_manifest(str(tmp_path)) == {}
+    captured = capsys.readouterr()
+    assert 'manifest' in (captured.err + captured.out).lower()
+
+
+def test_h6_old_string_manifest_still_loads(tmp_path):
+    from supp_finder import save_download_manifest, load_download_manifest, manifest_entry_url
+    save_download_manifest(str(tmp_path), {'S1.xlsx': 'https://journal.example/S1.xlsx'})
+    loaded = load_download_manifest(str(tmp_path))
+    assert manifest_entry_url(loaded['S1.xlsx']) == 'https://journal.example/S1.xlsx'
+
+
+# ── P0 H3: dynamic 'not loaded' signal + M13 settle/scroll ──
+
+def test_h3_supp_heading_without_candidates_needs_browser():
+    html = '<section id="supplementary"><h2>Supplementary Material</h2><p>Loading...</p></section>'
+    result = find_all_candidates(html, BASE)
+    assert result.candidates == []
+    assert result.needs_browser is True
+
+
+def test_h3_next_data_without_parsed_url_needs_browser():
+    html = ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            '{"props": {"pageProps": {"article": {"title": "Test"}}}}</script></head><body></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert result.needs_browser is True
+
+
+def test_h3_next_data_with_parsed_url_does_not_need_browser():
+    html = ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            '{"supplementaryMaterials": [{"fileName": "Supplementary_Table_S1.xlsx", "downloadUrl": "/api/dl/1"}]}'
+            '</script></head><body></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert result.needs_browser is False
+
+
+def test_h3_plain_page_with_candidates_does_not_need_browser():
+    result = find_all_candidates('<section id="supplementary"><a href="/S1.xlsx">Table S1</a></section>', BASE)
+    assert result.needs_browser is False
+
+
+def test_h3_plain_page_without_signals_does_not_need_browser():
+    result = find_all_candidates('<html><body><p>Results text.</p></body></html>', BASE)
+    assert result.needs_browser is False
+
+
+def test_h3_accordion_action_scrolls_in_segments_and_waits_for_settle():
+    import re
+    from supp_finder import expand_page_accordions_action
+
+    class FakePage:
+        def __init__(self):
+            self.scrolls = []
+            self.waits = []
+            self._count_calls = 0
+
+        def evaluate(self, js):
+            if 'scrollTo' in js:
+                m = re.search(r'scrollTo\(0, (\d+)\)', js)
+                self.scrolls.append(int(m.group(1)) if m else 0)
+                return None
+            if 'scrollHeight' in js:
+                return 2500
+            if 'innerHeight' in js:
+                return 1000
+            if 'querySelectorAll' in js:
+                self._count_calls += 1
+                return 3 if self._count_calls > 2 else self._count_calls
+            return 1  # clicked count
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = FakePage()
+    expand_page_accordions_action(page)
+    # Segmented scroll to the bottom in viewport steps, then a final scroll to the bottom.
+    assert page.scrolls == [1000, 2000, 2500, 2500]
+    # Settle polling ran (counts 1, 2, 3, then stable 3) instead of one fixed sleep.
+    assert len(page.waits) >= 4
+
+
+# ── H1: real fetch status + is_blocked_page ──────────────────────────────────
+
+def test_h1_is_blocked_page_detects_challenge_and_login():
+    from supp_finder import is_blocked_page, page_fetch_is_failure
+
+    assert is_blocked_page(
+        "<html><head><title>Just a moment...</title></head>"
+        "<body>Checking your browser before accessing the site</body></html>"
+    )
+    assert is_blocked_page(
+        "<html><body><div>Please verify you are human to continue</div></body></html>"
+    )
+    assert is_blocked_page(
+        "<html><head><title>Sign in</title></head>"
+        "<body><form>Sign in to access this article</form></body></html>"
+    )
+    assert is_blocked_page(
+        "<html><body><div>Access denied: your institution does not subscribe</div></body></html>"
+    )
+    # A normal article page that merely links to a sign-in page is NOT blocked.
+    assert not is_blocked_page(
+        '<html><body><a href="/login">Sign in</a><h1>Article title</h1>'
+        '<a href="/s1.xlsx">Supplementary Table S1</a></body></html>'
+    )
+    assert not is_blocked_page(
+        "<html><body><h1>Article</h1><p>Supplementary data are available.</p></body></html>"
+    )
+    # Caller rule: unknown status (None) + blocked features = failure;
+    # unknown status alone is not a failure (BrowserSkill exposes no status).
+    assert page_fetch_is_failure("<html><title>Just a moment</title></html>", None) is True
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", None) is False
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", 200) is False
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", 403) is True
+    # A blocked page is a failure even when the transport reported 200.
+    assert page_fetch_is_failure("<html><title>Access denied</title></html>", 200) is True
+
+
+def test_h1_cdp_returns_real_navigation_status():
+    import playwright_utils as pu
+    from types import SimpleNamespace as NS
+
+    mock_page = MagicMock()
+    mock_page.url = "https://example.com/article"
+    mock_page.content.return_value = "<html><body>Forbidden page</body></html>"
+    mock_context = MagicMock()
+    mock_context.pages = []
+    mock_context.new_page.return_value = mock_page
+    mock_context.cookies.return_value = []
+    mock_browser = MagicMock()
+    mock_browser.contexts = [mock_context]
+    # A real navigation that answered 403 must not come back as a fake 200.
+    mock_page.goto.return_value = NS(status=403)
+    with patch("playwright.sync_api.sync_playwright") as mock_pw:
+        mock_inst = MagicMock()
+        mock_pw.return_value.__enter__.return_value = mock_inst
+        mock_inst.chromium.connect_over_cdp.return_value = mock_browser
+        _, status, _, _ = pu.fetch_page_via_cdp("http://127.0.0.1:9222", "https://example.com/article")
+        assert status == 403
+    # Reusing an already-open tab performs no fresh navigation, so the
+    # status is unknown (None) rather than a synthetic 200.
+    mock_page.goto.reset_mock()
+    mock_context.pages = [mock_page]
+    with patch("playwright.sync_api.sync_playwright") as mock_pw:
+        mock_inst = MagicMock()
+        mock_pw.return_value.__enter__.return_value = mock_inst
+        mock_inst.chromium.connect_over_cdp.return_value = mock_browser
+        _, status, _, _ = pu.fetch_page_via_cdp("http://127.0.0.1:9222", "https://example.com/article")
+        assert status is None
+
+
+def test_h1_bsk_blocked_body_is_rejected_and_status_is_none():
+    import browserskill_adapter as bsk
+
+    session = MagicMock()
+    session.session_id = "sess-h1"
+    session.bsk_bin = "/bin/bsk"
+    session.tab_id = None
+    session.current_url = None
+    session.borrowed_tabs = set()
+    # Normal title, but the body is a Turnstile challenge: must raise, not
+    # return a synthetic 200.
+    with patch.object(session, "navigate"), patch.object(
+        session, "evaluate",
+        return_value={"html": "<html><head><title>Article</title></head>"
+                              "<body>Please verify you are human. Turnstile challenge.</body></html>",
+                      "url": "https://example.org/article"},
+    ):
+        with pytest.raises(bsk.BrowserSkillExecutionError, match="verification"):
+            bsk.fetch_page_via_browserskill("https://example.org/article", session=session, expand_accordions=False)
+    # A normal page fetch has no HTTP status to report: None, not fake 200.
+    with patch.object(session, "navigate"), patch.object(
+        session, "evaluate",
+        return_value={"html": "<html><body><h1>Article</h1></body></html>",
+                      "url": "https://example.org/article"},
+    ):
+        html, status, final = bsk.fetch_page_via_browserskill(
+            "https://example.org/article", session=session, expand_accordions=False)
+        assert status is None
+        assert "Article" in html
+
+
+def test_h1_fetch_page_html_accepts_unknown_status_and_falls_back_on_blocked():
+    import scansci_supp_downloader as a
+
+    good_html = "<html><body><h1>Article</h1></body></html>"
+    blocked_html = "<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
+    # BrowserSkill returned a usable DOM but no HTTP status: accept it
+    # (previously `status < 400` raised TypeError on None and discarded it).
+    with patch.object(a, "fetch_page_via_browserskill", return_value=(good_html, None, "https://example.org/article")):
+        html, status, final = a.fetch_page_html("https://example.org/article", use_bsk=True)
+        assert html == good_html
+        assert status is None
+    # BrowserSkill returned a blocked page with unknown status: fall through
+    # to the requests path instead of treating it as a successful fetch.
+    session = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.url = "https://example.org/article"
+    resp.text = good_html
+    session.get.return_value = resp
+    with patch.object(a, "fetch_page_via_browserskill", return_value=(blocked_html, None, "https://example.org/article")), \
+         patch.object(a, "HAS_SCANSCI", False):
+        html, status, final = a.fetch_page_html("https://example.org/article", session=session, use_bsk=True)
+        assert html == good_html
+        assert status == 200
+
+
+# ── H2: Tier 0 failure classification ────────────────────────────────────────
+
+def _h2_office_get():
+    def fake_get(url, timeout=30, stream=True):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-disposition": ""}
+        resp.iter_content = MagicMock(return_value=[office_archive()])
+        return resp
+    return fake_get
+
+
+def test_h2_transient_head_errors_do_not_count_as_misses(tmp_path):
+    """429 / timeout HEAD probes must not count toward consecutive misses:
+    mmc1-mmc4 rate-limited, mmc5 exists -> mmc5 must still be found."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc5.xlsx" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "2048"}
+        elif "mmc1." in url or "mmc2." in url or "mmc3." in url or "mmc4." in url:
+            resp.status_code = 429
+            resp.headers = {"retry-after": "0"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep") as sleep:
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=10, max_consecutive_misses=4)
+        basenames = [os.path.basename(f) for f in files]
+        assert "mmc5.xlsx" in basenames
+        assert sleep.called  # transient probes were retried with backoff
+
+
+def test_h2_timeout_head_probes_do_not_stop_the_scan(tmp_path):
+    """HEAD timeouts must not count as misses either."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+    import requests as _requests
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        if "mmc5.xlsx" in url:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {"content-length": "2048"}
+            return resp
+        if any(f"mmc{n}." in url for n in (1, 2, 3, 4)):
+            raise _requests.exceptions.Timeout("timed out")
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=10, max_consecutive_misses=4)
+        assert "mmc5.xlsx" in [os.path.basename(f) for f in files]
+
+
+def test_h2_retry_after_header_is_respected(tmp_path):
+    """A 429 with Retry-After must be retried after that delay, then succeed."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    calls = {"n": 0}
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.xlsx" in url:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                resp.status_code = 429
+                resp.headers = {"retry-after": "2"}
+                return resp
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+            return resp
+        resp.status_code = 404
+        resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep") as sleep:
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=3, max_consecutive_misses=2)
+        assert "mmc1.xlsx" in [os.path.basename(f) for f in files]
+        assert calls["n"] == 3
+        assert any(call.args and call.args[0] == 2 for call in sleep.call_args_list)
+
+
+def test_h2_extensions_come_from_data_extensions(tmp_path):
+    """Tier 0 must probe DATA_EXTENSIONS formats the old 15-item list
+    missed (.parquet/.ipynb) and composite extensions (.tar.gz)."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+    from supp_finder import DATA_EXTENSIONS
+
+    assert ".parquet" in DATA_EXTENSIONS and ".ipynb" in DATA_EXTENSIONS and ".tar.gz" in DATA_EXTENSIONS
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.parquet" in url or "mmc1.ipynb" in url or "mmc1.tar.gz" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=3, max_consecutive_misses=2)
+        basenames = [os.path.basename(f) for f in files]
+        assert "mmc1.parquet" in basenames
+        assert "mmc1.ipynb" in basenames
+        assert "mmc1.tar.gz" in basenames
+
+
+# ── H9: atomic download landing ──────────────────────────────────────────────
+
+def _h9_no_leftovers(path):
+    return [p.name for p in Path(path).iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")] == [] and \
+        not [p.name for p in Path(path).iterdir() if p.name.startswith(".") and ".tmp" in p.name]
+
+
+def test_h9_temp_path_helpers_preserve_extension_and_commit(tmp_path):
+    from supp_finder import temp_path_for, commit_temp_file, discard_temp_file
+
+    final = str(tmp_path / "mmc1.xlsx")
+    tmp = temp_path_for(final)
+    assert tmp != final
+    assert os.path.dirname(tmp) == str(tmp_path)
+    assert tmp.endswith(".xlsx")
+    assert os.path.basename(tmp).startswith(".")
+    Path(tmp).write_bytes(b"data")
+    commit_temp_file(tmp, final)
+    assert Path(final).read_bytes() == b"data"
+    assert not os.path.exists(tmp)
+    tmp2 = temp_path_for(final)
+    Path(tmp2).write_bytes(b"partial")
+    discard_temp_file(tmp2)
+    assert not os.path.exists(tmp2)
+    assert Path(final).read_bytes() == b"data"
+
+
+def test_h9_scansci_requests_stream_never_creates_partial_final(tmp_path):
+    """While the requests stream is still flowing, the final file must not
+    exist yet; it appears only after validation + os.replace."""
+    import scansci_supp_downloader as a
+    from supp_finder import Candidate
+
+    final = tmp_path / "s1.xlsx"
+    chunks = [office_archive()]
+
+    def gen():
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+        yield chunks[0]
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {}
+    resp.iter_content = MagicMock(return_value=gen())
+    session = MagicMock()
+    session.get.return_value = resp
+    cand = Candidate(url="https://example.com/s1.xlsx", filename="s1.xlsx")
+    with patch.object(a, "validate_downloaded_file", return_value=(True, "valid")):
+        result = a.download_file(cand, str(tmp_path), session=session)
+    assert result is not None and os.path.basename(result) == "s1.xlsx"
+    assert final.read_bytes() == chunks[0]
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_tier0_cdn_stream_never_creates_partial_final(tmp_path):
+    """Same atomic guarantee for the Tier 0 CDN download path."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    final = tmp_path / "mmc1.xlsx"
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.xlsx" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    def gen():
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+        yield office_archive()
+
+    def fake_get(url, timeout=30, stream=True):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-disposition": ""}
+        resp.iter_content = MagicMock(return_value=gen())
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=fake_get), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=1, max_consecutive_misses=1)
+    assert [os.path.basename(f) for f in files] == ["mmc1.xlsx"]
+    assert final.read_bytes() == office_archive()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_scansci_curl_writes_to_temp_first(tmp_path):
+    """curl must be pointed at a temp file (not the final path) and a
+    failed validation must leave neither the final file nor a temp file."""
+    import scansci_supp_downloader as a
+
+    seen = {}
+
+    def fake_run(cmd, timeout=None):
+        out = cmd[cmd.index("-o") + 1]
+        seen["out"] = out
+        Path(out).write_bytes(b"<html>not a spreadsheet</html>")
+        return NS(returncode=0)
+
+    with patch.object(a, "Fetcher") as fetcher, \
+         patch("scansci_supp_downloader.subprocess.run", side_effect=fake_run), \
+         patch.object(a, "validate_downloaded_file", return_value=(False, "invalid")):
+        fetcher.get.side_effect = Exception("no scrapling")
+        # StealthySession import inside download_file must also fail fast.
+        with patch("scrapling.fetchers.StealthySession", side_effect=Exception("no browser")):
+            result = a.download_file("https://example.com/s1.xlsx", str(tmp_path), session=None)
+    assert result is None
+    assert seen["out"] != str(tmp_path / "s1.xlsx")
+    assert os.path.dirname(seen["out"]) == str(tmp_path)
+    assert not (tmp_path / "s1.xlsx").exists()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_journal_fetcher_writes_in_chunks_and_cleans_up(tmp_path):
+    """journal_downloader must not write resp.body in one shot, and a
+    failed validation must leave neither the final file nor a temp file."""
+    import journal_downloader as j
+
+    body = b"x" * 200_000
+    resp = NS(status=200, body=body, headers={})
+    real_open = open
+    writes = []
+
+    class SpyFile:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, data):
+            writes.append(len(data))
+            return self._f.write(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._f.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+    def spy_open(*args, **kwargs):
+        f = real_open(*args, **kwargs)
+        mode = kwargs.get("mode", args[1] if len(args) > 1 else "")
+        return SpyFile(f) if "w" in str(mode) and "b" in str(mode) else f
+
+    with patch.object(j.Fetcher, "get", return_value=resp), \
+         patch.object(j, "validate_downloaded_file", return_value=(True, "valid")), \
+         patch("supp_finder.open", side_effect=spy_open):
+        result = j.download_file("https://example.com/s1.xlsx", str(tmp_path))
+    assert result is not None
+    assert Path(result).read_bytes() == body
+    assert len(writes) > 1 and max(writes) <= 65536
+    assert _h9_no_leftovers(tmp_path)
+
+    # Failed validation: no final file, no temp leftovers.
+    writes.clear()
+    with patch.object(j.Fetcher, "get", return_value=resp), \
+         patch.object(j, "validate_downloaded_file", return_value=(False, "invalid")):
+        assert j.download_file("https://example.com/s2.xlsx", str(tmp_path)) is None
+    assert not (tmp_path / "s2.xlsx").exists()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_bsk_download_leaves_no_staging_dir(tmp_path):
+    """BrowserSkill download already stages in a temp dir + os.replace;
+    verify no staging directory is left behind."""
+    import browserskill_adapter as bsk
+    from browserskill_adapter import BrowserSkillSession, BrowserSkillExecutionError
+
+    output = tmp_path / "table.csv"
+
+    def native(command, **kwargs):
+        Path(command[command.index("--out") + 1]).write_bytes(b"x,y\n1,2\n")
+        return NS(returncode=0, stdout="Downloaded", stderr="")
+
+    with patch("browserskill_adapter.atexit.register"), patch("browserskill_adapter.atexit.unregister"):
+        sess = BrowserSkillSession(bsk_bin="/bin/bsk")
+        sess.session_id = "h9-sess"
+        with patch.object(sess, "download_url_in_session", side_effect=BrowserSkillExecutionError("CORS")), \
+             patch.object(sess, "evaluate", return_value=True), \
+             patch.object(bsk.subprocess, "run", side_effect=native):
+            assert sess.download("https://cdn.org/table.csv", str(output)) == str(output)
+    assert output.read_bytes() == b"x,y\n1,2\n"
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".bsk-")]
+
+
+# ── H3 wiring: needs_browser forces a browser render ─────────────────────────
+
+# Singular "Additional file (7)": the legacy evidence file-count reading
+# (declared_file_count) sees 7 files, while the H5 file-count reading
+# (detect_declared_file_count) sees none -- so supp_finder's own
+# is_incomplete is False but the evidence check still reports missing
+# files. That is the exact gap the H3 wiring closes.
+_H3_FIRST_HTML = (
+    '<script type="application/json" id="__NEXT_DATA__">{"props":{"pageProps":{}}}</script>'
+    '<p>Additional file (7)</p>'
+    '<a href="/s1.xlsx">Supplementary Table S1</a>'
+)
+_H3_FULL_HTML = (
+    '<p>Additional file (7)</p>'
+    + ''.join(f'<a href="/s{i}.xlsx">Supplementary Table S{i}</a>' for i in range(1, 8))
+)
+
+
+def test_h3_wiring_journal_bsk_retry_fires_on_needs_browser(tmp_path, capsys):
+    """needs_browser + evidence still incomplete must force the BrowserSkill
+    retry even though supp_finder's own is_incomplete is False (1 of 5
+    declared files found). Before the wiring, the BSK retry condition only
+    looked at (not candidates or diag.is_incomplete) and never fired here."""
+    import journal_downloader as j
+
+    first = NS(url=BASE, status=200, text=_H3_FIRST_HTML, html_content=_H3_FIRST_HTML)
+    empty = NS(url=BASE, status=200, text='', html_content='')
+    diag0 = find_all_candidates(_H3_FIRST_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert diag0.is_incomplete is False  # the gap: static check looks fine
+    with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--bsk-auto', '--no-oa', '--list-only']), \
+         patch.object(j, 'load_saved_cookies', return_value=[]), \
+         patch.object(j.StealthyFetcher, 'fetch', side_effect=[first, empty]) as stealth, \
+         patch.object(j, 'fetch_page_via_browserskill', return_value=(_H3_FULL_HTML, None, BASE)) as bsk_fetch:
+        j.main()
+    out = capsys.readouterr().out
+    bsk_fetch.assert_called_once()
+    stealth.assert_called_once()  # no Stealthy retry needed after BSK succeeds
+    assert 's7.xlsx' in out
+
+
+def test_h3_wiring_journal_no_force_when_supplements_complete(tmp_path, capsys):
+    """needs_browser alone must NOT force a browser render when the
+    supplements are already complete (5 of 5 files found)."""
+    import journal_downloader as j
+
+    full = NS(url=BASE, status=200, text=_H3_FULL_HTML, html_content=_H3_FULL_HTML)
+    diag0 = find_all_candidates(
+        '<script type="application/json" id="__NEXT_DATA__">{"props":{}}</script>' + _H3_FULL_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert len(diag0.candidates) == 7
+    with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--bsk-auto', '--no-oa', '--list-only']), \
+         patch.object(j, 'load_saved_cookies', return_value=[]), \
+         patch.object(j.StealthyFetcher, 'fetch', return_value=full) as stealth, \
+         patch.object(j, 'fetch_page_via_browserskill', return_value=(_H3_FULL_HTML, None, BASE)) as bsk_fetch:
+        j.main()
+    out = capsys.readouterr().out
+    bsk_fetch.assert_not_called()
+    stealth.assert_called_once()
+    assert 's7.xlsx' in out
+
+
+def test_h3_wiring_scansci_page_scrape_forces_browser_render(tmp_path):
+    """_try_page_scrape_supplements must re-render in a browser when the
+    static page needs one and the evidence check still reports missing
+    files, even though supp_finder's own is_incomplete is False."""
+    import scansci_supp_downloader as a
+
+    diag0 = find_all_candidates(_H3_FIRST_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert diag0.is_incomplete is False
+    args = NS(headful=False, browserskill=False, skip_cdn=True, max_mmc=25, max_misses=4)
+    fetch_calls = []
+
+    def fake_fetch(url, session=None, play_cookies=None, headful=False, force_browser=False, **kwargs):
+        fetch_calls.append(force_browser)
+        if force_browser:
+            return _H3_FULL_HTML, 200, BASE
+        return _H3_FIRST_HTML, 200, BASE
+
+    downloaded = []
+    with patch.object(a, '_setup_authenticated_session_and_cookies', return_value=(MagicMock(), [])), \
+         patch.object(a, 'fetch_page_html', side_effect=fake_fetch), \
+         patch.object(a, 'download_file', side_effect=lambda cand, *args_, **kw: downloaded.append(cand.url)):
+        a._try_page_scrape_supplements(BASE, str(tmp_path), {}, args, [])
+    assert fetch_calls == [False, True]
+    assert len(downloaded) == 7

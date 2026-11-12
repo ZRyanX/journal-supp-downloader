@@ -75,6 +75,8 @@ from supp_finder import (
     should_match_candidate,
     load_download_manifest,
     save_download_manifest,
+    manifest_entry_url,
+    record_manifest_entry,
     disambiguate_target_filename,
     extract_article_title,
     expand_page_accordions_action,
@@ -82,6 +84,12 @@ from supp_finder import (
     ensure_inferred_extension_on_disk,
     is_placeholder_or_blocked_title,
     migrate_or_merge_article_dir,
+    is_blocked_page,
+    page_fetch_is_failure,
+    temp_path_for,
+    commit_temp_file,
+    discard_temp_file,
+    write_bytes_chunked,
 )
 
 try:
@@ -719,7 +727,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
         filepath = os.path.join(output_dir, fname)
 
-        if os.path.exists(filepath) and manifest.get(fname) == url:
+        if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
             is_val, _ = validate_downloaded_file(filepath)
             if is_val:
                 print(f"  [SKIP] {fname} (already exists)")
@@ -727,6 +735,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                 continue
 
         print(f"  [API→CDN] {fname} ...", end=" ", flush=True)
+        tmp_path = None
         try:
             dl_resp = dl_session.get(url, timeout=60, stream=True)
             if dl_resp.status_code == 200:
@@ -736,40 +745,44 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             found_files.append(filepath)
                             continue
 
+                # H9: stream to a same-directory temp file, validate it,
+                # then commit with os.replace; the final path never holds
+                # a partial file.
                 os.makedirs(output_dir, exist_ok=True)
-                with open(filepath, "wb") as f:
+                tmp_path = temp_path_for(filepath)
+                with open(tmp_path, "wb") as f:
                     for chunk in dl_resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
 
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     response_status=dl_resp.status_code,
                     headers=dl_resp.headers
                 )
                 if is_val:
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
                     actual_size = os.path.getsize(filepath)
                     print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                    manifest[fname] = url
+                    record_manifest_entry(manifest, fname, url)
                     save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
                     print(f"FAIL ({reason})")
             else:
                 print(f"FAIL (HTTP {dl_resp.status_code})")
         except Exception as e:
-            if os.path.exists(filepath):
-                os.remove(filepath)
             print(f"FAIL ({e})")
+        finally:
+            discard_temp_file(tmp_path)
 
     total_time = time.time() - t0
     if found_files:
@@ -787,6 +800,7 @@ def try_elsevier_cdn_brute_force(
     max_mmc=25,
     max_consecutive_misses=4,
     known_mmcs=None,
+    max_head_retries=2,
 ):
     """
     Elsevier hosts supplement files on a public CDN at:
@@ -795,12 +809,28 @@ def try_elsevier_cdn_brute_force(
     discard small files under 1 KB.
     Probes sequential MMC numbers, handles gaps without redundant requests,
     and directly targets known MMC numbers beyond default limits.
+
+    H2 failure classification: only a definitive miss (404, or another
+    non-transient 4xx for every probed extension) counts toward
+    consecutive misses. 429 / 403 / 5xx / timeouts / connection errors are
+    transient: they are retried with exponential backoff (up to
+    max_head_retries retries, respecting any Retry-After header) and, if
+    still unresolved, leave the MMC as "unknown" -- neither a hit nor a
+    miss -- so a rate-limited CDN can no longer stop the scan early.
     """
     if not pii:
         return []
 
     base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
-    exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt", "7z", "rar", "gz", "tsv", "cif", "h5"]
+    # H2: extensions come from supp_finder.DATA_EXTENSIONS (the same source
+    # Tier A uses), plus .pdf which Tier 0 historically probed. Composite
+    # extensions such as .tar.gz are kept whole ("tar.gz") so the probe URL
+    # becomes ...-mmcN.tar.gz, not ...-mmcN.tar. Deterministic order:
+    # common supplement formats first, then the rest alphabetically.
+    _tier0_priority = ("xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt")
+    _all_exts = {e.lstrip(".") for e in DATA_EXTENSIONS} | {"pdf"}
+    exts = [e for e in _tier0_priority if e in _all_exts]
+    exts += sorted(_all_exts - set(exts))
     found_files = []
     probed_mmcs = set()
     manifest = load_download_manifest(output_dir)
@@ -812,31 +842,69 @@ def try_elsevier_cdn_brute_force(
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
-    def _probe_single_mmc(i: int) -> bool:
+    def _retry_delay(headers, attempt):
+        """Backoff before retry number *attempt* (1-based). A Retry-After
+        header (seconds) wins over the exponential default; capped at 30s."""
+        raw = None
+        try:
+            raw = {k.lower(): v for k, v in (headers or {}).items()}.get("retry-after")
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                delay = float(raw)
+                if delay >= 0:
+                    return min(delay, 30.0)
+            except (TypeError, ValueError):
+                pass
+        return min(0.5 * (2 ** (attempt - 1)), 8.0)
+
+    def _check_ext(ext, mmc_num):
+        """HEAD-probe one extension of one MMC number. Returns
+        (ext, url, size, outcome) where outcome is "hit" (200), "miss"
+        (404 / other non-transient 4xx) or "transient" (429 / 403 / 5xx /
+        timeout / connection error still unresolved after
+        max_head_retries retries)."""
+        url = f"{base}-mmc{mmc_num}.{ext}"
+        headers = {}
+        for attempt in range(max_head_retries + 1):
+            try:
+                resp = session.head(url, timeout=10, allow_redirects=True)
+            except Exception:
+                outcome = "transient"
+            else:
+                headers = resp.headers or {}
+                code = resp.status_code
+                if code == 200:
+                    size = int(resp.headers.get("content-length", 0))
+                    return ext, url, size, "hit"
+                if code == 404:
+                    return ext, url, None, "miss"
+                if code in (403, 429) or code >= 500:
+                    outcome = "transient"
+                else:
+                    return ext, url, None, "miss"
+            if attempt < max_head_retries:
+                time.sleep(_retry_delay(headers, attempt + 1))
+        return ext, url, None, "transient"
+
+    def _probe_single_mmc(i: int) -> str:
+        """Probe one MMC number. Returns "hit", "miss" or "unknown".
+        "unknown" means at least one extension stayed transient with no
+        hit: the file may exist, so the caller must not count it as a miss.
+        """
         probed_mmcs.add(i)
         found_any = False
 
-        def _check_ext(ext):
-            url = f"{base}-mmc{i}.{ext}"
-            try:
-                resp = session.head(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200:
-                    size = int(resp.headers.get("content-length", 0))
-                    return ext, url, size
-            except requests.exceptions.Timeout:
-                pass
-            except Exception:
-                pass
-            return ext, url, None
-
         # Probe all candidate extensions concurrently
         with ThreadPoolExecutor(max_workers=min(len(exts), 8)) as executor:
-            future_to_ext = {executor.submit(_check_ext, ext): ext for ext in exts}
-            hits = []
+            future_to_ext = {executor.submit(_check_ext, ext, i): ext for ext in exts}
+            results = []
             for future in as_completed(future_to_ext):
-                ext, url, size = future.result()
-                if size is not None:
-                    hits.append((ext, url, size))
+                results.append(future.result())
+
+        hits = [(ext, url, size) for ext, url, size, outcome in results if outcome == "hit"]
+        saw_transient = any(outcome == "transient" for *_, outcome in results)
 
         # Sort hits by order of exts list for deterministic behavior
         hits.sort(key=lambda x: exts.index(x[0]))
@@ -846,7 +914,7 @@ def try_elsevier_cdn_brute_force(
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
 
-            if os.path.exists(filepath) and manifest.get(fname) == url:
+            if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                 is_val, _ = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"  [SKIP] {fname} (already exists)")
@@ -854,8 +922,9 @@ def try_elsevier_cdn_brute_force(
                     found_any = True
                     continue
 
-            # Download the file
+            # Download the file (H9: temp file -> validate -> os.replace)
             print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
+            tmp_path = None
             try:
                 dl_resp = session.get(url, timeout=30, stream=True)
                 if dl_resp.status_code == 200:
@@ -865,7 +934,7 @@ def try_elsevier_cdn_brute_force(
                         target_fname = sanitize_filename(cd_name)
                         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                         filepath = os.path.join(output_dir, fname)
-                        if os.path.exists(filepath) and manifest.get(fname) == url:
+                        if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                             is_val, _ = validate_downloaded_file(filepath)
                             if is_val:
                                 print(f"[SKIP] {fname} (already exists)")
@@ -874,46 +943,55 @@ def try_elsevier_cdn_brute_force(
                                 continue
 
                     os.makedirs(output_dir, exist_ok=True)
-                    with open(filepath, "wb") as f:
+                    tmp_path = temp_path_for(filepath)
+                    with open(tmp_path, "wb") as f:
                         for chunk in dl_resp.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
 
                     is_val, reason = validate_downloaded_file(
-                        filepath,
+                        tmp_path,
                         response_status=dl_resp.status_code,
                         headers=dl_resp.headers
                     )
                     if is_val:
+                        commit_temp_file(tmp_path, filepath)
+                        tmp_path = None
                         actual_size = os.path.getsize(filepath)
                         print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                        manifest[fname] = url
+                        record_manifest_entry(manifest, fname, url)
                         save_download_manifest(output_dir, manifest)
                         found_files.append(filepath)
                         found_any = True
                     else:
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
                         print(f"FAIL ({reason})")
                 else:
                     print(f"FAIL (HTTP {dl_resp.status_code})")
             except Exception as e:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
                 print(f"FAIL ({e})")
-        return found_any
+            finally:
+                discard_temp_file(tmp_path)
+        # A HEAD hit means the file exists even if the follow-up GET
+        # download itself failed, so it still counts as a hit (not a miss).
+        if found_any or hits:
+            return "hit"
+        if saw_transient:
+            return "unknown"
+        return "miss"
 
-    # Phase 1: Sequential scan from 1 up to max_mmc
+    # Phase 1: Sequential scan from 1 up to max_mmc. Only consecutive
+    # "miss" outcomes stop the scan; "unknown" (transient) outcomes leave
+    # the counter untouched, and a "hit" resets it.
     consecutive_misses = 0
     scanned_count = 0
     stop_reason = ""
 
     for i in range(1, max_mmc + 1):
         scanned_count = i
-        hit = _probe_single_mmc(i)
-        if hit:
+        outcome = _probe_single_mmc(i)
+        if outcome == "hit":
             consecutive_misses = 0
-        else:
+        elif outcome == "miss":
             consecutive_misses += 1
             if consecutive_misses >= max_consecutive_misses:
                 stop_reason = f"{max_consecutive_misses} consecutive misses after mmc{i}"
@@ -928,18 +1006,27 @@ def try_elsevier_cdn_brute_force(
         if k in probed_mmcs:
             continue
         print(f"  [Tier 0] Probing known MMC mmc{k} ...")
-        hit = _probe_single_mmc(k)
-        if hit:
+        outcome = _probe_single_mmc(k)
+        if outcome == "hit":
             follow_misses = 0
+            follow_unknowns = 0
             cur = k + 1
             while follow_misses < max_consecutive_misses and cur <= 999:
                 if cur in probed_mmcs:
                     break
-                follow_hit = _probe_single_mmc(cur)
-                if follow_hit:
+                follow_outcome = _probe_single_mmc(cur)
+                if follow_outcome == "hit":
                     follow_misses = 0
-                else:
+                    follow_unknowns = 0
+                elif follow_outcome == "miss":
                     follow_misses += 1
+                else:
+                    # Unknown: do not count as a miss, but stop following
+                    # after that many in a row so a persistently
+                    # rate-limited CDN cannot drag the scan out to mmc999.
+                    follow_unknowns += 1
+                    if follow_unknowns >= max_consecutive_misses:
+                        break
                 cur += 1
 
     total_probed = len(probed_mmcs)
@@ -977,13 +1064,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             path = os.path.join(output_dir, name)
             result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
             if result:
-                manifest[name] = url
+                record_manifest_entry(manifest, name, url, source_url=referer or "", table_ids=sorted(cand_or_url.covered_table_ids))
                 save_download_manifest(output_dir, manifest)
                 return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
             return None
     else:
         url = cand_or_url
         suggested_fname = ""
+
+    # Table ids the candidate is known to cover (H6), for the manifest record.
+    cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
 
     os.makedirs(output_dir, exist_ok=True)
     manifest = load_download_manifest(output_dir)
@@ -992,7 +1082,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     fname = disambiguate_target_filename(output_dir, fname, url, manifest)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath) and manifest.get(fname) == url:
+    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
@@ -1001,7 +1091,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
 
     # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
+    # H9: stream to a same-directory temp file, validate it, then commit
+    # with os.replace; the final path never holds a partial file, and a
+    # failure only ever discards the temp file.
     if session:
+        tmp_path = None
         try:
             resp = session.get(url, timeout=30, stream=True, verify=False, headers={"Referer": referer} if referer else {})
             if resp.status_code < 400:
@@ -1012,14 +1106,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
 
                 first_chunk = b""
-                with open(filepath, "wb") as f:
+                tmp_path = temp_path_for(filepath)
+                with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             if not first_chunk:
@@ -1031,12 +1126,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if inferred:
                         base = fname[:-4] if fname.endswith(".bin") else fname
                         fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
-                        new_path = os.path.join(output_dir, fname)
-                        os.replace(filepath, new_path)
-                        filepath = new_path
+                        filepath = os.path.join(output_dir, fname)
+                        # Re-home the staged file under the inferred
+                        # extension so validation sees the real extension.
+                        new_tmp = temp_path_for(filepath)
+                        os.replace(tmp_path, new_tmp)
+                        tmp_path = new_tmp
 
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     response_status=resp.status_code,
                     headers=resp.headers
                 )
@@ -1044,25 +1142,25 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                         base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
-                        new_path = os.path.join(output_dir, html_name)
-                        if filepath != new_path:
-                            os.replace(filepath, new_path)
-                            filepath = new_path
+                        if filepath != os.path.join(output_dir, html_name):
+                            filepath = os.path.join(output_dir, html_name)
                             fname = html_name
-                    manifest[fname] = url
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
+                    record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
-                else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
         except Exception:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            pass
+        finally:
+            discard_temp_file(tmp_path)
 
     # Method 2: Scrapling Fetcher (basic HTTP client)
+    # H9: chunked write to a temp file, validate, then os.replace.
     if HAS_SCRAPLING:
+        tmp_path = None
         try:
             sc_args = {"headers": {"Referer": referer}} if referer else {}
             if cookies:
@@ -1076,7 +1174,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -1089,10 +1187,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
                         filepath = os.path.join(output_dir, fname)
 
-                with open(filepath, "wb") as f:
-                    f.write(resp.body)
+                tmp_path = temp_path_for(filepath)
+                write_bytes_chunked(tmp_path, resp.body)
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     content_bytes=resp.body,
                     response_status=resp.status,
                     headers=resp.headers
@@ -1101,22 +1199,20 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                         base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
-                        new_path = os.path.join(output_dir, html_name)
-                        if filepath != new_path:
-                            os.replace(filepath, new_path)
-                            filepath = new_path
+                        if filepath != os.path.join(output_dir, html_name):
+                            filepath = os.path.join(output_dir, html_name)
                             fname = html_name
-                    manifest[fname] = url
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
+                    record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
-                else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
         except Exception:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            pass
+        finally:
+            discard_temp_file(tmp_path)
 
     # Reuse the opted-in authenticated session before a standalone browser.
     if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
@@ -1128,13 +1224,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 filepath, output_dir, url, manifest=manifest
             )
             fname = os.path.basename(filepath)
-            manifest[fname] = url
+            record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
             save_download_manifest(output_dir, manifest)
             print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
             return filepath
 
     # Method 3: Scrapling StealthySession + Playwright sync download fallback
+    # H9: the browser download lands in a temp file, is validated, then
+    # committed with os.replace; a failure only discards the temp file.
     if HAS_SCRAPLING:
+        tmp_path = None
         try:
             from scrapling.fetchers import StealthySession
             session_stealth = StealthySession(
@@ -1172,15 +1271,32 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 real_name = sanitize_filename(download.suggested_filename)
                 fname = disambiguate_target_filename(output_dir, real_name, url, manifest)
                 filepath = os.path.join(output_dir, fname)
-            download.save_as(filepath)
+            tmp_path = temp_path_for(filepath)
+            download.save_as(tmp_path)
             session_stealth.close()
 
-            filepath = ensure_inferred_extension_on_disk(
-                filepath, output_dir, url, manifest=manifest
-            )
-            fname = os.path.basename(filepath)
-            is_val, reason = validate_downloaded_file(filepath)
+            # Re-home under the inferred extension (if any) so validation
+            # sees the real extension, as in Method 1.
+            if "." not in fname or fname.endswith(".bin"):
+                with open(tmp_path, "rb") as _head_f:
+                    _head = _head_f.read(8192)
+                _inferred = infer_file_extension(_head, "")
+                if _inferred:
+                    _base = fname[:-4] if fname.endswith(".bin") else fname
+                    fname = disambiguate_target_filename(output_dir, f"{_base}{_inferred}", url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                    _new_tmp = temp_path_for(filepath)
+                    os.replace(tmp_path, _new_tmp)
+                    tmp_path = _new_tmp
+
+            is_val, reason = validate_downloaded_file(tmp_path)
             if is_val:
+                commit_temp_file(tmp_path, filepath)
+                tmp_path = None
+                filepath = ensure_inferred_extension_on_disk(
+                    filepath, output_dir, url, manifest=manifest
+                )
+                fname = os.path.basename(filepath)
                 if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                     base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                     html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
@@ -1189,34 +1305,50 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         os.replace(filepath, new_path)
                         filepath = new_path
                         fname = html_name
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 return filepath
-            else:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
         except Exception:
             try:
                 session_stealth.close()
             except Exception:
                 pass
-            if os.path.exists(filepath):
-                os.remove(filepath)
+        finally:
+            discard_temp_file(tmp_path)
 
     # Method 4: curl (cross-platform fallback)
+    # H9: curl writes to a temp file, which is validated and then committed
+    # with os.replace; a failure only discards the temp file.
+    tmp_path = None
     try:
         curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
-        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", filepath, url]
+        tmp_path = temp_path_for(filepath)
+        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", tmp_path, url]
         res = subprocess.run(cmd, timeout=120)
-        if res.returncode == 0 and os.path.exists(filepath):
-            filepath = ensure_inferred_extension_on_disk(
-                filepath, output_dir, url, manifest=manifest
-            )
-            fname = os.path.basename(filepath)
-            is_val, reason = validate_downloaded_file(filepath)
+        if res.returncode == 0 and os.path.exists(tmp_path):
+            # Re-home under the inferred extension (if any) so validation
+            # sees the real extension, as in Method 1.
+            if "." not in fname or fname.endswith(".bin"):
+                with open(tmp_path, "rb") as _head_f:
+                    _head = _head_f.read(8192)
+                _inferred = infer_file_extension(_head, "")
+                if _inferred:
+                    _base = fname[:-4] if fname.endswith(".bin") else fname
+                    fname = disambiguate_target_filename(output_dir, f"{_base}{_inferred}", url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                    _new_tmp = temp_path_for(filepath)
+                    os.replace(tmp_path, _new_tmp)
+                    tmp_path = _new_tmp
+            is_val, reason = validate_downloaded_file(tmp_path)
             if is_val:
+                commit_temp_file(tmp_path, filepath)
+                tmp_path = None
+                filepath = ensure_inferred_extension_on_disk(
+                    filepath, output_dir, url, manifest=manifest
+                )
+                fname = os.path.basename(filepath)
                 if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                     base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                     html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
@@ -1226,14 +1358,14 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         filepath = new_path
                         fname = html_name
                 size_kb = os.path.getsize(filepath) / 1024
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
-            elif os.path.exists(filepath):
-                os.remove(filepath)
     except Exception:
         pass
+    finally:
+        discard_temp_file(tmp_path)
 
     print("FAIL")
     return None
@@ -1272,8 +1404,10 @@ def fetch_page_html(
                 session=bsk_session,
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 return bsk_html, bsk_status, bsk_final or url
+            if bsk_html:
+                print("    BrowserSkill page is blocked or an error page; falling through to default pipeline...")
         except Exception as e_bsk:
             if bsk_runtime and (bsk_runtime.browser or bsk_runtime.tab_id):
                 raise
@@ -1289,7 +1423,7 @@ def fetch_page_html(
             cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
                 cdp_url, url, wait_selector=wait_sel, timeout=60.0
             )
-            if cdp_html and cdp_status < 400:
+            if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 if cdp_cookies:
                     if session:
                         for c in cdp_cookies:
@@ -1297,6 +1431,8 @@ def fetch_page_html(
                     if play_cookies is not None:
                         play_cookies.extend([c for c in cdp_cookies if c not in play_cookies])
                 return cdp_html, cdp_status, cdp_final or url
+            if cdp_html:
+                print("    CDP page is blocked or an error page; falling through to StealthyFetcher...")
         except Exception as e_cdp:
             print(f"    CDP direct tab attachment failed: {e_cdp}. Falling through to StealthyFetcher...")
 
@@ -1307,8 +1443,9 @@ def fetch_page_html(
             if resp.status_code < 400:
                 final_url = resp.url or url
                 text = resp.text
-                cf_signals = ["challenge-platform", "cf-browser-verification", "just a moment", "Checking your browser"]
-                is_challenge = any(sig.lower() in text.lower() for sig in cf_signals)
+                # H1: shared blocked-page check (challenge / login wall),
+                # not just the old Cloudflare substring list.
+                is_challenge = is_blocked_page(text)
                 if HAS_SCANSCI:
                     try:
                         from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
@@ -1345,6 +1482,12 @@ def fetch_page_html(
             page = StealthyFetcher.fetch(url, **sc_args)
             html_content = str(page.html_content)
             final_url = getattr(page, "url", None) or url
+            if page_fetch_is_failure(html_content, page.status):
+                print("    StealthyFetcher page is blocked or an error page; falling through...")
+                if not cdp_url:
+                    return "", 0, final_url
+                # Retry without CDP via the handler below.
+                raise RuntimeError("StealthyFetcher returned a blocked page")
             return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
@@ -1356,6 +1499,9 @@ def fetch_page_html(
                     page = StealthyFetcher.fetch(url, **sc_nocdp)
                     html_content = str(page.html_content)
                     final_url = getattr(page, "url", None) or url
+                    if page_fetch_is_failure(html_content, page.status):
+                        print("    StealthyFetcher standalone page is blocked or an error page.")
+                        return "", 0, final_url
                     return html_content, page.status, final_url
                 except Exception as e2:
                     print(f"    StealthyFetcher standalone error: {e2}")
@@ -1451,7 +1597,18 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         diag = find_all_candidates(html_content, effective_base, original_url=url)
 
         # Fallback to browser rendering if raw HTML yields no candidates or is incomplete
-        if (not diag.candidates or diag.is_incomplete) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
+        # H3: also force the render when the static page shows dynamic
+        # signals (diag.needs_browser) but the candidate set is empty or
+        # the evidence check still reports missing files. The evidence
+        # verdict is used here, not diag.is_incomplete alone: the two can
+        # disagree (e.g. a singular "Additional file (7)" declaration is
+        # seen by the legacy evidence file count but not by the H5 count).
+        # When the supplements are already complete, do not force.
+        _scrape_evidence = DiscoveryEvidence()
+        _scrape_evidence.observe("publisher", html_content, effective_base)
+        _scrape_inc, _ = _scrape_evidence.check(diag.candidates)
+        _needs_browser_retry = bool(diag.needs_browser) and (not diag.candidates or _scrape_inc)
+        if (not diag.candidates or diag.is_incomplete or _needs_browser_retry) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
             print("    Raw HTML incomplete or blocked. Retrying with browser rendering for page scrape...")
             html_content_b, status_b, final_url_b = fetch_page_html(
                 url,
@@ -1484,11 +1641,11 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     print(f"    Renamed folder from HTML title to: {os.path.abspath(article_dir)}")
 
         manifest = load_download_manifest(article_dir)
-        downloaded_urls = set(manifest.values())
+        downloaded_urls = {manifest_entry_url(v) for v in manifest.values()}
         existing_basenames = {os.path.basename(f) for f in existing_files}
         downloaded_mmcs = set()
         for k, v in manifest.items():
-            for s in (k, v):
+            for s in (k, manifest_entry_url(v)):
                 m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
@@ -1498,6 +1655,10 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
+                # Skip dotfiles: H9 temp files (and the manifest) are
+                # never downloaded files, even if a hard kill left one.
+                if f.startswith("."):
+                    continue
                 m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))
@@ -1540,7 +1701,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             downloaded_mmcs = set()
             manifest = load_download_manifest(article_dir)
             for k, v in manifest.items():
-                for s in (k, v):
+                for s in (k, manifest_entry_url(v)):
                     m = MMC_NUM_REGEX.search(s)
                     if m:
                         downloaded_mmcs.add(int(m.group(1)))
@@ -1550,6 +1711,10 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     downloaded_mmcs.add(int(m.group(1)))
             if os.path.exists(article_dir):
                 for f in os.listdir(article_dir):
+                    # Skip dotfiles: H9 temp files (and the manifest) are
+                    # never downloaded files, even if a hard kill left one.
+                    if f.startswith("."):
+                        continue
                     m_f = MMC_NUM_REGEX.search(f)
                     if m_f:
                         downloaded_mmcs.add(int(m_f.group(1)))
@@ -1698,7 +1863,7 @@ def run_download(args, bsk_runtime):
         bsk_runtime=bsk_runtime,
         bsk_tab=getattr(args, "bsk_tab", None),
     )
-    if (not html_content or status >= 400) and bsk_runtime.enabled and not args.browserskill:
+    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill:
         try:
             html_content, status, final_url = fetch_page_via_browserskill(url, runtime=bsk_runtime)
         except BrowserSkillError as exc:
@@ -1755,8 +1920,13 @@ def run_download(args, bsk_runtime):
     evidence.observe("publisher", html_content, effective_base)
 
     # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
+    # H3: also force a browser render when the static page shows dynamic
+    # signals (diag.needs_browser) but the candidate set is empty or the
+    # evidence check still reports missing files. When the supplements
+    # are already complete, do not force.
     is_inc, inc_reason = evidence.check(candidates)
-    if (not candidates or is_inc) and HAS_SCRAPLING and session and not args.browserskill:
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
             url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
@@ -1778,7 +1948,9 @@ def run_download(args, bsk_runtime):
     is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
-    if (args.cdp or args.cdp_url) and (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
+    # H3: needs_browser also forces the probe (same rule as above).
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -1817,7 +1989,9 @@ def run_download(args, bsk_runtime):
     is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
-    if (not candidates or is_inc) and bsk_runtime.enabled:
+    # H3: needs_browser also forces the probe (same rule as above).
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled:
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
@@ -1827,7 +2001,7 @@ def run_download(args, bsk_runtime):
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 bsk_base = extract_effective_base_url(bsk_html, bsk_final or url)
                 evidence.observe("publisher", bsk_html, bsk_base)
                 bsk_diag = find_all_candidates(bsk_html, bsk_base, original_url=args.url_or_doi)
@@ -1927,11 +2101,17 @@ def run_download(args, bsk_runtime):
     # Download files
     os.makedirs(article_dir, exist_ok=True)
     print(f"\n  Downloading {len(candidates)} file(s)...")
+    # H8: no separate transport exists at this call site -- download_file
+    # already cascades requests -> Scrapling -> BrowserSkill ->
+    # StealthySession -> curl internally, so there is no distinct
+    # retry_download to wire in. A transient failure therefore retries
+    # the same download once, with backoff (max_retries=1); a bare
+    # None/False with no reason is not retried.
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, session, play_cookies,
                                    bsk_runtime=bsk_runtime, referer=cand.source_url or url),
-        mirrors, expand_repository_candidates)
+        mirrors, expand_repository_candidates, max_retries=1)
     success_count = len(successful)
     incomplete, reason = evidence.check(successful)
     if incomplete:
@@ -1944,12 +2124,16 @@ def run_download(args, bsk_runtime):
         downloaded_mmcs = set()
         manifest = load_download_manifest(article_dir)
         for k, v in manifest.items():
-            for s in (k, v):
+            for s in (k, manifest_entry_url(v)):
                 m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
+                # Skip dotfiles: H9 temp files (and the manifest) are
+                # never downloaded files, even if a hard kill left one.
+                if f.startswith("."):
+                    continue
                 m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))

@@ -91,6 +91,38 @@ class TestPlaywrightUtils(unittest.TestCase):
             if os.path.exists(fake_browser):
                 os.remove(fake_browser)
 
+    def test_find_playwright_chromium_chrome_linux64_layout(self):
+        # Newer Playwright ships the Linux build as chrome-linux64/chrome,
+        # not chrome-linux/chrome; detection must cover both layouts.
+        with tempfile.TemporaryDirectory() as td:
+            exe_dir = os.path.join(td, "chromium-1254", "chrome-linux64")
+            os.makedirs(exe_dir)
+            exe = os.path.join(exe_dir, "chrome")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            env = {"PLAYWRIGHT_BROWSERS_PATH": td}
+            env.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
+            with patch.dict(os.environ, env, clear=False):
+                os.environ.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
+                found = pu.find_playwright_chromium()
+            self.assertEqual(found, exe)
+
+    def test_find_playwright_chromium_prefers_chrome_linux_when_both_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            old_dir = os.path.join(td, "chromium-1254", "chrome-linux")
+            new_dir = os.path.join(td, "chromium-1254", "chrome-linux64")
+            os.makedirs(old_dir)
+            os.makedirs(new_dir)
+            old_exe = os.path.join(old_dir, "chrome")
+            new_exe = os.path.join(new_dir, "chrome")
+            for path in (old_exe, new_exe):
+                with open(path, "w") as f:
+                    f.write("#!/bin/sh\n")
+            with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": td}, clear=False):
+                os.environ.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
+                found = pu.find_playwright_chromium()
+            self.assertEqual(found, old_exe)
+
     def test_find_system_chromium(self):
         # Should return a string or None, but never throw an unhandled exception
         result = pu.find_system_chromium()
@@ -282,7 +314,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                 "http://127.0.0.1:9222",
                 "https://doi.org/10.1016/j.oregeorev.2022.104949",
             )
-            self.assertEqual(status, 200)
+            # H1: reusing an open tab performs no fresh navigation, so
+            # there is no real status to report (no synthetic 200).
+            self.assertIsNone(status)
             self.assertIn("Paper text in open tab", html)
             self.assertEqual(len(live_c), 1)
             self.assertEqual(live_c[0]["name"], "AuthToken")
@@ -313,7 +347,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                 "https://link.springer.com/article/10.1007/s00126-020-00999-x",
                 wait_selector="#supplementary-material",
             )
-            self.assertEqual(status, 200)
+            # H1: the mocked goto returns no integer status, so the
+            # status is unknown (None), not a hardcoded 200.
+            self.assertIsNone(status)
             self.assertIn("Springer paper text", html)
             self.assertEqual(len(live_c), 1)
             mock_context.new_page.assert_called_once()
@@ -362,7 +398,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                     endpoint[0],
                     "about:blank",
                 )
-                self.assertEqual(status, 200)
+                # about:blank has no navigation response; status is
+                # unknown (None) rather than a synthetic 200.
+                self.assertIn(status, (None, 200))
                 self.assertIsInstance(html, str)
             finally:
                 if proc.poll() is None:
