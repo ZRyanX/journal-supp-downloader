@@ -2503,6 +2503,102 @@ _BZIP2_MAGIC_SUFFIXES = (".bz2",)
 _XZ_MAGIC_SUFFIXES = (".xz", ".txz")
 
 
+# ── Blocked-page detection (H1) ──────────────────────────────────────────────
+# A fetched article page is "blocked" when it is a Cloudflare / Turnstile
+# challenge, an access-denied page, or a login wall rather than the article.
+# Kept here (next to file validation) so both downloaders and the
+# BrowserSkill adapter can use it without a circular import: supp_finder
+# imports neither browserskill_adapter nor playwright_utils, while both of
+# those are imported by the downloaders. The title markers below subsume
+# the four keywords BrowserSkill used to check on its own
+# ("just a moment" / "access denied" / "attention required" /
+# "verify you are human").
+
+_BLOCKED_TITLE_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "access denied",
+    "403 forbidden",
+    "security check",
+    "checking your browser",
+    "please verify",
+    "are you human",
+    "human verification",
+    "sign in to",
+    "log in to",
+    "institutional login",
+    "login required",
+    "sign in required",
+    "please sign in",
+    "please log in",
+)
+
+_BLOCKED_TITLE_EXACT = {"sign in", "log in", "login", "sign-in", "log-in"}
+
+# Body phrases that only appear when the page itself is a challenge / login
+# wall. Deliberately NOT included: a bare "Sign in" navigation link, which
+# normal article pages carry in their header.
+_BLOCKED_BODY_MARKERS = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "please verify you are human",
+    "checking your browser",
+    "challenge-platform",
+    "cf-browser-verification",
+    "turnstile",
+    "human verification",
+    "access denied",
+    "403 forbidden",
+    "sign in to access",
+    "log in to access",
+    "sign in to view",
+    "log in to view",
+    "sign in to continue",
+    "log in to continue",
+    "login required",
+    "sign-in required",
+    "authentication required",
+    "you must be logged in",
+    "institutional login",
+)
+
+
+def is_blocked_page(page_html: Optional[str]) -> bool:
+    """True if *page_html* looks like a challenge / access-denied / login-wall page.
+
+    Checks the <title> and the visible body text. A normal article page
+    that merely links to a sign-in page is not blocked.
+    """
+    if not page_html or not isinstance(page_html, str):
+        return False
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", page_html, re.I | re.S)
+    title = (title_match.group(1) if title_match else "").strip().lower()
+    if title:
+        if title in _BLOCKED_TITLE_EXACT:
+            return True
+        if any(marker in title for marker in _BLOCKED_TITLE_MARKERS):
+            return True
+    text = re.sub(r"<[^>]+>", " ", page_html)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    return any(marker in text for marker in _BLOCKED_BODY_MARKERS)
+
+
+def page_fetch_is_failure(html: Optional[str], status: Optional[int] = None) -> bool:
+    """Caller rule for H1: a page fetch failed when the HTTP status is an
+    error (>= 400), or when the page is a blocked page. An unknown status
+    (None, e.g. BrowserSkill exposes no navigation status) is only a
+    failure when the page shows challenge / login features; on its own it
+    is accepted, since no better signal exists. A ``status < 400`` alone
+    must never be treated as success without this check.
+    """
+    if status is not None and status >= 400:
+        return True
+    return bool(html) and is_blocked_page(html)
+
+
 def validate_downloaded_file(
     filepath: str,
     content_bytes: Optional[bytes] = None,

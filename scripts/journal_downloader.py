@@ -57,6 +57,8 @@ from supp_finder import (
     is_placeholder_or_blocked_title,
     migrate_or_merge_article_dir,
     expand_page_accordions_action,
+    is_blocked_page,
+    page_fetch_is_failure,
 )
 
 
@@ -436,7 +438,7 @@ def run_download(args, bsk_runtime):
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 print("  [BrowserSkill] Successfully retrieved page DOM from live browser session.")
                 page = type("BrowserSkillPage", (), {
                     "html_content": bsk_html,
@@ -476,7 +478,7 @@ def run_download(args, bsk_runtime):
             cdp_html, cdp_status, cdp_final_url, cdp_c = fetch_page_via_cdp(
                 cdp_target, fetch_url, wait_selector=args.wait_selector, timeout=args.timeout / 1000.0
             )
-            if cdp_html and cdp_status < 400:
+            if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 print("  [CDP] Successfully retrieved page DOM from live browser session.")
                 if cdp_c:
                     cookies = merge_cookies(cookies, cdp_c)
@@ -522,7 +524,12 @@ def run_download(args, bsk_runtime):
                     print(f"  [Recovery] HTTP direct fetch failed: {e3}")
 
 
-    if (page is None or getattr(page, "status", 200) >= 400) and bsk_runtime.enabled and not args.browserskill:
+    # H1: a blocked page (challenge / login wall) is a failed fetch even
+    # when the transport reported status < 400, and an unknown status
+    # (None, from BrowserSkill/CDP) must not crash the comparison.
+    _page_html = str(getattr(page, "html_content", None) or getattr(page, "text", "") or "") if page is not None else ""
+    _page_status = getattr(page, "status", None) if page is not None else None
+    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill:
         try:
             html, status, landing = fetch_page_via_browserskill(
                 fetch_url, wait_selector=args.wait_selector,
@@ -536,6 +543,13 @@ def run_download(args, bsk_runtime):
 
     if page is None:
         print(f"Warning: Unable to fetch publisher page; checking available alternatives.")
+        page = type("UnavailablePage", (), {"url": fetch_url, "html_content": "", "text": "", "status": 0})()
+
+    # A page that is still blocked after every fetch tier must not be
+    # parsed as an article: a challenge page mentioning "Table S1" would
+    # otherwise be recorded as declared-but-missing evidence.
+    if page is not None and is_blocked_page(str(getattr(page, "html_content", None) or getattr(page, "text", "") or "")):
+        print("  [Warning] Fetched page is a challenge / login wall; treating it as no usable article page.")
         page = type("UnavailablePage", (), {"url": fetch_url, "html_content": "", "text": "", "status": 0})()
 
     # Resolve effective base URL (Fixing Issue #1: DOI redirect resolution)

@@ -84,6 +84,8 @@ from supp_finder import (
     ensure_inferred_extension_on_disk,
     is_placeholder_or_blocked_title,
     migrate_or_merge_article_dir,
+    is_blocked_page,
+    page_fetch_is_failure,
 )
 
 try:
@@ -1277,8 +1279,10 @@ def fetch_page_html(
                 session=bsk_session,
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 return bsk_html, bsk_status, bsk_final or url
+            if bsk_html:
+                print("    BrowserSkill page is blocked or an error page; falling through to default pipeline...")
         except Exception as e_bsk:
             if bsk_runtime and (bsk_runtime.browser or bsk_runtime.tab_id):
                 raise
@@ -1294,7 +1298,7 @@ def fetch_page_html(
             cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
                 cdp_url, url, wait_selector=wait_sel, timeout=60.0
             )
-            if cdp_html and cdp_status < 400:
+            if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 if cdp_cookies:
                     if session:
                         for c in cdp_cookies:
@@ -1302,6 +1306,8 @@ def fetch_page_html(
                     if play_cookies is not None:
                         play_cookies.extend([c for c in cdp_cookies if c not in play_cookies])
                 return cdp_html, cdp_status, cdp_final or url
+            if cdp_html:
+                print("    CDP page is blocked or an error page; falling through to StealthyFetcher...")
         except Exception as e_cdp:
             print(f"    CDP direct tab attachment failed: {e_cdp}. Falling through to StealthyFetcher...")
 
@@ -1312,8 +1318,9 @@ def fetch_page_html(
             if resp.status_code < 400:
                 final_url = resp.url or url
                 text = resp.text
-                cf_signals = ["challenge-platform", "cf-browser-verification", "just a moment", "Checking your browser"]
-                is_challenge = any(sig.lower() in text.lower() for sig in cf_signals)
+                # H1: shared blocked-page check (challenge / login wall),
+                # not just the old Cloudflare substring list.
+                is_challenge = is_blocked_page(text)
                 if HAS_SCANSCI:
                     try:
                         from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
@@ -1350,6 +1357,12 @@ def fetch_page_html(
             page = StealthyFetcher.fetch(url, **sc_args)
             html_content = str(page.html_content)
             final_url = getattr(page, "url", None) or url
+            if page_fetch_is_failure(html_content, page.status):
+                print("    StealthyFetcher page is blocked or an error page; falling through...")
+                if not cdp_url:
+                    return "", 0, final_url
+                # Retry without CDP via the handler below.
+                raise RuntimeError("StealthyFetcher returned a blocked page")
             return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
@@ -1361,6 +1374,9 @@ def fetch_page_html(
                     page = StealthyFetcher.fetch(url, **sc_nocdp)
                     html_content = str(page.html_content)
                     final_url = getattr(page, "url", None) or url
+                    if page_fetch_is_failure(html_content, page.status):
+                        print("    StealthyFetcher standalone page is blocked or an error page.")
+                        return "", 0, final_url
                     return html_content, page.status, final_url
                 except Exception as e2:
                     print(f"    StealthyFetcher standalone error: {e2}")
@@ -1703,7 +1719,7 @@ def run_download(args, bsk_runtime):
         bsk_runtime=bsk_runtime,
         bsk_tab=getattr(args, "bsk_tab", None),
     )
-    if (not html_content or status >= 400) and bsk_runtime.enabled and not args.browserskill:
+    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill:
         try:
             html_content, status, final_url = fetch_page_via_browserskill(url, runtime=bsk_runtime)
         except BrowserSkillError as exc:
@@ -1832,7 +1848,7 @@ def run_download(args, bsk_runtime):
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
             )
-            if bsk_html and bsk_status < 400:
+            if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 bsk_base = extract_effective_base_url(bsk_html, bsk_final or url)
                 evidence.observe("publisher", bsk_html, bsk_base)
                 bsk_diag = find_all_candidates(bsk_html, bsk_base, original_url=args.url_or_doi)

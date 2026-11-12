@@ -984,7 +984,7 @@ def fetch_page_via_browserskill(
     session: Optional[BrowserSkillSession] = None,
     bsk_bin: Optional[str] = None,
     runtime=None,
-) -> Tuple[str, int, str]:
+) -> Tuple[str, Optional[int], str]:
     """
     Fetches an article page using Tencent BrowserSkill:
     1. Normalizes DOI if given as '10.xxxx/...'.
@@ -995,8 +995,11 @@ def fetch_page_via_browserskill(
     5. Extracts DOM and landing URL together; falls back to get-html and URL metadata.
     6. Safely cleans up the session (if created internally).
 
-    Returns: (html_content, 200, final_url). 200 is a synthetic DOM-success
-    signal; BrowserSkill does not expose the navigation HTTP status here.
+    Returns: (html_content, status, final_url). status is None: BrowserSkill
+    does not expose the navigation HTTP status, so no synthetic 200 is
+    returned (H1). Callers must use supp_finder.page_fetch_is_failure()
+    (unknown status + blocked-page features = failure) instead of
+    treating ``status < 400`` as success.
     """
     if runtime is not None:
         session = runtime.get_session()
@@ -1097,13 +1100,21 @@ def fetch_page_via_browserskill(
         if not isinstance(final_url, str) or not final_url.startswith(("http://", "https://")):
             raise BrowserSkillExecutionError("Could not determine the article landing URL")
         sess.current_url = final_url
-        # DOM retrieval has no HTTP status; reject recognizable challenge/login pages.
-        title_match = re.search(r"<title[^>]*>(.*?)</title>", final_html, re.I | re.S)
-        title = title_match.group(1).strip().lower() if title_match else ""
-        if any(marker in title for marker in ("just a moment", "access denied", "attention required", "verify you are human")):
+        # DOM retrieval has no HTTP status; reject challenge / login pages.
+        # H1: use the shared page-level check (title + body features) rather
+        # than the old title-only keyword list, so a Turnstile / login-wall
+        # body under a normal title is no longer reported as an article.
+        try:
+            from supp_finder import is_blocked_page
+            blocked = is_blocked_page(final_html)
+        except ImportError:
+            title_match = re.search(r"<title[^>]*>(.*?)</title>", final_html, re.I | re.S)
+            title = title_match.group(1).strip().lower() if title_match else ""
+            blocked = any(marker in title for marker in ("just a moment", "access denied", "attention required", "verify you are human"))
+        if blocked:
             raise BrowserSkillExecutionError("Browser page requires verification or access; complete it in the browser and retry")
 
-        return final_html, 200, final_url
+        return final_html, None, final_url
 
     finally:
         if should_close_session and sess:

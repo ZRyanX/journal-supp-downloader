@@ -282,7 +282,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                 "http://127.0.0.1:9222",
                 "https://doi.org/10.1016/j.oregeorev.2022.104949",
             )
-            self.assertEqual(status, 200)
+            # H1: reusing an open tab performs no fresh navigation, so
+            # there is no real status to report (no synthetic 200).
+            self.assertIsNone(status)
             self.assertIn("Paper text in open tab", html)
             self.assertEqual(len(live_c), 1)
             self.assertEqual(live_c[0]["name"], "AuthToken")
@@ -313,7 +315,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                 "https://link.springer.com/article/10.1007/s00126-020-00999-x",
                 wait_selector="#supplementary-material",
             )
-            self.assertEqual(status, 200)
+            # H1: the mocked goto returns no integer status, so the
+            # status is unknown (None), not a hardcoded 200.
+            self.assertIsNone(status)
             self.assertIn("Springer paper text", html)
             self.assertEqual(len(live_c), 1)
             mock_context.new_page.assert_called_once()
@@ -362,7 +366,9 @@ class TestPlaywrightUtils(unittest.TestCase):
                     endpoint[0],
                     "about:blank",
                 )
-                self.assertEqual(status, 200)
+                # about:blank has no navigation response; status is
+                # unknown (None) rather than a synthetic 200.
+                self.assertIn(status, (None, 200))
                 self.assertIsInstance(html, str)
             finally:
                 if proc.poll() is None:

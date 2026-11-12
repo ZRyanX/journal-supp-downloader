@@ -2,7 +2,7 @@
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 import io
 import json
 import zipfile
@@ -382,3 +382,130 @@ def test_h3_accordion_action_scrolls_in_segments_and_waits_for_settle():
     assert page.scrolls == [1000, 2000, 2500, 2500]
     # Settle polling ran (counts 1, 2, 3, then stable 3) instead of one fixed sleep.
     assert len(page.waits) >= 4
+
+
+# ── H1: real fetch status + is_blocked_page ──────────────────────────────────
+
+def test_h1_is_blocked_page_detects_challenge_and_login():
+    from supp_finder import is_blocked_page, page_fetch_is_failure
+
+    assert is_blocked_page(
+        "<html><head><title>Just a moment...</title></head>"
+        "<body>Checking your browser before accessing the site</body></html>"
+    )
+    assert is_blocked_page(
+        "<html><body><div>Please verify you are human to continue</div></body></html>"
+    )
+    assert is_blocked_page(
+        "<html><head><title>Sign in</title></head>"
+        "<body><form>Sign in to access this article</form></body></html>"
+    )
+    assert is_blocked_page(
+        "<html><body><div>Access denied: your institution does not subscribe</div></body></html>"
+    )
+    # A normal article page that merely links to a sign-in page is NOT blocked.
+    assert not is_blocked_page(
+        '<html><body><a href="/login">Sign in</a><h1>Article title</h1>'
+        '<a href="/s1.xlsx">Supplementary Table S1</a></body></html>'
+    )
+    assert not is_blocked_page(
+        "<html><body><h1>Article</h1><p>Supplementary data are available.</p></body></html>"
+    )
+    # Caller rule: unknown status (None) + blocked features = failure;
+    # unknown status alone is not a failure (BrowserSkill exposes no status).
+    assert page_fetch_is_failure("<html><title>Just a moment</title></html>", None) is True
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", None) is False
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", 200) is False
+    assert page_fetch_is_failure("<html><body>Article text</body></html>", 403) is True
+    # A blocked page is a failure even when the transport reported 200.
+    assert page_fetch_is_failure("<html><title>Access denied</title></html>", 200) is True
+
+
+def test_h1_cdp_returns_real_navigation_status():
+    import playwright_utils as pu
+    from types import SimpleNamespace as NS
+
+    mock_page = MagicMock()
+    mock_page.url = "https://example.com/article"
+    mock_page.content.return_value = "<html><body>Forbidden page</body></html>"
+    mock_context = MagicMock()
+    mock_context.pages = []
+    mock_context.new_page.return_value = mock_page
+    mock_context.cookies.return_value = []
+    mock_browser = MagicMock()
+    mock_browser.contexts = [mock_context]
+    # A real navigation that answered 403 must not come back as a fake 200.
+    mock_page.goto.return_value = NS(status=403)
+    with patch("playwright.sync_api.sync_playwright") as mock_pw:
+        mock_inst = MagicMock()
+        mock_pw.return_value.__enter__.return_value = mock_inst
+        mock_inst.chromium.connect_over_cdp.return_value = mock_browser
+        _, status, _, _ = pu.fetch_page_via_cdp("http://127.0.0.1:9222", "https://example.com/article")
+        assert status == 403
+    # Reusing an already-open tab performs no fresh navigation, so the
+    # status is unknown (None) rather than a synthetic 200.
+    mock_page.goto.reset_mock()
+    mock_context.pages = [mock_page]
+    with patch("playwright.sync_api.sync_playwright") as mock_pw:
+        mock_inst = MagicMock()
+        mock_pw.return_value.__enter__.return_value = mock_inst
+        mock_inst.chromium.connect_over_cdp.return_value = mock_browser
+        _, status, _, _ = pu.fetch_page_via_cdp("http://127.0.0.1:9222", "https://example.com/article")
+        assert status is None
+
+
+def test_h1_bsk_blocked_body_is_rejected_and_status_is_none():
+    import browserskill_adapter as bsk
+
+    session = MagicMock()
+    session.session_id = "sess-h1"
+    session.bsk_bin = "/bin/bsk"
+    session.tab_id = None
+    session.current_url = None
+    session.borrowed_tabs = set()
+    # Normal title, but the body is a Turnstile challenge: must raise, not
+    # return a synthetic 200.
+    with patch.object(session, "navigate"), patch.object(
+        session, "evaluate",
+        return_value={"html": "<html><head><title>Article</title></head>"
+                              "<body>Please verify you are human. Turnstile challenge.</body></html>",
+                      "url": "https://example.org/article"},
+    ):
+        with pytest.raises(bsk.BrowserSkillExecutionError, match="verification"):
+            bsk.fetch_page_via_browserskill("https://example.org/article", session=session, expand_accordions=False)
+    # A normal page fetch has no HTTP status to report: None, not fake 200.
+    with patch.object(session, "navigate"), patch.object(
+        session, "evaluate",
+        return_value={"html": "<html><body><h1>Article</h1></body></html>",
+                      "url": "https://example.org/article"},
+    ):
+        html, status, final = bsk.fetch_page_via_browserskill(
+            "https://example.org/article", session=session, expand_accordions=False)
+        assert status is None
+        assert "Article" in html
+
+
+def test_h1_fetch_page_html_accepts_unknown_status_and_falls_back_on_blocked():
+    import scansci_supp_downloader as a
+
+    good_html = "<html><body><h1>Article</h1></body></html>"
+    blocked_html = "<html><head><title>Just a moment...</title></head><body>Checking your browser</body></html>"
+    # BrowserSkill returned a usable DOM but no HTTP status: accept it
+    # (previously `status < 400` raised TypeError on None and discarded it).
+    with patch.object(a, "fetch_page_via_browserskill", return_value=(good_html, None, "https://example.org/article")):
+        html, status, final = a.fetch_page_html("https://example.org/article", use_bsk=True)
+        assert html == good_html
+        assert status is None
+    # BrowserSkill returned a blocked page with unknown status: fall through
+    # to the requests path instead of treating it as a successful fetch.
+    session = MagicMock()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.url = "https://example.org/article"
+    resp.text = good_html
+    session.get.return_value = resp
+    with patch.object(a, "fetch_page_via_browserskill", return_value=(blocked_html, None, "https://example.org/article")), \
+         patch.object(a, "HAS_SCANSCI", False):
+        html, status, final = a.fetch_page_html("https://example.org/article", session=session, use_bsk=True)
+        assert html == good_html
+        assert status == 200
