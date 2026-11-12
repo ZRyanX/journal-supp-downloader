@@ -1805,28 +1805,51 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
 
 # ── Completeness & Incomplete Result Detection (Issue #4) ────────────────────
 
-def detect_declared_supplement_count(html_content: str) -> Optional[int]:
-    """
-    Detect whether the article page declares a specific count of supplementary files (E1).
-    e.g., '4 Supplementary Files', 'Supplementary Tables S1-S5', 'Supporting Information (3)',
-    '共 4 个补充文件', '附表 1-5', '附表1至附表6', '附录 1-4', 'Supplementary Table S1 and S2',
-    'Tables S1-S3 in Supplementary Information', 'see Supplementary Tables 2-5',
-    'Appendix 1-4', 'Data S1-S3', 'Tables S1, S2, and S3'.
-    Strips inline HTML tags before matching and returns the maximum count found across all patterns.
-    """
-    if not html_content:
-        return None
-
-    # Strip <script> and <style> blocks and inline HTML tags so 'Tables <a>S1</a>-<a>S4</a>' is matched cleanly
+def _clean_text_for_declarations(html_content: str) -> str:
+    """Strip <script>/<style> blocks and tags so declarations are matched on visible text."""
     cleaned = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html_content, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = html.unescape(cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned)
 
+
+_CN_DECLARATION_DIGITS = {
+    '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+    '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+}
+
+
+def _parse_declared_numeral(s: str) -> Optional[int]:
+    """Convert an Arabic or Chinese numeral (一二三四五六七八九十) to int, else None."""
+    if not s:
+        return None
+    s = s.strip()
+    if s.isdigit():
+        return int(s)
+    if s in _CN_DECLARATION_DIGITS:
+        return _CN_DECLARATION_DIGITS[s]
+    if s.startswith('十') and len(s) == 2 and s[1] in _CN_DECLARATION_DIGITS:
+        return 10 + _CN_DECLARATION_DIGITS[s[1]]
+    return None
+
+
+def detect_declared_file_count(html_content: str) -> Optional[int]:
+    """
+    Detect an explicit declared number of supplementary *files* (H5, file-count reading).
+
+    Only statements that count files are recognised, e.g. '3 Supplementary Files',
+    'Supplementary Material (4 files)', '共 4 个补充文件', '提供 3 个附件'.
+    Table identifiers and table ranges ('Tables S1-S3', 'Supplementary Table S10',
+    '5 个附表') are deliberately NOT counted here; see detect_declared_table_range.
+    Returns None when no file-count statement is present.
+    """
+    if not html_content:
+        return None
+    cleaned = _clean_text_for_declarations(html_content)
     found_counts: List[int] = []
 
-    # Pattern 1: 'N Supplementary Files' / 'N Supplementary Tables'
-    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|tables?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
+    # Pattern 1: 'N Supplementary Files' / 'N Supplementary Materials' (never 'N Supplementary Tables')
+    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
@@ -1834,9 +1857,20 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 2: 'Supporting Information (N)' or 'Supplementary Material (4 files)'
+    # Pattern 1b: 'N attachments' / 'Total N files'
+    for m in re.finditer(r'\b(\d{1,2})\s+attachments?\b|\btotal\s+(\d{1,2})\s+files?\b', cleaned, re.IGNORECASE):
+        try:
+            val = int(m.group(1) or m.group(2))
+            if 1 <= val <= 99:
+                found_counts.append(val)
+        except ValueError:
+            pass
+
+    # Pattern 2: 'Supporting Information (N)' / 'Supplementary Material (4 files)'.
+    # A bare parenthesised number after an Information/Material heading counts files;
+    # an explicit '(N tables)' belongs to the table reading instead.
     for m in re.finditer(
-        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+(?:Information|Material|Materials|Data|Files|Tables)\s*\(\s*([1-9]\d?)(?:\s+(?:files?|tables?|items?|datasets?))?\s*\)',
+        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+(?:Information|Material|Materials|Data|Files)\s*\(\s*([1-9]\d?)(?:\s+files?)?\s*\)',
         cleaned,
         re.IGNORECASE,
     ):
@@ -1847,139 +1881,85 @@ def detect_declared_supplement_count(html_content: str) -> Optional[int]:
         except ValueError:
             pass
 
-    # Pattern 3a: English Table Range: 'Tables S1-S3', 'Supplementary Tables 2-5', 'Tables S1 to S4' (E1)
-    # Modifier and 'S' cannot both be omitted (e.g. 'Tables 1 to 3' is main text, not supplementary)
+    # Pattern 5: Chinese file counts: '共 4 个补充文件', '3 个附件', '共四个补充文件'.
+    # The supplement qualifier (补充/附录/附加) is mandatory: bare '本文包含 4 个表格'
+    # is a main-text table count, not a supplementary declaration (H5).
     for m in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data|appendix)(?:\s+(?:information|info|materials?|data))?\s+(?:(?:figures?|figs?\.?)\s+(?:and|&)\s+)?tables?(?:\s+(?:and|&)\s+(?:figures?|figs?\.?))?\s+s?0?(\d{1,2})|tables?\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
+        r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(?:补充|附录|附加)(?:文件|材料|附件|数据)'
+        r'|([0-9一二两三四五六七八九十]+)\s*个?附件',
         cleaned,
-        re.IGNORECASE,
     ):
-        try:
-            start_num = int(m.group(1) or m.group(2))
-            end_num = int(m.group(3))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Pattern 3b: Standalone Appendix range: 'Appendix 1-4', 'Appendix 1 to 5' (A1, E1)
-    for m in re.finditer(
-        r'\bappendix\s+0?(\d{1,2})\s*(?:[-–至~到]|to)\s*0?(\d{1,2})\b',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        try:
-            start_num = int(m.group(1))
-            end_num = int(m.group(2))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Pattern 3c: Data/Dataset range: 'Data S1-S3', 'Supplementary Data S1-S4', 'Dataset 1 to 4' (A3, E1)
-    for m in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting)\s+(?:datasets?|data|files?)\s+s?0?(\d{1,2})|(?:datasets?|data|files?)\s+s0?(\d{1,2}))\s*(?:[-–至~到]|to)\s*s?0?(\d{1,2})\b',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        try:
-            start_num = int(m.group(1) or m.group(2))
-            end_num = int(m.group(3))
-            if end_num >= start_num and (end_num - start_num + 1) <= 99:
-                found_counts.append(end_num - start_num + 1)
-        except ValueError:
-            pass
-
-    # Helper for converting Arabic or Chinese numerals (一二三四五六七八九十)
-    cn_digits = {
-        '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
-        '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
-    }
-    def _parse_count_val(s: str) -> Optional[int]:
-        if not s:
-            return None
-        s = s.strip()
-        if s.isdigit():
-            return int(s)
-        if s in cn_digits:
-            return cn_digits[s]
-        if s.startswith('十') and len(s) == 2 and s[1] in cn_digits:
-            return 10 + cn_digits[s[1]]
-        return None
-
-    # Pattern 4: Chinese range: '附表 1-5', '附表1至附表6', '补充表 S1-S6', '附录 1-4', '附表一至附表四'
-    for m in re.finditer(
-        r'(?:附表|补充表|附录表|补充表格|附录)\s*s?0?([0-9一二两三四五六七八九十]+)\s*(?:[-–至~到]|to)\s*(?:附表|补充表|附录表|补充表格|附录)?\s*s?0?([0-9一二两三四五六七八九十]+)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        s_num = _parse_count_val(m.group(1))
-        e_num = _parse_count_val(m.group(2))
-        if s_num is not None and e_num is not None and e_num >= s_num and (e_num - s_num + 1) <= 99:
-            found_counts.append(e_num - s_num + 1)
-
-    # Pattern 5: Chinese counts: '共 4 个补充文件', '4 个附表', '3个附件', '含 5 个附表', '共四个补充文件'
-    for m in re.finditer(r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(?:补充|附录|附加)?(?:文件|材料|表格|数据|附件|附表|补充表)', cleaned):
-        c_num = _parse_count_val(m.group(1))
+        c_num = _parse_declared_numeral(m.group(1) or m.group(2))
         if c_num is not None and 1 <= c_num <= 99:
             found_counts.append(c_num)
 
-    # Pattern 6a: List of tables: 'Supplementary Table S1 and S2', 'Tables S1, S2 and S3', 'Tables S1, S2, and S3' (E1)
-    for m_list in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data|appendix)\s+tables?\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
-        r'|tables?\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        nums = re.findall(r'\d{1,2}', m_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 6b: List of data files: 'Data S1 and S2', 'Supplementary Data S1, S2, and S3' (E1)
-    for m_data_list in re.finditer(
-        r'(?:(?:supplementary|supplemental|supporting)\s+(?:datasets?|data|files?)\s+s?0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b'
-        r'|(?:datasets?|data|files?)\s+s0?\d{1,2}(?:\s*,\s*s?0?\d{1,2})*(?:\s*,)?\s+(?:and|&)\s+s?0?\d{1,2}\b)',
-        cleaned,
-        re.IGNORECASE,
-    ):
-        nums = re.findall(r'\d{1,2}', m_data_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 7: Chinese table/appendix list: '附表1、附表2和附表3', '附录1、附录2及附录3' (E1)
-    for m_cn_list in re.finditer(
-        r'(?:附表|补充表|附录)\s*\d{1,2}(?:[、,，]\s*(?:附表|补充表|附录)?\s*\d{1,2})*\s*(?:和|及|与)\s*(?:附表|补充表|附录)?\s*(\d{1,2})',
-        cleaned,
-    ):
-        nums = re.findall(r'\d{1,2}', m_cn_list.group(0))
-        if nums:
-            found_counts.append(len(nums))
-
-    # Pattern 8: Highest explicit supplementary table mention (including single Table S1 / Supplementary Table S1)
-    # e.g. "see Supplementary Table S4", "Table S1", "S4 Table", "附表1", "附表四"
-    # Requires explicit supplementary prefix or 'S' numbering to avoid matching bare primary 'Table 1-3'.
-    m_high = re.findall(
-        r'(?:(?:supplementary|supplemental|supporting|extended\s*data)(?:\s+(?:information|info|materials?|data))?\s+tables?\s+s?0?(\d{1,2})'
-        r'|tables?\s+s0?(\d{1,2})'
-        r'|\bs0?(\d{1,2})\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?)'
-        r'|附表\s*s?0?([0-9一二两三四五六七八九十]+))\b',
-        cleaned,
-        re.IGNORECASE,
-    )
-    if m_high:
-        nums = []
-        for g in m_high:
-            for val in g:
-                if val:
-                    n = _parse_count_val(val)
-                    if n is not None and 1 <= n <= 99:
-                        nums.append(n)
-        if nums:
-            max_val = max(nums)
-            if max_val >= 1:
-                found_counts.append(max_val)
-
     return max(found_counts) if found_counts else None
+
+
+def detect_declared_table_range(html_content: str) -> Set[str]:
+    """
+    Detect the table identities a page declares (H5, table-range reading).
+
+    Returns the set of namespaced table ids (e.g. {'S1', 'S2', 'S3'}) from
+    ranges ('Tables S1-S3', 'Tables S1 to S3'), lists ('Tables S1, S2, and S3'),
+    single mentions ('Supplementary Table S10' -> {'S10'} only, never S1..S10)
+    and bare table counts ('5 个附表' / '3 Supplementary Tables' -> S1..S5 / S1..S3).
+    A bare table count expands from 1 because such a statement declares that
+    many tables without naming them; a single numbered mention does not imply
+    the tables below it. Returns an empty set when nothing is declared.
+    """
+    if not html_content:
+        return set()
+    cleaned = _clean_text_for_declarations(html_content)
+    declared = set(supplementary_table_ids(cleaned))
+
+    # Bare table counts with no ids: '3 Supplementary Tables', 'Supplementary Tables (5)'.
+    for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+tables?\b', cleaned, re.IGNORECASE):
+        try:
+            count = int(m.group(1))
+            if 1 <= count <= 99:
+                declared.update(f"S{i}" for i in range(1, count + 1))
+        except ValueError:
+            pass
+    for m in re.finditer(
+        r'(?:Supplementary|Supplemental|Supporting|Additional)\s+Tables?\s*\(\s*([1-9]\d?)(?:\s+tables?)?\s*\)',
+        cleaned,
+        re.IGNORECASE,
+    ):
+        try:
+            count = int(m.group(1))
+            if 1 <= count <= 99:
+                declared.update(f"S{i}" for i in range(1, count + 1))
+        except ValueError:
+            pass
+
+    # Bare Chinese table counts: '5 个附表' -> S1..S5, '5 个附录' -> A1..A5.
+    for m in re.finditer(
+        r'(?:共|含|包括)?\s*([0-9一二两三四五六七八九十]+)\s*个?(附表|补充表|附录表|附加表|附录)',
+        cleaned,
+    ):
+        c_num = _parse_declared_numeral(m.group(1))
+        if c_num is not None and 1 <= c_num <= 99:
+            prefix = "A" if m.group(2) == "附录" else "S"
+            declared.update(f"{prefix}{i}" for i in range(1, c_num + 1))
+
+    return declared
+
+
+def detect_declared_supplement_count(html_content: str) -> Optional[int]:
+    """
+    Compatibility entry point: now returns the *file-count* reading only.
+
+    Historically this returned max() across file counts, table ranges and the
+    highest table mention, which inflated the declared number (e.g. a page
+    with '3 Supplementary Files' plus a mention of 'Table S10' reported 10).
+    It is kept so existing callers keep working, but its semantics changed in
+    the P0 H5 fix: it is exactly detect_declared_file_count(). For the
+    table-range reading use detect_declared_table_range(), and for the
+    completeness verdict use is_result_obviously_incomplete(), which
+    consults both readings separately instead of mixing them.
+    """
+    return detect_declared_file_count(html_content)
 
 
 _DOM_SUPP_SECTIONS = {
@@ -2204,10 +2184,13 @@ def is_result_obviously_incomplete(candidates, html_content, declared_count=None
     if not html_content:
         return (True, 'Empty page content') if not candidates else (False, '')
     soup = html_content if isinstance(html_content, BeautifulSoup) else BeautifulSoup(html_content, DEFAULT_PARSER)
-    page_text = soup.get_text(' ', strip=True)
-    expected_tables = supplementary_table_ids(page_text)
+    raw_html = html_content if isinstance(html_content, str) else str(html_content)
+    # H5: the two readings are judged separately, both on visible text only
+    # (script/style content is not a declaration). A table range or a high
+    # table number is never treated as a file count.
+    expected_tables = detect_declared_table_range(raw_html)
     missing = expected_tables - covered_table_ids(candidates)
-    file_count = declared_file_count(page_text)
+    file_count = detect_declared_file_count(raw_html)
     # Deduplicate identical URLs but never substitute table counts for files.
     if file_count and len({c.url for c in candidates}) < file_count:
         return True, f'File count ({len({c.url for c in candidates})}) is less than declared count ({file_count} files)'

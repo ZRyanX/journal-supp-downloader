@@ -189,3 +189,56 @@ def test_h4_to_range_missing_member_is_reported():
 def test_h4_hierarchical_missing_member_is_reported():
     result = find_all_candidates('<section id="supplementary">Tables S1.1 and S1.2<a href="/S1-1.xlsx">Table S1.1</a></section>', BASE)
     assert result.is_incomplete and 'S1.2' in result.incomplete_reason
+
+
+# ── P0 H5: file-count and table-range declarations are separate ──
+
+def test_h5_file_count_ignores_table_mention():
+    from supp_finder import detect_declared_supplement_count, detect_declared_file_count, detect_declared_table_range
+    text = '3 Supplementary Files. Detailed metrics are available in Supplementary Table S10.'
+    assert detect_declared_file_count(text) == 3
+    assert detect_declared_table_range(text) == {'S10'}
+    # Compat entry keeps the file-count reading only; the S10 mention must not inflate it.
+    assert detect_declared_supplement_count(text) == 3
+
+
+def test_h5_single_table_mention_is_not_a_count_of_ten():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_supplement_count('See Supplementary Table S10.') is None
+    assert detect_declared_table_range('See Supplementary Table S10.') == {'S10'}
+
+
+def test_h5_chinese_table_word_without_supplement_qualifier_is_ignored():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_supplement_count('本文包含 4 个表格。') is None
+    assert detect_declared_table_range('本文包含 4 个表格。') == set()
+
+
+def test_h5_bare_table_count_expands_from_one():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_table_range('包含 5 个附表及相关数据。') == {'S1', 'S2', 'S3', 'S4', 'S5'}
+    assert detect_declared_supplement_count('包含 5 个附表及相关数据。') is None
+
+
+def test_h5_table_range_does_not_count_as_files():
+    from supp_finder import detect_declared_supplement_count, detect_declared_table_range
+    assert detect_declared_table_range('Tables S1-S3 in Supplementary Information') == {'S1', 'S2', 'S3'}
+    assert detect_declared_supplement_count('Tables S1-S3 in Supplementary Information') is None
+
+
+def test_h5_high_table_number_does_not_fake_incompleteness():
+    # A 'Table S99' that only exists inside a <script> block is not a visible
+    # declaration, and a high table number must never inflate the file count:
+    # 3 declared files with 3 candidates is complete.
+    html = ('<html><head><script>const ref = "Table S99";</script></head><body>'
+            '<section id="supplementary">3 Supplementary Files.'
+            '<a href="/a.xlsx">Table S1</a><a href="/b.xlsx">Table S2</a><a href="/c.xlsx">Table S3</a>'
+            '</section></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert not result.is_incomplete
+
+
+def test_h5_table_range_still_drives_missing_check():
+    html = '<section id="supplementary">Tables S1-S3<a href="/S1.xlsx">Table S1</a><a href="/S2.xlsx">Table S2</a></section>'
+    result = find_all_candidates(html, BASE)
+    assert result.is_incomplete and 'S3' in result.incomplete_reason
