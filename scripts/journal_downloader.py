@@ -612,7 +612,16 @@ def run_download(args, bsk_runtime):
     evidence = DiscoveryEvidence()
     evidence.observe("publisher", html_content, effective_base)
 
-    if (not candidates or diag.is_incomplete) and bsk_runtime.enabled and not args.wait_selector:
+    # H3: force a browser render when the static page shows dynamic
+    # signals (diag.needs_browser) but the candidate set is empty or the
+    # evidence check still reports missing files. The evidence verdict is
+    # used here, not supp_finder's own is_incomplete: the two can
+    # disagree (e.g. a singular "Additional file (7)" declaration is
+    # seen by the legacy evidence file count but not by the H5 file
+    # count). When the supplements are already complete, do not force.
+    _ev_inc, _ = evidence.check(candidates)
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or _ev_inc)
+    if (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector:
         try:
             retry_html, _, retry_url = fetch_page_via_browserskill(
                 fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
@@ -633,7 +642,10 @@ def run_download(args, bsk_runtime):
             print(f"  [Recovery] BrowserSkill: {exc}")
 
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
-    if diag.is_incomplete and not args.wait_selector and not args.browserskill:
+    # H3 (recomputed after any BSK retry above): diag.is_incomplete is
+    # the evidence verdict here, so the flag again follows the task rule.
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or diag.is_incomplete)
+    if (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill:
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)

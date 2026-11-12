@@ -829,3 +829,92 @@ def test_h9_bsk_download_leaves_no_staging_dir(tmp_path):
             assert sess.download("https://cdn.org/table.csv", str(output)) == str(output)
     assert output.read_bytes() == b"x,y\n1,2\n"
     assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".bsk-")]
+
+
+# ── H3 wiring: needs_browser forces a browser render ─────────────────────────
+
+# Singular "Additional file (7)": the legacy evidence file-count reading
+# (declared_file_count) sees 7 files, while the H5 file-count reading
+# (detect_declared_file_count) sees none -- so supp_finder's own
+# is_incomplete is False but the evidence check still reports missing
+# files. That is the exact gap the H3 wiring closes.
+_H3_FIRST_HTML = (
+    '<script type="application/json" id="__NEXT_DATA__">{"props":{"pageProps":{}}}</script>'
+    '<p>Additional file (7)</p>'
+    '<a href="/s1.xlsx">Supplementary Table S1</a>'
+)
+_H3_FULL_HTML = (
+    '<p>Additional file (7)</p>'
+    + ''.join(f'<a href="/s{i}.xlsx">Supplementary Table S{i}</a>' for i in range(1, 8))
+)
+
+
+def test_h3_wiring_journal_bsk_retry_fires_on_needs_browser(tmp_path, capsys):
+    """needs_browser + evidence still incomplete must force the BrowserSkill
+    retry even though supp_finder's own is_incomplete is False (1 of 5
+    declared files found). Before the wiring, the BSK retry condition only
+    looked at (not candidates or diag.is_incomplete) and never fired here."""
+    import journal_downloader as j
+
+    first = NS(url=BASE, status=200, text=_H3_FIRST_HTML, html_content=_H3_FIRST_HTML)
+    empty = NS(url=BASE, status=200, text='', html_content='')
+    diag0 = find_all_candidates(_H3_FIRST_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert diag0.is_incomplete is False  # the gap: static check looks fine
+    with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--bsk-auto', '--no-oa', '--list-only']), \
+         patch.object(j, 'load_saved_cookies', return_value=[]), \
+         patch.object(j.StealthyFetcher, 'fetch', side_effect=[first, empty]) as stealth, \
+         patch.object(j, 'fetch_page_via_browserskill', return_value=(_H3_FULL_HTML, None, BASE)) as bsk_fetch:
+        j.main()
+    out = capsys.readouterr().out
+    bsk_fetch.assert_called_once()
+    stealth.assert_called_once()  # no Stealthy retry needed after BSK succeeds
+    assert 's7.xlsx' in out
+
+
+def test_h3_wiring_journal_no_force_when_supplements_complete(tmp_path, capsys):
+    """needs_browser alone must NOT force a browser render when the
+    supplements are already complete (5 of 5 files found)."""
+    import journal_downloader as j
+
+    full = NS(url=BASE, status=200, text=_H3_FULL_HTML, html_content=_H3_FULL_HTML)
+    diag0 = find_all_candidates(
+        '<script type="application/json" id="__NEXT_DATA__">{"props":{}}</script>' + _H3_FULL_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert len(diag0.candidates) == 7
+    with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--bsk-auto', '--no-oa', '--list-only']), \
+         patch.object(j, 'load_saved_cookies', return_value=[]), \
+         patch.object(j.StealthyFetcher, 'fetch', return_value=full) as stealth, \
+         patch.object(j, 'fetch_page_via_browserskill', return_value=(_H3_FULL_HTML, None, BASE)) as bsk_fetch:
+        j.main()
+    out = capsys.readouterr().out
+    bsk_fetch.assert_not_called()
+    stealth.assert_called_once()
+    assert 's7.xlsx' in out
+
+
+def test_h3_wiring_scansci_page_scrape_forces_browser_render(tmp_path):
+    """_try_page_scrape_supplements must re-render in a browser when the
+    static page needs one and the evidence check still reports missing
+    files, even though supp_finder's own is_incomplete is False."""
+    import scansci_supp_downloader as a
+
+    diag0 = find_all_candidates(_H3_FIRST_HTML, BASE)
+    assert diag0.needs_browser is True
+    assert diag0.is_incomplete is False
+    args = NS(headful=False, browserskill=False, skip_cdn=True, max_mmc=25, max_misses=4)
+    fetch_calls = []
+
+    def fake_fetch(url, session=None, play_cookies=None, headful=False, force_browser=False, **kwargs):
+        fetch_calls.append(force_browser)
+        if force_browser:
+            return _H3_FULL_HTML, 200, BASE
+        return _H3_FIRST_HTML, 200, BASE
+
+    downloaded = []
+    with patch.object(a, '_setup_authenticated_session_and_cookies', return_value=(MagicMock(), [])), \
+         patch.object(a, 'fetch_page_html', side_effect=fake_fetch), \
+         patch.object(a, 'download_file', side_effect=lambda cand, *args_, **kw: downloaded.append(cand.url)):
+        a._try_page_scrape_supplements(BASE, str(tmp_path), {}, args, [])
+    assert fetch_calls == [False, True]
+    assert len(downloaded) == 7

@@ -1597,7 +1597,18 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         diag = find_all_candidates(html_content, effective_base, original_url=url)
 
         # Fallback to browser rendering if raw HTML yields no candidates or is incomplete
-        if (not diag.candidates or diag.is_incomplete) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
+        # H3: also force the render when the static page shows dynamic
+        # signals (diag.needs_browser) but the candidate set is empty or
+        # the evidence check still reports missing files. The evidence
+        # verdict is used here, not diag.is_incomplete alone: the two can
+        # disagree (e.g. a singular "Additional file (7)" declaration is
+        # seen by the legacy evidence file count but not by the H5 count).
+        # When the supplements are already complete, do not force.
+        _scrape_evidence = DiscoveryEvidence()
+        _scrape_evidence.observe("publisher", html_content, effective_base)
+        _scrape_inc, _ = _scrape_evidence.check(diag.candidates)
+        _needs_browser_retry = bool(diag.needs_browser) and (not diag.candidates or _scrape_inc)
+        if (not diag.candidates or diag.is_incomplete or _needs_browser_retry) and (HAS_SCRAPLING or (bsk_runtime and bsk_runtime.enabled)):
             print("    Raw HTML incomplete or blocked. Retrying with browser rendering for page scrape...")
             html_content_b, status_b, final_url_b = fetch_page_html(
                 url,
@@ -1909,8 +1920,13 @@ def run_download(args, bsk_runtime):
     evidence.observe("publisher", html_content, effective_base)
 
     # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
+    # H3: also force a browser render when the static page shows dynamic
+    # signals (diag.needs_browser) but the candidate set is empty or the
+    # evidence check still reports missing files. When the supplements
+    # are already complete, do not force.
     is_inc, inc_reason = evidence.check(candidates)
-    if (not candidates or is_inc) and HAS_SCRAPLING and session and not args.browserskill:
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
             url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
@@ -1932,7 +1948,9 @@ def run_download(args, bsk_runtime):
     is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
-    if (args.cdp or args.cdp_url) and (not candidates or is_inc) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
+    # H3: needs_browser also forces the probe (same rule as above).
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -1971,7 +1989,9 @@ def run_download(args, bsk_runtime):
     is_inc, inc_reason = evidence.check(candidates)
 
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
-    if (not candidates or is_inc) and bsk_runtime.enabled:
+    # H3: needs_browser also forces the probe (same rule as above).
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
+    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled:
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
