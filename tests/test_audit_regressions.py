@@ -1,5 +1,6 @@
 """Behavioral regressions for the supplementary completeness audit."""
 import sys
+import os
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock, Mock, patch
@@ -10,6 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 from supp_finder import Candidate, find_all_candidates, validate_downloaded_file
 from repository_resolver import expand_repository_candidates
+from archive_fixture import office_archive
 
 BASE = 'https://journal.example/article'
 
@@ -509,3 +511,129 @@ def test_h1_fetch_page_html_accepts_unknown_status_and_falls_back_on_blocked():
         html, status, final = a.fetch_page_html("https://example.org/article", session=session, use_bsk=True)
         assert html == good_html
         assert status == 200
+
+
+# ── H2: Tier 0 failure classification ────────────────────────────────────────
+
+def _h2_office_get():
+    def fake_get(url, timeout=30, stream=True):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-disposition": ""}
+        resp.iter_content = MagicMock(return_value=[office_archive()])
+        return resp
+    return fake_get
+
+
+def test_h2_transient_head_errors_do_not_count_as_misses(tmp_path):
+    """429 / timeout HEAD probes must not count toward consecutive misses:
+    mmc1-mmc4 rate-limited, mmc5 exists -> mmc5 must still be found."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc5.xlsx" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "2048"}
+        elif "mmc1." in url or "mmc2." in url or "mmc3." in url or "mmc4." in url:
+            resp.status_code = 429
+            resp.headers = {"retry-after": "0"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep") as sleep:
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=10, max_consecutive_misses=4)
+        basenames = [os.path.basename(f) for f in files]
+        assert "mmc5.xlsx" in basenames
+        assert sleep.called  # transient probes were retried with backoff
+
+
+def test_h2_timeout_head_probes_do_not_stop_the_scan(tmp_path):
+    """HEAD timeouts must not count as misses either."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+    import requests as _requests
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        if "mmc5.xlsx" in url:
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {"content-length": "2048"}
+            return resp
+        if any(f"mmc{n}." in url for n in (1, 2, 3, 4)):
+            raise _requests.exceptions.Timeout("timed out")
+        resp = MagicMock()
+        resp.status_code = 404
+        resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=10, max_consecutive_misses=4)
+        assert "mmc5.xlsx" in [os.path.basename(f) for f in files]
+
+
+def test_h2_retry_after_header_is_respected(tmp_path):
+    """A 429 with Retry-After must be retried after that delay, then succeed."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    calls = {"n": 0}
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.xlsx" in url:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                resp.status_code = 429
+                resp.headers = {"retry-after": "2"}
+                return resp
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+            return resp
+        resp.status_code = 404
+        resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep") as sleep:
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=3, max_consecutive_misses=2)
+        assert "mmc1.xlsx" in [os.path.basename(f) for f in files]
+        assert calls["n"] == 3
+        assert any(call.args and call.args[0] == 2 for call in sleep.call_args_list)
+
+
+def test_h2_extensions_come_from_data_extensions(tmp_path):
+    """Tier 0 must probe DATA_EXTENSIONS formats the old 15-item list
+    missed (.parquet/.ipynb) and composite extensions (.tar.gz)."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+    from supp_finder import DATA_EXTENSIONS
+
+    assert ".parquet" in DATA_EXTENSIONS and ".ipynb" in DATA_EXTENSIONS and ".tar.gz" in DATA_EXTENSIONS
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.parquet" in url or "mmc1.ipynb" in url or "mmc1.tar.gz" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=_h2_office_get()), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=3, max_consecutive_misses=2)
+        basenames = [os.path.basename(f) for f in files]
+        assert "mmc1.parquet" in basenames
+        assert "mmc1.ipynb" in basenames
+        assert "mmc1.tar.gz" in basenames

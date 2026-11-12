@@ -791,6 +791,7 @@ def try_elsevier_cdn_brute_force(
     max_mmc=25,
     max_consecutive_misses=4,
     known_mmcs=None,
+    max_head_retries=2,
 ):
     """
     Elsevier hosts supplement files on a public CDN at:
@@ -799,12 +800,28 @@ def try_elsevier_cdn_brute_force(
     discard small files under 1 KB.
     Probes sequential MMC numbers, handles gaps without redundant requests,
     and directly targets known MMC numbers beyond default limits.
+
+    H2 failure classification: only a definitive miss (404, or another
+    non-transient 4xx for every probed extension) counts toward
+    consecutive misses. 429 / 403 / 5xx / timeouts / connection errors are
+    transient: they are retried with exponential backoff (up to
+    max_head_retries retries, respecting any Retry-After header) and, if
+    still unresolved, leave the MMC as "unknown" -- neither a hit nor a
+    miss -- so a rate-limited CDN can no longer stop the scan early.
     """
     if not pii:
         return []
 
     base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
-    exts = ["xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt", "7z", "rar", "gz", "tsv", "cif", "h5"]
+    # H2: extensions come from supp_finder.DATA_EXTENSIONS (the same source
+    # Tier A uses), plus .pdf which Tier 0 historically probed. Composite
+    # extensions such as .tar.gz are kept whole ("tar.gz") so the probe URL
+    # becomes ...-mmcN.tar.gz, not ...-mmcN.tar. Deterministic order:
+    # common supplement formats first, then the rest alphabetically.
+    _tier0_priority = ("xlsx", "xls", "csv", "docx", "doc", "pdf", "zip", "pptx", "txt")
+    _all_exts = {e.lstrip(".") for e in DATA_EXTENSIONS} | {"pdf"}
+    exts = [e for e in _tier0_priority if e in _all_exts]
+    exts += sorted(_all_exts - set(exts))
     found_files = []
     probed_mmcs = set()
     manifest = load_download_manifest(output_dir)
@@ -816,31 +833,69 @@ def try_elsevier_cdn_brute_force(
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
-    def _probe_single_mmc(i: int) -> bool:
+    def _retry_delay(headers, attempt):
+        """Backoff before retry number *attempt* (1-based). A Retry-After
+        header (seconds) wins over the exponential default; capped at 30s."""
+        raw = None
+        try:
+            raw = {k.lower(): v for k, v in (headers or {}).items()}.get("retry-after")
+        except Exception:
+            raw = None
+        if raw is not None:
+            try:
+                delay = float(raw)
+                if delay >= 0:
+                    return min(delay, 30.0)
+            except (TypeError, ValueError):
+                pass
+        return min(0.5 * (2 ** (attempt - 1)), 8.0)
+
+    def _check_ext(ext, mmc_num):
+        """HEAD-probe one extension of one MMC number. Returns
+        (ext, url, size, outcome) where outcome is "hit" (200), "miss"
+        (404 / other non-transient 4xx) or "transient" (429 / 403 / 5xx /
+        timeout / connection error still unresolved after
+        max_head_retries retries)."""
+        url = f"{base}-mmc{mmc_num}.{ext}"
+        headers = {}
+        for attempt in range(max_head_retries + 1):
+            try:
+                resp = session.head(url, timeout=10, allow_redirects=True)
+            except Exception:
+                outcome = "transient"
+            else:
+                headers = resp.headers or {}
+                code = resp.status_code
+                if code == 200:
+                    size = int(resp.headers.get("content-length", 0))
+                    return ext, url, size, "hit"
+                if code == 404:
+                    return ext, url, None, "miss"
+                if code in (403, 429) or code >= 500:
+                    outcome = "transient"
+                else:
+                    return ext, url, None, "miss"
+            if attempt < max_head_retries:
+                time.sleep(_retry_delay(headers, attempt + 1))
+        return ext, url, None, "transient"
+
+    def _probe_single_mmc(i: int) -> str:
+        """Probe one MMC number. Returns "hit", "miss" or "unknown".
+        "unknown" means at least one extension stayed transient with no
+        hit: the file may exist, so the caller must not count it as a miss.
+        """
         probed_mmcs.add(i)
         found_any = False
 
-        def _check_ext(ext):
-            url = f"{base}-mmc{i}.{ext}"
-            try:
-                resp = session.head(url, timeout=10, allow_redirects=True)
-                if resp.status_code == 200:
-                    size = int(resp.headers.get("content-length", 0))
-                    return ext, url, size
-            except requests.exceptions.Timeout:
-                pass
-            except Exception:
-                pass
-            return ext, url, None
-
         # Probe all candidate extensions concurrently
         with ThreadPoolExecutor(max_workers=min(len(exts), 8)) as executor:
-            future_to_ext = {executor.submit(_check_ext, ext): ext for ext in exts}
-            hits = []
+            future_to_ext = {executor.submit(_check_ext, ext, i): ext for ext in exts}
+            results = []
             for future in as_completed(future_to_ext):
-                ext, url, size = future.result()
-                if size is not None:
-                    hits.append((ext, url, size))
+                results.append(future.result())
+
+        hits = [(ext, url, size) for ext, url, size, outcome in results if outcome == "hit"]
+        saw_transient = any(outcome == "transient" for *_, outcome in results)
 
         # Sort hits by order of exts list for deterministic behavior
         hits.sort(key=lambda x: exts.index(x[0]))
@@ -905,19 +960,27 @@ def try_elsevier_cdn_brute_force(
                 if os.path.exists(filepath):
                     os.remove(filepath)
                 print(f"FAIL ({e})")
-        return found_any
+        # A HEAD hit means the file exists even if the follow-up GET
+        # download itself failed, so it still counts as a hit (not a miss).
+        if found_any or hits:
+            return "hit"
+        if saw_transient:
+            return "unknown"
+        return "miss"
 
-    # Phase 1: Sequential scan from 1 up to max_mmc
+    # Phase 1: Sequential scan from 1 up to max_mmc. Only consecutive
+    # "miss" outcomes stop the scan; "unknown" (transient) outcomes leave
+    # the counter untouched, and a "hit" resets it.
     consecutive_misses = 0
     scanned_count = 0
     stop_reason = ""
 
     for i in range(1, max_mmc + 1):
         scanned_count = i
-        hit = _probe_single_mmc(i)
-        if hit:
+        outcome = _probe_single_mmc(i)
+        if outcome == "hit":
             consecutive_misses = 0
-        else:
+        elif outcome == "miss":
             consecutive_misses += 1
             if consecutive_misses >= max_consecutive_misses:
                 stop_reason = f"{max_consecutive_misses} consecutive misses after mmc{i}"
@@ -932,18 +995,27 @@ def try_elsevier_cdn_brute_force(
         if k in probed_mmcs:
             continue
         print(f"  [Tier 0] Probing known MMC mmc{k} ...")
-        hit = _probe_single_mmc(k)
-        if hit:
+        outcome = _probe_single_mmc(k)
+        if outcome == "hit":
             follow_misses = 0
+            follow_unknowns = 0
             cur = k + 1
             while follow_misses < max_consecutive_misses and cur <= 999:
                 if cur in probed_mmcs:
                     break
-                follow_hit = _probe_single_mmc(cur)
-                if follow_hit:
+                follow_outcome = _probe_single_mmc(cur)
+                if follow_outcome == "hit":
                     follow_misses = 0
-                else:
+                    follow_unknowns = 0
+                elif follow_outcome == "miss":
                     follow_misses += 1
+                else:
+                    # Unknown: do not count as a miss, but stop following
+                    # after that many in a row so a persistently
+                    # rate-limited CDN cannot drag the scan out to mmc999.
+                    follow_unknowns += 1
+                    if follow_unknowns >= max_consecutive_misses:
+                        break
                 cur += 1
 
     total_probed = len(probed_mmcs)
