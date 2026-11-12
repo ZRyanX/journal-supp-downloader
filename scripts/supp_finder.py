@@ -314,6 +314,10 @@ class FindingDiagnostics:
     candidates: List[Candidate] = field(default_factory=list)
     excluded_links: List[Tuple[str, str]] = field(default_factory=list)
     strategy_counts: Dict[str, int] = field(default_factory=dict)
+    # H3: static parsing could not settle the page; a browser render is
+    # needed (supplementary heading/section with no candidates, or inline
+    # JSON such as __NEXT_DATA__ from which no URL was parsed).
+    needs_browser: bool = False
 
 
 # ── URL & Filename Utilities ─────────────────────────────────────────────────
@@ -1417,6 +1421,36 @@ def _parent_direct_table_ids(tag) -> Set[str]:
     return supplementary_table_ids(direct_text)
 
 
+# Inline JSON payloads whose URLs static parsing may miss (H3).
+_INLINE_JSON_MARKERS = ("__NEXT_DATA__", "__INITIAL_STATE__", "__NUXT__", "__PRELOADED_STATE__")
+
+_SUPP_SIGNAL_KEYWORDS = (
+    "supplement", "suppl", "appendix", "supporting-info", "supporting_info",
+    "esm", "additional-file", "extended-data", "extended_data",
+    "补充", "附表", "附录", "支撑材料",
+)
+
+
+def _page_has_supplementary_signal(soup) -> bool:
+    """True when the page shows a supplementary heading, section, or collapsed control (H3)."""
+    for el in soup.find_all(["section", "div", "aside", "details", "figure"]):
+        ident = (el.get("id", "") + " " + " ".join(el.get("class", []))).lower()
+        if any(kw in ident for kw in _SUPP_SIGNAL_KEYWORDS):
+            return True
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if SUPP_KEYWORD_PATTERN.search(heading.get_text(" ", strip=True) or ""):
+            return True
+    for el in soup.find_all(["button", "a", "summary"]):
+        text = " ".join([
+            el.get_text(" ", strip=True) or "",
+            str(el.get("aria-label") or ""),
+            str(el.get("title") or ""),
+        ])
+        if SUPP_KEYWORD_PATTERN.search(text):
+            return True
+    return False
+
+
 def find_all_candidates(
     html_content: str,
     base_url: str,
@@ -1656,6 +1690,17 @@ def find_all_candidates(
     is_inc, inc_reason = is_result_obviously_incomplete(candidates, soup, diag.declared_count)
     diag.is_incomplete = is_inc
     diag.incomplete_reason = inc_reason
+
+    # ── H3: dynamic 'not loaded' signal ───────────────────────────────────
+    # Supplementary heading/section present but nothing extracted, or inline
+    # JSON (__NEXT_DATA__ / __INITIAL_STATE__ / ...) present but no URL was
+    # parsed out of it: static parsing cannot settle the page, so a browser
+    # render is needed. Callers should treat this as a must-render signal.
+    embedded_found = any(c.match_rule.startswith("embedded_") for c in candidates)
+    has_inline_json = any(marker in html_content for marker in _INLINE_JSON_MARKERS)
+    diag.needs_browser = (not candidates and _page_has_supplementary_signal(soup)) or (
+        has_inline_json and not embedded_found
+    )
 
     return diag
 
@@ -2877,59 +2922,118 @@ def extract_article_title(page_or_html, default: str = "unknown_article") -> str
     return title or default
 
 
+# JS: count links that look like supplementary downloads (M13 settle signal).
+_SUPP_LINK_COUNT_JS = """() => {
+    return document.querySelectorAll(
+        "a[href*='supp'], a[href*='mmc'], a[href*='esm'], " +
+        "a[href$='.xlsx'], a[href$='.xls'], a[href$='.csv'], a[href$='.zip'], " +
+        "[data-test*='supplementary'], [data-test*='source-data']"
+    ).length;
+}"""
+
+# JS: open closed <details> and click collapsed supplementary triggers (M13).
+# Scrolling is driven from Python (segmented scroll) instead of here.
+_ACCORDION_CLICK_JS = """() => {
+    let clicked = 0;
+    // 1. Open only closed <details> elements (and do not click their <summary> afterward)
+    document.querySelectorAll('details:not([open])').forEach(d => {
+        d.open = true;
+        clicked++;
+    });
+
+    // 2. Click collapsed buttons, tabs, or accordion triggers matching supplementary keywords
+    const suppKeywords = [
+        'supp', 'appendi', 'extended', 'additional', 'data',
+        'table', 'material', 'source', 'esm', 'file',
+        '附', '补充', '支撑'
+    ];
+    const selectors = [
+        'button[aria-expanded="false"]',
+        'a[aria-expanded="false"]',
+        '[role="button"][aria-expanded="false"]',
+        '[role="tab"][aria-expanded="false"]',
+        '[data-toggle="collapse"]:not([aria-expanded="true"])',
+        '.accordion-header:not([aria-expanded="true"])',
+        '.accordion-button.collapsed',
+        '.accordion-button[aria-expanded="false"]'
+    ].join(', ');
+    document.querySelectorAll(selectors).forEach(el => {
+        if (el.getAttribute('aria-expanded') === 'true') return;
+        if (el.classList && (el.classList.contains('active') || el.classList.contains('is-open'))) return;
+        if (el.tagName && el.tagName.toLowerCase() === 'summary') {
+            const parentDetails = el.closest('details');
+            if (parentDetails && parentDetails.open) return;
+        }
+        const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+        if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(text)) return;
+        const idClass = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
+        if (suppKeywords.some(kw => text.includes(kw) || idClass.includes(kw))) {
+            try { el.click(); clicked++; } catch (e) {}
+        }
+    });
+    return clicked;
+}"""
+
+
+def _js_int(page, expr: str, default: int = 0) -> int:
+    """Evaluate a JS expression returning an int; default when unavailable (M13)."""
+    try:
+        return int(page.evaluate(expr))
+    except Exception:
+        return default
+
+
 def expand_page_accordions_action(page):
-    """Playwright page action for Scrapling: expand details, tabs, and accordion panels without re-closing open ones."""
+    """Playwright page action for Scrapling: expand details, tabs, and accordion panels without re-closing open ones.
+
+    M13: after expanding, scroll to the bottom in viewport-sized segments
+    (pausing at each step so lazy loading can trigger), then wait until the
+    DOM settles -- the supplementary-link count must stay unchanged across
+    two consecutive polls -- with a bounded total wait (~5s) instead of a
+    single fixed 600-1000ms sleep. The caller signature is unchanged.
+    """
     try:
         clicked_count = 0
-        if hasattr(page, "evaluate"):
-            clicked_count = page.evaluate("""() => {
-                let clicked = 0;
-                // 1. Open only closed <details> elements (and do not click their <summary> afterward)
-                document.querySelectorAll('details:not([open])').forEach(d => {
-                    d.open = true;
-                    clicked++;
-                });
-
-                // 2. Click collapsed buttons, tabs, or accordion triggers matching supplementary keywords
-                const suppKeywords = [
-                    'supp', 'appendi', 'extended', 'additional', 'data',
-                    'table', 'material', 'source', 'esm', 'file',
-                    '附', '补充', '支撑'
-                ];
-                const selectors = [
-                    'button[aria-expanded="false"]',
-                    'a[aria-expanded="false"]',
-                    '[role="button"][aria-expanded="false"]',
-                    '[role="tab"][aria-expanded="false"]',
-                    '[data-toggle="collapse"]:not([aria-expanded="true"])',
-                    '.accordion-header:not([aria-expanded="true"])',
-                    '.accordion-button.collapsed',
-                    '.accordion-button[aria-expanded="false"]'
-                ].join(', ');
-                document.querySelectorAll(selectors).forEach(el => {
-                    if (el.getAttribute('aria-expanded') === 'true') return;
-                    if (el.classList && (el.classList.contains('active') || el.classList.contains('is-open'))) return;
-                    if (el.tagName && el.tagName.toLowerCase() === 'summary') {
-                        const parentDetails = el.closest('details');
-                        if (parentDetails && parentDetails.open) return;
-                    }
-                    const text = (el.innerText || el.textContent || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
-                    if (/delete|remove|edit|upload|publish|purchase|删除|移除|编辑|上传|发布|购买/i.test(text)) return;
-                    const idClass = ((el.id || '') + ' ' + (typeof el.className === 'string' ? el.className : '')).toLowerCase();
-                    if (suppKeywords.some(kw => text.includes(kw) || idClass.includes(kw))) {
-                        try { el.click(); clicked++; } catch (e) {}
-                    }
-                });
-
-                // 3. Scroll down to trigger lazy loading
-                try {
-                    window.scrollTo(0, document.body.scrollHeight / 2);
-                    window.scrollTo(0, document.body.scrollHeight);
-                } catch (e) {}
-                return clicked;
-            }""")
-        if hasattr(page, "wait_for_timeout"):
+        has_evaluate = hasattr(page, "evaluate")
+        has_wait = hasattr(page, "wait_for_timeout")
+        if has_evaluate:
+            clicked_count = _js_int(page, _ACCORDION_CLICK_JS, 0)
+        if not has_wait:
+            return
+        if not has_evaluate:
+            # No JS evaluation available: keep the old fixed wait.
             page.wait_for_timeout(1000 if clicked_count else 600)
+            return
+        # Segmented scroll to the bottom to trigger lazy loading.
+        height = _js_int(page, "() => (document.body ? document.body.scrollHeight : 0)", 0)
+        viewport = _js_int(page, "() => (window.innerHeight || 800)", 800)
+        if height > 0 and viewport > 0:
+            pos = 0
+            while pos < height:
+                pos += viewport
+                try:
+                    page.evaluate(f"() => window.scrollTo(0, {min(pos, height)})")
+                except Exception:
+                    break
+                page.wait_for_timeout(250)
+            try:
+                page.evaluate(f"() => window.scrollTo(0, {height})")
+            except Exception:
+                pass
+        # Debounced settle wait: stop once the supplementary-link count is
+        # stable across two polls; give up after 10 polls (~5s).
+        prev_count = None
+        stable_polls = 0
+        for _ in range(10):
+            count = _js_int(page, _SUPP_LINK_COUNT_JS, -1)
+            if count == prev_count:
+                stable_polls += 1
+                if stable_polls >= 1:
+                    break
+            else:
+                stable_polls = 0
+                prev_count = count
+            page.wait_for_timeout(500)
     except Exception:
         pass
 

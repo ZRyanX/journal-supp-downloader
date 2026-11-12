@@ -312,3 +312,73 @@ def test_h6_old_string_manifest_still_loads(tmp_path):
     save_download_manifest(str(tmp_path), {'S1.xlsx': 'https://journal.example/S1.xlsx'})
     loaded = load_download_manifest(str(tmp_path))
     assert manifest_entry_url(loaded['S1.xlsx']) == 'https://journal.example/S1.xlsx'
+
+
+# ── P0 H3: dynamic 'not loaded' signal + M13 settle/scroll ──
+
+def test_h3_supp_heading_without_candidates_needs_browser():
+    html = '<section id="supplementary"><h2>Supplementary Material</h2><p>Loading...</p></section>'
+    result = find_all_candidates(html, BASE)
+    assert result.candidates == []
+    assert result.needs_browser is True
+
+
+def test_h3_next_data_without_parsed_url_needs_browser():
+    html = ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            '{"props": {"pageProps": {"article": {"title": "Test"}}}}</script></head><body></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert result.needs_browser is True
+
+
+def test_h3_next_data_with_parsed_url_does_not_need_browser():
+    html = ('<html><head><script id="__NEXT_DATA__" type="application/json">'
+            '{"supplementaryMaterials": [{"fileName": "Supplementary_Table_S1.xlsx", "downloadUrl": "/api/dl/1"}]}'
+            '</script></head><body></body></html>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert result.needs_browser is False
+
+
+def test_h3_plain_page_with_candidates_does_not_need_browser():
+    result = find_all_candidates('<section id="supplementary"><a href="/S1.xlsx">Table S1</a></section>', BASE)
+    assert result.needs_browser is False
+
+
+def test_h3_plain_page_without_signals_does_not_need_browser():
+    result = find_all_candidates('<html><body><p>Results text.</p></body></html>', BASE)
+    assert result.needs_browser is False
+
+
+def test_h3_accordion_action_scrolls_in_segments_and_waits_for_settle():
+    import re
+    from supp_finder import expand_page_accordions_action
+
+    class FakePage:
+        def __init__(self):
+            self.scrolls = []
+            self.waits = []
+            self._count_calls = 0
+
+        def evaluate(self, js):
+            if 'scrollTo' in js:
+                m = re.search(r'scrollTo\(0, (\d+)\)', js)
+                self.scrolls.append(int(m.group(1)) if m else 0)
+                return None
+            if 'scrollHeight' in js:
+                return 2500
+            if 'innerHeight' in js:
+                return 1000
+            if 'querySelectorAll' in js:
+                self._count_calls += 1
+                return 3 if self._count_calls > 2 else self._count_calls
+            return 1  # clicked count
+
+        def wait_for_timeout(self, ms):
+            self.waits.append(ms)
+
+    page = FakePage()
+    expand_page_accordions_action(page)
+    # Segmented scroll to the bottom in viewport steps, then a final scroll to the bottom.
+    assert page.scrolls == [1000, 2000, 2500, 2500]
+    # Settle polling ran (counts 1, 2, 3, then stable 3) instead of one fixed sleep.
+    assert len(page.waits) >= 4
