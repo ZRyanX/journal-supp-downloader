@@ -734,11 +734,16 @@ def run_download(args, bsk_runtime):
 
     # --- Step 3: Download files ---
     print(f"\n[3/3] Downloading {len(candidates)} file(s)...")
+    # H8: no separate transport exists at this call site -- download_file
+    # already cascades Fetcher -> requests -> BrowserSkill internally, so
+    # there is no distinct retry_download to wire in. A transient failure
+    # therefore retries the same download once, with backoff
+    # (max_retries=1); a bare None/False with no reason is not retried.
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime,
                                    referer=cand.source_url or final_url),
-        mirrors, expand_repository_candidates)
+        mirrors, expand_repository_candidates, max_retries=1)
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
     incomplete, reason = evidence.check(successful)

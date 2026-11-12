@@ -2101,11 +2101,17 @@ def run_download(args, bsk_runtime):
     # Download files
     os.makedirs(article_dir, exist_ok=True)
     print(f"\n  Downloading {len(candidates)} file(s)...")
+    # H8: no separate transport exists at this call site -- download_file
+    # already cascades requests -> Scrapling -> BrowserSkill ->
+    # StealthySession -> curl internally, so there is no distinct
+    # retry_download to wire in. A transient failure therefore retries
+    # the same download once, with backoff (max_retries=1); a bare
+    # None/False with no reason is not retried.
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, session, play_cookies,
                                    bsk_runtime=bsk_runtime, referer=cand.source_url or url),
-        mirrors, expand_repository_candidates)
+        mirrors, expand_repository_candidates, max_retries=1)
     success_count = len(successful)
     incomplete, reason = evidence.check(successful)
     if incomplete:

@@ -94,3 +94,211 @@ def test_h7_empty_observe_records_nothing():
     assert evidence.pages == {}
     assert evidence.tables == set()
     assert evidence.files_by_source == {}
+
+
+# ── H8: recovery splits on failure reason ──────────────────────────────────
+
+class _Mirrors:
+    """Minimal stand-in for MirrorDiscovery: discover() returns preset items."""
+    def __init__(self, items=()):
+        self.items = list(items)
+        self.calls = 0
+
+    def discover(self):
+        self.calls += 1
+        return list(self.items)
+
+
+def _cand_url(url, table_id='S1'):
+    return Candidate(url=url, filename=f'{table_id}.xlsx',
+                     link_text=f'Table {table_id}',
+                     covered_table_ids={table_id})
+
+
+def test_h8_transient_tuple_failure_retries_via_alternate_transport():
+    sleeps = []
+    calls = {'download': 0, 'retry': 0}
+
+    def download(cand):
+        calls['download'] += 1
+        return (False, 'HTTP 429 Too Many Requests')
+
+    def retry_download(cand):
+        calls['retry'] += 1
+        return True
+
+    ok, attempted = download_with_recovery(
+        [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+        retry_download=retry_download, sleep=sleeps.append)
+    assert [c.url for c in ok] == [BASE + '/s1.xlsx']
+    assert attempted == 1
+    assert calls == {'download': 1, 'retry': 1}
+    assert sleeps == [0.5]
+
+
+def test_h8_transient_exception_retries_with_exponential_backoff():
+    sleeps = []
+    attempts = {'retry': 0}
+
+    def download(cand):
+        raise TimeoutError('timed out')
+
+    def retry_download(cand):
+        attempts['retry'] += 1
+        if attempts['retry'] < 2:
+            raise ConnectionResetError('connection reset by peer')
+        return (True, 'ok')
+
+    ok, _ = download_with_recovery(
+        [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+        retry_download=retry_download, sleep=sleeps.append)
+    assert len(ok) == 1
+    assert attempts['retry'] == 2
+    assert sleeps == [0.5, 1.0]
+
+
+def test_h8_deterministic_failures_are_never_retried():
+    for reason in ('HTTP 404 Not Found', 'validation failed: not a zip file', 404):
+        calls = {'download': 0, 'retry': 0}
+
+        def download(cand, _calls=calls):
+            _calls['download'] += 1
+            return (False, reason)
+
+        def retry_download(cand, _calls=calls):
+            _calls['retry'] += 1
+            return True
+
+        ok, _ = download_with_recovery(
+            [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+            retry_download=retry_download, sleep=lambda s: None)
+        assert ok == []
+        assert calls == {'download': 1, 'retry': 0}
+
+
+def test_h8_unclassified_bare_failure_is_not_retried():
+    calls = {'download': 0, 'retry': 0}
+
+    def download(cand):
+        calls['download'] += 1
+        return False  # no reason reported: cannot be proven transient
+
+    def retry_download(cand):
+        calls['retry'] += 1
+        return True
+
+    ok, _ = download_with_recovery(
+        [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+        retry_download=retry_download, sleep=lambda s: None)
+    assert ok == []
+    assert calls == {'download': 1, 'retry': 0}
+
+
+def test_h8_no_alternate_transport_retries_same_download_once():
+    sleeps = []
+    calls = {'n': 0}
+
+    def download(cand):
+        calls['n'] += 1
+        if calls['n'] == 1:
+            return (False, 'HTTP 503 Service Unavailable')
+        return True
+
+    ok, _ = download_with_recovery(
+        [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+        sleep=sleeps.append)
+    assert len(ok) == 1
+    assert calls['n'] == 2
+    assert sleeps == [0.5]
+
+
+def test_h8_transient_failure_is_reattempted_in_the_mirror_round():
+    # Old code skipped any URL already in `attempted`; a transient failure
+    # that exhausts its retries must still get a fresh attempt when the
+    # mirror round re-discovers the same URL.
+    calls = {'n': 0}
+    cand = _cand_url(BASE + '/s1.xlsx')
+
+    def download(c):
+        calls['n'] += 1
+        return (False, 'HTTP 429')
+
+    ok, _ = download_with_recovery(
+        [cand], download, _Mirrors([cand]), list,
+        sleep=lambda s: None)
+    # Round 1: initial + 1 same-download retry; round 2: the re-discovered
+    # alternative is attempted again (initial + 1 retry).
+    assert calls['n'] == 4
+    assert ok == []
+
+
+def test_h8_failure_reasons_are_recorded_and_printed(capsys):
+    failures = {}
+
+    def download(cand):
+        return (False, 'HTTP 404 Not Found')
+
+    ok, _ = download_with_recovery(
+        [_cand_url(BASE + '/s1.xlsx')], download, _Mirrors(), list,
+        sleep=lambda s: None, failures=failures)
+    assert ok == []
+    assert failures == {BASE + '/s1.xlsx': 'HTTP 404 Not Found'}
+    assert 'HTTP 404' in capsys.readouterr().out
+
+
+def test_h8_mirror_rediscover_reprobes_after_failure():
+    from oa_resolver import OAResult
+    mirror_url = 'https://mirror.example/article'
+    mirror_html = ('<section id="supplementary">'
+                   '<a href="/s3.xlsx">Table S3</a></section>')
+    evidence = DiscoveryEvidence()
+    attempts = {'n': 0}
+
+    def fetch(url):
+        attempts['n'] += 1
+        if attempts['n'] == 1:
+            raise ConnectionError('connection reset by peer')
+        return mirror_html, 200, url
+
+    mirrors = MirrorDiscovery('10.1234/article', True,
+                              lambda doi: OAResult(oa_landing_urls=[mirror_url]),
+                              fetch, evidence)
+    assert mirrors.discover() == []
+    assert mirror_url in mirrors.failures
+    assert 'ConnectionError' in mirrors.failures[mirror_url]
+    # A second plain discover() returns the memoized empty result.
+    assert mirrors.discover() == []
+    assert attempts['n'] == 1
+    # rediscover(force=True) re-probes and recovers the candidate.
+    found = mirrors.rediscover()
+    assert [c.url for c in found] == ['https://mirror.example/s3.xlsx']
+    assert mirror_url not in mirrors.failures
+    assert attempts['n'] == 2
+
+
+def test_h8_mirror_none_status_uses_page_fetch_is_failure():
+    from oa_resolver import OAResult
+    mirror_url = 'https://mirror.example/article'
+    good_html = ('<section id="supplementary">'
+                 '<a href="/s1.xlsx">Table S1</a></section>')
+    blocked_html = '<html><title>Just a moment</title><body>checking</body></html>'
+    evidence = DiscoveryEvidence()
+
+    def fetch_blocked(url):
+        return blocked_html, None, url
+
+    mirrors = MirrorDiscovery('10.1234/article', True,
+                              lambda doi: OAResult(oa_landing_urls=[mirror_url]),
+                              fetch_blocked, evidence)
+    assert mirrors.discover() == []
+    assert mirrors.failures[mirror_url] == 'blocked page (challenge/login)'
+
+    def fetch_good(url):
+        return good_html, None, url
+
+    mirrors2 = MirrorDiscovery('10.1234/article', True,
+                               lambda doi: OAResult(oa_landing_urls=[mirror_url]),
+                               fetch_good, evidence)
+    found = mirrors2.discover()
+    assert [c.url for c in found] == ['https://mirror.example/s1.xlsx']
+    assert mirror_url not in mirrors2.failures
