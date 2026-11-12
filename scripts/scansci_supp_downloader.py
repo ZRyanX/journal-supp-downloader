@@ -86,6 +86,10 @@ from supp_finder import (
     migrate_or_merge_article_dir,
     is_blocked_page,
     page_fetch_is_failure,
+    temp_path_for,
+    commit_temp_file,
+    discard_temp_file,
+    write_bytes_chunked,
 )
 
 try:
@@ -731,6 +735,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                 continue
 
         print(f"  [API→CDN] {fname} ...", end=" ", flush=True)
+        tmp_path = None
         try:
             dl_resp = dl_session.get(url, timeout=60, stream=True)
             if dl_resp.status_code == 200:
@@ -747,33 +752,37 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                             found_files.append(filepath)
                             continue
 
+                # H9: stream to a same-directory temp file, validate it,
+                # then commit with os.replace; the final path never holds
+                # a partial file.
                 os.makedirs(output_dir, exist_ok=True)
-                with open(filepath, "wb") as f:
+                tmp_path = temp_path_for(filepath)
+                with open(tmp_path, "wb") as f:
                     for chunk in dl_resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
 
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     response_status=dl_resp.status_code,
                     headers=dl_resp.headers
                 )
                 if is_val:
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
                     actual_size = os.path.getsize(filepath)
                     print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
                     record_manifest_entry(manifest, fname, url)
                     save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
                     print(f"FAIL ({reason})")
             else:
                 print(f"FAIL (HTTP {dl_resp.status_code})")
         except Exception as e:
-            if os.path.exists(filepath):
-                os.remove(filepath)
             print(f"FAIL ({e})")
+        finally:
+            discard_temp_file(tmp_path)
 
     total_time = time.time() - t0
     if found_files:
@@ -913,8 +922,9 @@ def try_elsevier_cdn_brute_force(
                     found_any = True
                     continue
 
-            # Download the file
+            # Download the file (H9: temp file -> validate -> os.replace)
             print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
+            tmp_path = None
             try:
                 dl_resp = session.get(url, timeout=30, stream=True)
                 if dl_resp.status_code == 200:
@@ -933,17 +943,20 @@ def try_elsevier_cdn_brute_force(
                                 continue
 
                     os.makedirs(output_dir, exist_ok=True)
-                    with open(filepath, "wb") as f:
+                    tmp_path = temp_path_for(filepath)
+                    with open(tmp_path, "wb") as f:
                         for chunk in dl_resp.iter_content(chunk_size=8192):
                             if chunk:
                                 f.write(chunk)
 
                     is_val, reason = validate_downloaded_file(
-                        filepath,
+                        tmp_path,
                         response_status=dl_resp.status_code,
                         headers=dl_resp.headers
                     )
                     if is_val:
+                        commit_temp_file(tmp_path, filepath)
+                        tmp_path = None
                         actual_size = os.path.getsize(filepath)
                         print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
                         record_manifest_entry(manifest, fname, url)
@@ -951,15 +964,13 @@ def try_elsevier_cdn_brute_force(
                         found_files.append(filepath)
                         found_any = True
                     else:
-                        if os.path.exists(filepath):
-                            os.remove(filepath)
                         print(f"FAIL ({reason})")
                 else:
                     print(f"FAIL (HTTP {dl_resp.status_code})")
             except Exception as e:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
                 print(f"FAIL ({e})")
+            finally:
+                discard_temp_file(tmp_path)
         # A HEAD hit means the file exists even if the follow-up GET
         # download itself failed, so it still counts as a hit (not a miss).
         if found_any or hits:
@@ -1080,7 +1091,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
 
     # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
+    # H9: stream to a same-directory temp file, validate it, then commit
+    # with os.replace; the final path never holds a partial file, and a
+    # failure only ever discards the temp file.
     if session:
+        tmp_path = None
         try:
             resp = session.get(url, timeout=30, stream=True, verify=False, headers={"Referer": referer} if referer else {})
             if resp.status_code < 400:
@@ -1098,7 +1113,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                             return filepath
 
                 first_chunk = b""
-                with open(filepath, "wb") as f:
+                tmp_path = temp_path_for(filepath)
+                with open(tmp_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             if not first_chunk:
@@ -1110,12 +1126,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if inferred:
                         base = fname[:-4] if fname.endswith(".bin") else fname
                         fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
-                        new_path = os.path.join(output_dir, fname)
-                        os.replace(filepath, new_path)
-                        filepath = new_path
+                        filepath = os.path.join(output_dir, fname)
+                        # Re-home the staged file under the inferred
+                        # extension so validation sees the real extension.
+                        new_tmp = temp_path_for(filepath)
+                        os.replace(tmp_path, new_tmp)
+                        tmp_path = new_tmp
 
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     response_status=resp.status_code,
                     headers=resp.headers
                 )
@@ -1123,25 +1142,25 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                         base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
-                        new_path = os.path.join(output_dir, html_name)
-                        if filepath != new_path:
-                            os.replace(filepath, new_path)
-                            filepath = new_path
+                        if filepath != os.path.join(output_dir, html_name):
+                            filepath = os.path.join(output_dir, html_name)
                             fname = html_name
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
                     record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
-                else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
         except Exception:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            pass
+        finally:
+            discard_temp_file(tmp_path)
 
     # Method 2: Scrapling Fetcher (basic HTTP client)
+    # H9: chunked write to a temp file, validate, then os.replace.
     if HAS_SCRAPLING:
+        tmp_path = None
         try:
             sc_args = {"headers": {"Referer": referer}} if referer else {}
             if cookies:
@@ -1168,10 +1187,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         fname = disambiguate_target_filename(output_dir, f"{base}{inferred}", url, manifest)
                         filepath = os.path.join(output_dir, fname)
 
-                with open(filepath, "wb") as f:
-                    f.write(resp.body)
+                tmp_path = temp_path_for(filepath)
+                write_bytes_chunked(tmp_path, resp.body)
                 is_val, reason = validate_downloaded_file(
-                    filepath,
+                    tmp_path,
                     content_bytes=resp.body,
                     response_status=resp.status,
                     headers=resp.headers
@@ -1180,22 +1199,20 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                         base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                         html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
-                        new_path = os.path.join(output_dir, html_name)
-                        if filepath != new_path:
-                            os.replace(filepath, new_path)
-                            filepath = new_path
+                        if filepath != os.path.join(output_dir, html_name):
+                            filepath = os.path.join(output_dir, html_name)
                             fname = html_name
+                    commit_temp_file(tmp_path, filepath)
+                    tmp_path = None
                     record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
-                else:
-                    if os.path.exists(filepath):
-                        os.remove(filepath)
         except Exception:
-            if os.path.exists(filepath):
-                os.remove(filepath)
+            pass
+        finally:
+            discard_temp_file(tmp_path)
 
     # Reuse the opted-in authenticated session before a standalone browser.
     if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
@@ -1213,7 +1230,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             return filepath
 
     # Method 3: Scrapling StealthySession + Playwright sync download fallback
+    # H9: the browser download lands in a temp file, is validated, then
+    # committed with os.replace; a failure only discards the temp file.
     if HAS_SCRAPLING:
+        tmp_path = None
         try:
             from scrapling.fetchers import StealthySession
             session_stealth = StealthySession(
@@ -1251,15 +1271,32 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 real_name = sanitize_filename(download.suggested_filename)
                 fname = disambiguate_target_filename(output_dir, real_name, url, manifest)
                 filepath = os.path.join(output_dir, fname)
-            download.save_as(filepath)
+            tmp_path = temp_path_for(filepath)
+            download.save_as(tmp_path)
             session_stealth.close()
 
-            filepath = ensure_inferred_extension_on_disk(
-                filepath, output_dir, url, manifest=manifest
-            )
-            fname = os.path.basename(filepath)
-            is_val, reason = validate_downloaded_file(filepath)
+            # Re-home under the inferred extension (if any) so validation
+            # sees the real extension, as in Method 1.
+            if "." not in fname or fname.endswith(".bin"):
+                with open(tmp_path, "rb") as _head_f:
+                    _head = _head_f.read(8192)
+                _inferred = infer_file_extension(_head, "")
+                if _inferred:
+                    _base = fname[:-4] if fname.endswith(".bin") else fname
+                    fname = disambiguate_target_filename(output_dir, f"{_base}{_inferred}", url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                    _new_tmp = temp_path_for(filepath)
+                    os.replace(tmp_path, _new_tmp)
+                    tmp_path = _new_tmp
+
+            is_val, reason = validate_downloaded_file(tmp_path)
             if is_val:
+                commit_temp_file(tmp_path, filepath)
+                tmp_path = None
+                filepath = ensure_inferred_extension_on_disk(
+                    filepath, output_dir, url, manifest=manifest
+                )
+                fname = os.path.basename(filepath)
                 if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                     base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                     html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
@@ -1273,29 +1310,45 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 return filepath
-            else:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
         except Exception:
             try:
                 session_stealth.close()
             except Exception:
                 pass
-            if os.path.exists(filepath):
-                os.remove(filepath)
+        finally:
+            discard_temp_file(tmp_path)
 
     # Method 4: curl (cross-platform fallback)
+    # H9: curl writes to a temp file, which is validated and then committed
+    # with os.replace; a failure only discards the temp file.
+    tmp_path = None
     try:
         curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
-        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", filepath, url]
+        tmp_path = temp_path_for(filepath)
+        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", tmp_path, url]
         res = subprocess.run(cmd, timeout=120)
-        if res.returncode == 0 and os.path.exists(filepath):
-            filepath = ensure_inferred_extension_on_disk(
-                filepath, output_dir, url, manifest=manifest
-            )
-            fname = os.path.basename(filepath)
-            is_val, reason = validate_downloaded_file(filepath)
+        if res.returncode == 0 and os.path.exists(tmp_path):
+            # Re-home under the inferred extension (if any) so validation
+            # sees the real extension, as in Method 1.
+            if "." not in fname or fname.endswith(".bin"):
+                with open(tmp_path, "rb") as _head_f:
+                    _head = _head_f.read(8192)
+                _inferred = infer_file_extension(_head, "")
+                if _inferred:
+                    _base = fname[:-4] if fname.endswith(".bin") else fname
+                    fname = disambiguate_target_filename(output_dir, f"{_base}{_inferred}", url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                    _new_tmp = temp_path_for(filepath)
+                    os.replace(tmp_path, _new_tmp)
+                    tmp_path = _new_tmp
+            is_val, reason = validate_downloaded_file(tmp_path)
             if is_val:
+                commit_temp_file(tmp_path, filepath)
+                tmp_path = None
+                filepath = ensure_inferred_extension_on_disk(
+                    filepath, output_dir, url, manifest=manifest
+                )
+                fname = os.path.basename(filepath)
                 if "HTML table attachment" in reason and (filepath.endswith(".bin") or not os.path.splitext(filepath)[1]):
                     base_html = filepath[:-4] if filepath.endswith(".bin") else filepath
                     html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
@@ -1309,10 +1362,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
-            elif os.path.exists(filepath):
-                os.remove(filepath)
     except Exception:
         pass
+    finally:
+        discard_temp_file(tmp_path)
 
     print("FAIL")
     return None
@@ -1591,6 +1644,10 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
+                # Skip dotfiles: H9 temp files (and the manifest) are
+                # never downloaded files, even if a hard kill left one.
+                if f.startswith("."):
+                    continue
                 m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))
@@ -1643,6 +1700,10 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     downloaded_mmcs.add(int(m.group(1)))
             if os.path.exists(article_dir):
                 for f in os.listdir(article_dir):
+                    # Skip dotfiles: H9 temp files (and the manifest) are
+                    # never downloaded files, even if a hard kill left one.
+                    if f.startswith("."):
+                        continue
                     m_f = MMC_NUM_REGEX.search(f)
                     if m_f:
                         downloaded_mmcs.add(int(m_f.group(1)))
@@ -2043,6 +2104,10 @@ def run_download(args, bsk_runtime):
                     downloaded_mmcs.add(int(m.group(1)))
         if os.path.exists(article_dir):
             for f in os.listdir(article_dir):
+                # Skip dotfiles: H9 temp files (and the manifest) are
+                # never downloaded files, even if a hard kill left one.
+                if f.startswith("."):
+                    continue
                 m_f = MMC_NUM_REGEX.search(f)
                 if m_f:
                     downloaded_mmcs.add(int(m_f.group(1)))

@@ -637,3 +637,195 @@ def test_h2_extensions_come_from_data_extensions(tmp_path):
         assert "mmc1.parquet" in basenames
         assert "mmc1.ipynb" in basenames
         assert "mmc1.tar.gz" in basenames
+
+
+# ── H9: atomic download landing ──────────────────────────────────────────────
+
+def _h9_no_leftovers(path):
+    return [p.name for p in Path(path).iterdir() if p.name.startswith(".") and p.name.endswith(".tmp")] == [] and \
+        not [p.name for p in Path(path).iterdir() if p.name.startswith(".") and ".tmp" in p.name]
+
+
+def test_h9_temp_path_helpers_preserve_extension_and_commit(tmp_path):
+    from supp_finder import temp_path_for, commit_temp_file, discard_temp_file
+
+    final = str(tmp_path / "mmc1.xlsx")
+    tmp = temp_path_for(final)
+    assert tmp != final
+    assert os.path.dirname(tmp) == str(tmp_path)
+    assert tmp.endswith(".xlsx")
+    assert os.path.basename(tmp).startswith(".")
+    Path(tmp).write_bytes(b"data")
+    commit_temp_file(tmp, final)
+    assert Path(final).read_bytes() == b"data"
+    assert not os.path.exists(tmp)
+    tmp2 = temp_path_for(final)
+    Path(tmp2).write_bytes(b"partial")
+    discard_temp_file(tmp2)
+    assert not os.path.exists(tmp2)
+    assert Path(final).read_bytes() == b"data"
+
+
+def test_h9_scansci_requests_stream_never_creates_partial_final(tmp_path):
+    """While the requests stream is still flowing, the final file must not
+    exist yet; it appears only after validation + os.replace."""
+    import scansci_supp_downloader as a
+    from supp_finder import Candidate
+
+    final = tmp_path / "s1.xlsx"
+    chunks = [office_archive()]
+
+    def gen():
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+        yield chunks[0]
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.headers = {}
+    resp.iter_content = MagicMock(return_value=gen())
+    session = MagicMock()
+    session.get.return_value = resp
+    cand = Candidate(url="https://example.com/s1.xlsx", filename="s1.xlsx")
+    with patch.object(a, "validate_downloaded_file", return_value=(True, "valid")):
+        result = a.download_file(cand, str(tmp_path), session=session)
+    assert result is not None and os.path.basename(result) == "s1.xlsx"
+    assert final.read_bytes() == chunks[0]
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_tier0_cdn_stream_never_creates_partial_final(tmp_path):
+    """Same atomic guarantee for the Tier 0 CDN download path."""
+    from scansci_supp_downloader import try_elsevier_cdn_brute_force
+
+    final = tmp_path / "mmc1.xlsx"
+
+    def fake_head(url, timeout=10, allow_redirects=True):
+        resp = MagicMock()
+        if "mmc1.xlsx" in url:
+            resp.status_code = 200
+            resp.headers = {"content-length": "1024"}
+        else:
+            resp.status_code = 404
+            resp.headers = {}
+        return resp
+
+    def gen():
+        assert not final.exists(), "partial file was created at the final path mid-stream"
+        yield office_archive()
+
+    def fake_get(url, timeout=30, stream=True):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {"content-disposition": ""}
+        resp.iter_content = MagicMock(return_value=gen())
+        return resp
+
+    with patch("requests.Session.head", side_effect=fake_head), \
+         patch("requests.Session.get", side_effect=fake_get), \
+         patch("scansci_supp_downloader.validate_downloaded_file", return_value=(True, "valid")), \
+         patch("time.sleep"):
+        files = try_elsevier_cdn_brute_force("S12345", str(tmp_path), max_mmc=1, max_consecutive_misses=1)
+    assert [os.path.basename(f) for f in files] == ["mmc1.xlsx"]
+    assert final.read_bytes() == office_archive()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_scansci_curl_writes_to_temp_first(tmp_path):
+    """curl must be pointed at a temp file (not the final path) and a
+    failed validation must leave neither the final file nor a temp file."""
+    import scansci_supp_downloader as a
+
+    seen = {}
+
+    def fake_run(cmd, timeout=None):
+        out = cmd[cmd.index("-o") + 1]
+        seen["out"] = out
+        Path(out).write_bytes(b"<html>not a spreadsheet</html>")
+        return NS(returncode=0)
+
+    with patch.object(a, "Fetcher") as fetcher, \
+         patch("scansci_supp_downloader.subprocess.run", side_effect=fake_run), \
+         patch.object(a, "validate_downloaded_file", return_value=(False, "invalid")):
+        fetcher.get.side_effect = Exception("no scrapling")
+        # StealthySession import inside download_file must also fail fast.
+        with patch("scrapling.fetchers.StealthySession", side_effect=Exception("no browser")):
+            result = a.download_file("https://example.com/s1.xlsx", str(tmp_path), session=None)
+    assert result is None
+    assert seen["out"] != str(tmp_path / "s1.xlsx")
+    assert os.path.dirname(seen["out"]) == str(tmp_path)
+    assert not (tmp_path / "s1.xlsx").exists()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_journal_fetcher_writes_in_chunks_and_cleans_up(tmp_path):
+    """journal_downloader must not write resp.body in one shot, and a
+    failed validation must leave neither the final file nor a temp file."""
+    import journal_downloader as j
+
+    body = b"x" * 200_000
+    resp = NS(status=200, body=body, headers={})
+    real_open = open
+    writes = []
+
+    class SpyFile:
+        def __init__(self, f):
+            self._f = f
+
+        def write(self, data):
+            writes.append(len(data))
+            return self._f.write(data)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._f.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._f, name)
+
+    def spy_open(*args, **kwargs):
+        f = real_open(*args, **kwargs)
+        mode = kwargs.get("mode", args[1] if len(args) > 1 else "")
+        return SpyFile(f) if "w" in str(mode) and "b" in str(mode) else f
+
+    with patch.object(j.Fetcher, "get", return_value=resp), \
+         patch.object(j, "validate_downloaded_file", return_value=(True, "valid")), \
+         patch("supp_finder.open", side_effect=spy_open):
+        result = j.download_file("https://example.com/s1.xlsx", str(tmp_path))
+    assert result is not None
+    assert Path(result).read_bytes() == body
+    assert len(writes) > 1 and max(writes) <= 65536
+    assert _h9_no_leftovers(tmp_path)
+
+    # Failed validation: no final file, no temp leftovers.
+    writes.clear()
+    with patch.object(j.Fetcher, "get", return_value=resp), \
+         patch.object(j, "validate_downloaded_file", return_value=(False, "invalid")):
+        assert j.download_file("https://example.com/s2.xlsx", str(tmp_path)) is None
+    assert not (tmp_path / "s2.xlsx").exists()
+    assert _h9_no_leftovers(tmp_path)
+
+
+def test_h9_bsk_download_leaves_no_staging_dir(tmp_path):
+    """BrowserSkill download already stages in a temp dir + os.replace;
+    verify no staging directory is left behind."""
+    import browserskill_adapter as bsk
+    from browserskill_adapter import BrowserSkillSession, BrowserSkillExecutionError
+
+    output = tmp_path / "table.csv"
+
+    def native(command, **kwargs):
+        Path(command[command.index("--out") + 1]).write_bytes(b"x,y\n1,2\n")
+        return NS(returncode=0, stdout="Downloaded", stderr="")
+
+    with patch("browserskill_adapter.atexit.register"), patch("browserskill_adapter.atexit.unregister"):
+        sess = BrowserSkillSession(bsk_bin="/bin/bsk")
+        sess.session_id = "h9-sess"
+        with patch.object(sess, "download_url_in_session", side_effect=BrowserSkillExecutionError("CORS")), \
+             patch.object(sess, "evaluate", return_value=True), \
+             patch.object(bsk.subprocess, "run", side_effect=native):
+            assert sess.download("https://cdn.org/table.csv", str(output)) == str(output)
+    assert output.read_bytes() == b"x,y\n1,2\n"
+    assert not [p.name for p in tmp_path.iterdir() if p.name.startswith(".bsk-")]

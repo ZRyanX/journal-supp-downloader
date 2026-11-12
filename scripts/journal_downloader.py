@@ -59,6 +59,10 @@ from supp_finder import (
     expand_page_accordions_action,
     is_blocked_page,
     page_fetch_is_failure,
+    temp_path_for,
+    commit_temp_file,
+    discard_temp_file,
+    write_bytes_chunked,
 )
 
 
@@ -190,6 +194,10 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             return filepath
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
+    # H9: the body is written in bounded chunks to a same-directory temp
+    # file, validated, then committed with os.replace; the final path
+    # never holds a partial file and a failure only discards the temp.
+    tmp_path = None
     try:
         get_kwargs = {"stealthy_headers": True, "timeout": 30}
         if referer:
@@ -249,12 +257,12 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 fname = disambiguate_target_filename(output_dir, f"{base}{inferred_ext}", url, manifest)
                 filepath = os.path.join(output_dir, fname)
 
-        with open(filepath, "wb") as f:
-            f.write(resp.body)
+        tmp_path = temp_path_for(filepath)
+        write_bytes_chunked(tmp_path, resp.body)
 
         # Validate file based on signature and response headers (Fixing Issue #5, D1)
         is_valid, reason = validate_downloaded_file(
-            filepath,
+            tmp_path,
             content_bytes=resp.body,
             response_status=resp.status,
             headers=resp.headers,
@@ -267,9 +275,10 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 html_name = disambiguate_target_filename(output_dir, os.path.basename(base_html) + ".html", url, manifest)
                 new_path = os.path.join(output_dir, html_name)
                 if filepath != new_path:
-                    os.replace(filepath, new_path)
                     filepath = new_path
                     fname = html_name
+            commit_temp_file(tmp_path, filepath)
+            tmp_path = None
             record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
             save_download_manifest(output_dir, manifest)
             print(f"OK ({size_kb:.1f} KB - {reason})")
@@ -277,8 +286,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
         raise RuntimeError(reason)
 
     except Exception as exc:
-        if os.path.exists(filepath):
-            os.remove(filepath)
+        discard_temp_file(tmp_path)
         if bsk_session is not None or (bsk_runtime is not None and bsk_runtime.enabled):
             result = download_file_via_browserskill(
                 url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime

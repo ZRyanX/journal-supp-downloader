@@ -1156,6 +1156,59 @@ def save_download_manifest(output_dir: str, manifest: Dict[str, Any]):
         print(f"[Warning] Could not save download manifest {manifest_path}: {exc}", file=sys.stderr)
 
 
+# ── Atomic download landing (H9) ─────────────────────────────────────────────
+# Every download path writes to a same-directory temporary file, validates
+# it, then commits with os.replace and only afterwards updates the
+# manifest. The temp name keeps the target extension (so
+# validate_downloaded_file's extension-specific checks still apply) and
+# is dot-prefixed with a random token, so it can never collide with the
+# final file and is never registered in the manifest.
+
+def temp_path_for(final_path: str) -> str:
+    """Create an empty temp file next to *final_path* and return its path.
+
+    Name shape: ``.<stem>.<random><ext>`` in the same directory, so the
+    commit is a same-filesystem os.replace and the extension is preserved
+    for validation. The caller owns the file and must commit or discard it.
+    """
+    directory = os.path.dirname(os.path.abspath(final_path))
+    base = os.path.basename(final_path)
+    stem, ext = os.path.splitext(base)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{stem}.", suffix=ext, dir=directory)
+    os.close(fd)
+    return tmp_path
+
+
+def commit_temp_file(tmp_path: str, final_path: str) -> None:
+    """Atomically publish a validated temp file at *final_path*."""
+    os.replace(tmp_path, final_path)
+
+
+def discard_temp_file(tmp_path: Optional[str]) -> None:
+    """Best-effort removal of a temp file (failed / invalid download)."""
+    if not tmp_path:
+        return
+    try:
+        os.remove(tmp_path)
+    except OSError:
+        pass
+
+
+def write_bytes_chunked(path: str, data: bytes, chunk_size: int = 65536) -> int:
+    """Write *data* to *path* in bounded chunks instead of one shot.
+
+    The bytes are already in memory (e.g. a Fetcher response body); the
+    point is to avoid a single huge write call and to keep the write path
+    uniform with the streaming downloaders.
+    """
+    written = 0
+    view = memoryview(data)
+    with open(path, "wb") as f:
+        for offset in range(0, len(data), chunk_size):
+            written += f.write(view[offset:offset + chunk_size])
+    return written
+
+
 def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, Any]) -> str:
     """
     Ensure fname does not collide with an existing file on disk downloaded for a different URL (D2).
