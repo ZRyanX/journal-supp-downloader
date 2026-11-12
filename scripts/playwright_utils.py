@@ -90,9 +90,15 @@ def find_playwright_chromium():
                             if "Contents/MacOS" in test_path:
                                 return test_path
             else:
-                exe_path = os.path.join(chrom_dir, "chrome-linux", "chrome")
-                if os.path.exists(exe_path):
-                    return exe_path
+                # Newer Playwright ships the Linux build as
+                # chrome-linux64/chrome instead of chrome-linux/chrome
+                # (e.g. chromium-1254); accept any chrome-linux* layout,
+                # sorted so the classic chrome-linux/ still wins when
+                # both are present.
+                matches = sorted(glob.glob(
+                    os.path.join(chrom_dir, "chrome-linux*", "chrome")))
+                if matches:
+                    return matches[0]
 
     return None
 
