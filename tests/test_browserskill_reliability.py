@@ -246,7 +246,7 @@ def test_403_reaches_authenticated_download_and_updates_manifest(tmp_path):
         http.return_value.get.return_value.status_code = 403
         result = light.download_file("https://cdn.org/table.csv", str(tmp_path), bsk_session=session, referer=session.current_url)
     assert Path(result).read_text() == "x,y\n1,2\n"
-    assert load_download_manifest(str(tmp_path))["table.csv"] == "https://cdn.org/table.csv"
+    assert load_download_manifest(str(tmp_path))["table.csv"]["url"] == "https://cdn.org/table.csv"
 
 
 def test_default_download_does_not_discover_or_use_personal_browser(tmp_path):
@@ -364,4 +364,4 @@ else:
     assert commands[-2][:2] == ["tab", "return"]
     assert commands[-1] == ["session", "stop", "session-real-process"]
     assert not list(output.rglob(".bsk-*"))
-    assert load_download_manifest(str(files[0].parent))[files[0].name] == "https://publisher.example/table-s1.csv"
+    assert load_download_manifest(str(files[0].parent))[files[0].name]["url"] == "https://publisher.example/table-s1.csv"

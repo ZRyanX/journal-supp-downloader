@@ -50,6 +50,8 @@ from supp_finder import (
     is_article_figure_url,
     load_download_manifest,
     save_download_manifest,
+    manifest_entry_url,
+    record_manifest_entry,
     disambiguate_target_filename,
     extract_article_title,
     is_placeholder_or_blocked_title,
@@ -161,13 +163,16 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             path = os.path.join(output_dir, name)
             result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
             if result:
-                manifest[name] = url
+                record_manifest_entry(manifest, name, url, source_url=referer or "", table_ids=sorted(cand_or_url.covered_table_ids))
                 save_download_manifest(output_dir, manifest)
                 return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
             return None
     else:
         url = cand_or_url
         suggested_fname = ""
+
+    # Table ids the candidate is known to cover (H6), for the manifest record.
+    cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
 
     manifest = load_download_manifest(output_dir)
     fname = suggested_fname or extract_filename_from_url(url)
@@ -176,7 +181,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
     filepath = os.path.join(output_dir, fname)
 
     # Check if already exists and is valid for this exact URL
-    if os.path.exists(filepath) and manifest.get(fname) == url:
+    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
@@ -228,7 +233,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             target_fname = sanitize_filename(cd_name)
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
-            if os.path.exists(filepath) and manifest.get(fname) == url:
+            if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                 is_val, _ = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"[SKIP] {fname} (already exists)")
@@ -263,7 +268,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                     os.replace(filepath, new_path)
                     filepath = new_path
                     fname = html_name
-            manifest[fname] = url
+            record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
             save_download_manifest(output_dir, manifest)
             print(f"OK ({size_kb:.1f} KB - {reason})")
             return filepath
@@ -277,7 +282,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 url, filepath, session=bsk_session, referer=referer, runtime=bsk_runtime
             )
             if result:
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 filepath = ensure_inferred_extension_on_disk(filepath, output_dir, url, manifest=manifest)
                 print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")

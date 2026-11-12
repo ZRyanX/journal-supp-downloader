@@ -2342,7 +2342,7 @@ class TestCodebaseAuditFixes(unittest.TestCase):
     def test_ensure_inferred_extension_and_migrate_or_merge_article_dir(self):
         """ensure_inferred_extension_on_disk renames .bin files and migrate_or_merge_article_dir merges existing folders."""
         import tempfile
-        from supp_finder import ensure_inferred_extension_on_disk, migrate_or_merge_article_dir, load_download_manifest, save_download_manifest
+        from supp_finder import ensure_inferred_extension_on_disk, migrate_or_merge_article_dir, load_download_manifest, save_download_manifest, manifest_entry_url
         with tempfile.TemporaryDirectory() as td:
             old_dir = os.path.join(td, "supplements")
             new_dir = os.path.join(td, "Real Article Title")
@@ -2373,8 +2373,8 @@ class TestCodebaseAuditFixes(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(new_dir, "attachment_1.xlsx")))
             self.assertTrue(os.path.exists(os.path.join(new_dir, "existing.csv")))
             merged_manifest = load_download_manifest(new_dir)
-            self.assertEqual(merged_manifest.get("attachment_1.xlsx"), "https://example.com/dl/1")
-            self.assertEqual(merged_manifest.get("existing.csv"), "https://example.com/dl/existing")
+            self.assertEqual(manifest_entry_url(merged_manifest.get("attachment_1.xlsx")), "https://example.com/dl/1")
+            self.assertEqual(manifest_entry_url(merged_manifest.get("existing.csv")), "https://example.com/dl/existing")
 
     def test_scansci_pii_extraction_url_normalization_and_mime_mapping(self):
         """extract_pii_from_url strips hyphens/parens, normalize_url rewrites abs/pdfft, and _mime_or_format_to_ext avoids single-char bugs."""

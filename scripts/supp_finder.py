@@ -10,10 +10,12 @@ import html
 import json
 import os
 import re
+import sys
+import tempfile
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from bs4 import BeautifulSoup
 
 
@@ -280,6 +282,11 @@ class Candidate:
     source_tag: str = "a"
     extra_info: dict = field(default_factory=dict)
     source_url: str = ""
+    # Table ids this candidate is known to cover (H6). Filled during
+    # extraction from the link label / filename / nearby item text; the
+    # coverage check prefers this field and falls back to inferring ids
+    # from link_text/filename when it is empty.
+    covered_table_ids: Set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict:
         return {
@@ -291,6 +298,7 @@ class Candidate:
             "source_tag": self.source_tag,
             "extra_info": self.extra_info,
             "source_url": self.source_url,
+            "covered_table_ids": sorted(self.covered_table_ids),
         }
 
 
@@ -1016,31 +1024,135 @@ def extract_target_url_from_tag(tag) -> Optional[str]:
     return None
 
 
-# ── Manifest & Collision Management (D2) ────────────────────────────────────
+# ── Manifest & Collision Management (D2, H6) ─────────────────────────────────
 
-def load_download_manifest(output_dir: str) -> Dict[str, str]:
-    """Load download manifest mapping filename -> URL (D2)."""
+# Manifest entries are filename -> {url, source_url, table_ids, size, sha256, status}.
+# Older manifests stored filename -> URL string; they are normalized on load/save.
+_MANIFEST_ENTRY_DEFAULTS = {
+    "url": "",
+    "source_url": "",
+    "table_ids": [],
+    "size": None,
+    "sha256": None,
+    "status": "downloaded",
+}
+
+
+def manifest_entry_url(entry: Any) -> str:
+    """Return the URL recorded in a manifest entry, old (str) or new (dict) format."""
+    if isinstance(entry, dict):
+        return str(entry.get("url") or "")
+    if isinstance(entry, str):
+        return entry
+    return ""
+
+
+def _normalize_manifest_entry(entry: Any) -> Optional[Dict[str, Any]]:
+    """Coerce a manifest entry to the structured dict format; None when unusable."""
+    if isinstance(entry, str):
+        if not entry:
+            return None
+        normalized = dict(_MANIFEST_ENTRY_DEFAULTS)
+        normalized["url"] = entry
+        return normalized
+    if isinstance(entry, dict):
+        url = str(entry.get("url") or "")
+        if not url:
+            return None
+        normalized = dict(_MANIFEST_ENTRY_DEFAULTS)
+        normalized.update(entry)
+        normalized["url"] = url
+        normalized["source_url"] = str(entry.get("source_url") or "")
+        table_ids = entry.get("table_ids") or []
+        if isinstance(table_ids, str):
+            table_ids = [table_ids]
+        normalized["table_ids"] = sorted({str(t) for t in table_ids if t})
+        return normalized
+    return None
+
+
+def record_manifest_entry(
+    manifest: Dict[str, Any],
+    filename: str,
+    url: str,
+    *,
+    source_url: str = "",
+    table_ids: Any = (),
+    size: Optional[int] = None,
+    sha256: Optional[str] = None,
+    status: str = "downloaded",
+) -> Dict[str, Any]:
+    """Record one download in structured form (H6); returns the stored entry."""
+    entry = {
+        "url": url,
+        "source_url": source_url or "",
+        "table_ids": sorted({str(t) for t in (table_ids or ()) if t}),
+        "size": size,
+        "sha256": sha256,
+        "status": status,
+    }
+    manifest[filename] = entry
+    return entry
+
+
+def load_download_manifest(output_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Load download manifest mapping filename -> structured entry dict (D2, H6).
+
+    A corrupt manifest file prints a warning and returns {} instead of
+    silently discarding the saved entries.
+    """
     manifest_path = os.path.join(output_dir, ".download_manifest.json")
     if os.path.exists(manifest_path):
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
+                data = json.load(f)
+        except Exception as exc:
+            print(f"[Warning] Corrupt download manifest {manifest_path}: {exc}; ignoring saved entries", file=sys.stderr)
             return {}
+        if not isinstance(data, dict):
+            print(f"[Warning] Corrupt download manifest {manifest_path}: expected a JSON object; ignoring saved entries", file=sys.stderr)
+            return {}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for fname, entry in data.items():
+            coerced = _normalize_manifest_entry(entry)
+            if coerced is None:
+                print(f"[Warning] Skipping unusable manifest entry for {fname!r} in {manifest_path}", file=sys.stderr)
+                continue
+            normalized[fname] = coerced
+        return normalized
     return {}
 
 
-def save_download_manifest(output_dir: str, manifest: Dict[str, str]):
-    """Save download manifest mapping filename -> URL (D2)."""
+def save_download_manifest(output_dir: str, manifest: Dict[str, Any]):
+    """Save download manifest atomically via temp file + os.replace (D2, H6)."""
     manifest_path = os.path.join(output_dir, ".download_manifest.json")
+    normalized = {}
+    for fname, entry in (manifest or {}).items():
+        coerced = _normalize_manifest_entry(entry)
+        if coerced is not None:
+            normalized[fname] = coerced
+    tmp_path = None
     try:
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+        os.makedirs(output_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".download_manifest.", suffix=".tmp", dir=output_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(normalized, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, manifest_path)
+            tmp_path = None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+    except Exception as exc:
+        print(f"[Warning] Could not save download manifest {manifest_path}: {exc}", file=sys.stderr)
 
 
-def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, str]) -> str:
+def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest: Dict[str, Any]) -> str:
     """
     Ensure fname does not collide with an existing file on disk downloaded for a different URL (D2).
     """
@@ -1049,7 +1161,7 @@ def disambiguate_target_filename(output_dir: str, fname: str, url: str, manifest
     idx = 2
     while os.path.exists(os.path.join(output_dir, target)):
         # If this exact file on disk was downloaded for this exact URL, no rename needed
-        if manifest.get(target) == url:
+        if manifest_entry_url(manifest.get(target)) == url:
             break
         target = f"{base}_{idx}{ext}"
         idx += 1
@@ -1221,6 +1333,90 @@ def should_match_candidate(
 
 # ── Core Candidate Scanner ───────────────────────────────────────────────────
 
+# Query parameters that only mark a link as a download request (or analytics
+# tracking) and never identify a distinct file. Two URLs that differ ONLY in
+# these parameters point at the same file and must dedup to one candidate.
+# Normalization rule (H6): a marker parameter is dropped only when its value
+# is a generic flag (empty, a bare number, true/yes/download/attachment);
+# a value that names a file ('download=S2.xlsx') is kept, as are all other
+# parameters (id, attachmentId, file, type, ...), which may identify
+# distinct files. Remaining parameters are sorted so their order does not
+# matter. Scheme/host are lowercased; the path is left untouched.
+_DOWNLOAD_MARKER_PARAMS = {"download", "dl", "attachment", "force_download", "force-download"}
+_DOWNLOAD_MARKER_VALUES = {"", "true", "yes", "download", "attachment"}
+
+
+def _normalize_url_for_dedup(url: str) -> str:
+    """Dedup key for a candidate URL: fragment stripped, marker params dropped (H6)."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return url
+    params = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+    kept = [
+        (k, v) for k, v in params
+        if not (
+            k.lower() in _DOWNLOAD_MARKER_PARAMS
+            and (v.lower() in _DOWNLOAD_MARKER_VALUES or v.isdigit())
+        )
+        and not k.lower().startswith("utm_")
+    ]
+    kept.sort()
+    query = urllib.parse.urlencode(kept)
+    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+
+
+def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
+    """Table ids named by a candidate's own label, filename, or attributes (H6)."""
+    ids: Set[str] = set()
+    for value in (link_text, filename):
+        ids |= supplementary_table_ids(value)
+    for value in (attrs or {}).values():
+        if isinstance(value, str):
+            ids |= supplementary_table_ids(value)
+        elif isinstance(value, list):
+            for item in value:
+                ids |= supplementary_table_ids(str(item))
+    return ids
+
+
+def _parent_direct_table_ids(tag) -> Set[str]:
+    """Table ids in the immediate parent's own text nodes (H6).
+
+    E.g. '<li>Table S2 <a>Download</a></li>' attributes S2 to the link.
+    Only when the parent is a single item row (li/td/p/...) holding exactly
+    one download control, so a section that lists several tables never
+    donates its whole declaration ('Tables S1.1 and S1.2') to one link.
+    """
+    parent = getattr(tag, "parent", None)
+    if parent is None or not hasattr(parent, "find_all"):
+        return set()
+    parent_name = getattr(parent, "name", "") or ""
+    if parent_name in ("section", "article", "main", "body", "html", "ul", "ol", "table", "figure"):
+        return set()
+    if parent_name == "div":
+        attrs = " ".join(
+            [str(parent.get("id") or "")] + [str(c) for c in (parent.get("class") or [])]
+        ).lower()
+        if any(kw in attrs for kw in ("supplement", "suppl", "appendix", "extended-data", "extended_data", "附表", "附录")):
+            return set()
+    try:
+        controls = [
+            c for c in parent.find_all(["a", "button", "input"], recursive=False)
+            if extract_target_url_from_tag(c)
+        ]
+        if len(controls) != 1:
+            return set()
+        direct_text = " ".join(
+            s.strip() for s in parent.find_all(string=True, recursive=False) if s.strip()
+        )
+    except Exception:
+        return set()
+    if not direct_text:
+        return set()
+    return supplementary_table_ids(direct_text)
+
+
 def find_all_candidates(
     html_content: str,
     base_url: str,
@@ -1271,10 +1467,21 @@ def find_all_candidates(
         if is_article_figure_url(norm_url, text=cand.link_text, attrs=evidence_attrs):
             diag.excluded_links.append((norm_url, "article_figure_pattern"))
             return
-        if norm_url in seen_urls:
-            # Upgrade existing candidate if this one has a more specific filename
-            for i, existing in enumerate(candidates):
-                if existing.url.split("#")[0].strip() == norm_url:
+        # H6: record the table ids this link is known to cover, then dedup on
+        # the query-normalized URL so download-marker differences do not
+        # inflate the candidate count.
+        cand.covered_table_ids = set(cand.covered_table_ids) | _infer_candidate_table_ids(
+            cand.link_text, cand.filename, evidence_attrs
+        )
+        dedup_key = _normalize_url_for_dedup(norm_url)
+        if dedup_key in seen_urls:
+            # H6: same file reached twice (e.g. once as 'Table S1', once as
+            # 'Table S2') keeps ONE candidate but merges both labels/table ids.
+            for existing in candidates:
+                if _normalize_url_for_dedup(existing.url.split("#")[0].strip()) == dedup_key:
+                    existing.covered_table_ids |= cand.covered_table_ids
+                    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
+                        existing.link_text = cand.link_text
                     is_existing_generic = (
                         existing.filename.endswith(".bin")
                         or existing.filename.startswith("download_")
@@ -1286,10 +1493,10 @@ def find_all_candidates(
                         or cand.filename.startswith("attachment_")
                     )
                     if is_existing_generic and is_cand_specific:
-                        candidates[i] = cand
+                        existing.filename = cand.filename
                     break
             return
-        seen_urls.add(norm_url)
+        seen_urls.add(dedup_key)
         candidates.append(cand)
 
     # ── Strategy 1: Targeted Meta & Link Tags (Highwire, Nature, etc.) ────
@@ -1326,7 +1533,8 @@ def find_all_candidates(
                     filename=sanitize_filename(control_label) + ".bin",
                     link_text=control_label, section="supplementary_section",
                     source_url=base_url, extra_info={"browser_selector": selector},
-                    match_rule="browser_download_control"))
+                    match_rule="browser_download_control",
+                    covered_table_ids=supplementary_table_ids(control_label)))
             continue
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
@@ -1387,6 +1595,7 @@ def find_all_candidates(
                 match_rule=rule,
                 source_tag=tag.name,
                 extra_info={"attributes": attrs},
+                covered_table_ids=_parent_direct_table_ids(tag),
             ))
 
     # ── Strategy 3: Publisher-Specific Extractors (Issue #6 & WebVPN compatibility) ──
@@ -2173,8 +2382,18 @@ def candidate_evidence(candidates):
 
 
 def covered_table_ids(candidates):
+    """Table ids covered by candidates (H6).
+
+    Prefers each candidate's explicit covered_table_ids field (filled during
+    extraction); when a candidate has no explicit ids, falls back to inferring
+    them from its link text, filename, and attributes, as before.
+    """
     covered = set()
     for item in candidate_evidence(candidates):
+        explicit = item.get('covered_table_ids')
+        if explicit:
+            covered.update(str(t) for t in explicit)
+            continue
         for value in (item.get('link_text'), item.get('filename'), item.get('extra_info', {}).get('attributes', {})):
             covered.update(supplementary_table_ids(value))
     return covered
@@ -2478,7 +2697,7 @@ def ensure_inferred_extension_on_disk(
     filepath: str,
     output_dir: str,
     url: str,
-    manifest: Optional[Dict[str, str]] = None,
+    manifest: Optional[Dict[str, Any]] = None,
     content_type: str = "",
 ) -> str:
     """
@@ -2516,7 +2735,7 @@ def ensure_inferred_extension_on_disk(
 
     if fname in m and final_fname != fname:
         m.pop(fname, None)
-    m[final_fname] = url
+    record_manifest_entry(m, final_fname, url)
     save_download_manifest(output_dir, m)
     return new_filepath
 
@@ -2584,15 +2803,16 @@ def migrate_or_merge_article_dir(old_dir: str, new_dir: str) -> str:
                 continue
             src_path = os.path.join(old_abs, entry)
             if os.path.isfile(src_path):
-                url = old_manifest.get(entry, "")
+                old_entry = _normalize_manifest_entry(old_manifest.get(entry))
+                url = manifest_entry_url(old_entry)
                 dest_fname = disambiguate_target_filename(
                     new_abs, entry, url or f"__migrated__:{src_path}", new_manifest
                 )
                 dest_path = os.path.join(new_abs, dest_fname)
                 try:
                     os.replace(src_path, dest_path)
-                    if url:
-                        new_manifest[dest_fname] = url
+                    if old_entry is not None:
+                        new_manifest[dest_fname] = old_entry
                 except Exception:
                     pass
     except Exception:

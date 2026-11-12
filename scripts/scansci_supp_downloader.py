@@ -75,6 +75,8 @@ from supp_finder import (
     should_match_candidate,
     load_download_manifest,
     save_download_manifest,
+    manifest_entry_url,
+    record_manifest_entry,
     disambiguate_target_filename,
     extract_article_title,
     expand_page_accordions_action,
@@ -719,7 +721,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
         filepath = os.path.join(output_dir, fname)
 
-        if os.path.exists(filepath) and manifest.get(fname) == url:
+        if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
             is_val, _ = validate_downloaded_file(filepath)
             if is_val:
                 print(f"  [SKIP] {fname} (already exists)")
@@ -736,7 +738,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -757,7 +759,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                 if is_val:
                     actual_size = os.path.getsize(filepath)
                     print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                    manifest[fname] = url
+                    record_manifest_entry(manifest, fname, url)
                     save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
@@ -846,7 +848,7 @@ def try_elsevier_cdn_brute_force(
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
 
-            if os.path.exists(filepath) and manifest.get(fname) == url:
+            if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                 is_val, _ = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"  [SKIP] {fname} (already exists)")
@@ -865,7 +867,7 @@ def try_elsevier_cdn_brute_force(
                         target_fname = sanitize_filename(cd_name)
                         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                         filepath = os.path.join(output_dir, fname)
-                        if os.path.exists(filepath) and manifest.get(fname) == url:
+                        if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                             is_val, _ = validate_downloaded_file(filepath)
                             if is_val:
                                 print(f"[SKIP] {fname} (already exists)")
@@ -887,7 +889,7 @@ def try_elsevier_cdn_brute_force(
                     if is_val:
                         actual_size = os.path.getsize(filepath)
                         print(f"OK ({actual_size / 1024:.1f} KB) → {fname}")
-                        manifest[fname] = url
+                        record_manifest_entry(manifest, fname, url)
                         save_download_manifest(output_dir, manifest)
                         found_files.append(filepath)
                         found_any = True
@@ -977,13 +979,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             path = os.path.join(output_dir, name)
             result = download_file_via_browserskill(selector, path, session=bsk_session, runtime=bsk_runtime, referer=referer, verify_control=True)
             if result:
-                manifest[name] = url
+                record_manifest_entry(manifest, name, url, source_url=referer or "", table_ids=sorted(cand_or_url.covered_table_ids))
                 save_download_manifest(output_dir, manifest)
                 return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
             return None
     else:
         url = cand_or_url
         suggested_fname = ""
+
+    # Table ids the candidate is known to cover (H6), for the manifest record.
+    cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
 
     os.makedirs(output_dir, exist_ok=True)
     manifest = load_download_manifest(output_dir)
@@ -992,7 +997,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     fname = disambiguate_target_filename(output_dir, fname, url, manifest)
     filepath = os.path.join(output_dir, fname)
 
-    if os.path.exists(filepath) and manifest.get(fname) == url:
+    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
         is_val, _ = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
@@ -1012,7 +1017,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -1049,7 +1054,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                             os.replace(filepath, new_path)
                             filepath = new_path
                             fname = html_name
-                    manifest[fname] = url
+                    record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
@@ -1076,7 +1081,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     target_fname = sanitize_filename(cd_name)
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
-                    if os.path.exists(filepath) and manifest.get(fname) == url:
+                    if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
                         is_val, _ = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
@@ -1106,7 +1111,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                             os.replace(filepath, new_path)
                             filepath = new_path
                             fname = html_name
-                    manifest[fname] = url
+                    record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                     save_download_manifest(output_dir, manifest)
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
@@ -1128,7 +1133,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 filepath, output_dir, url, manifest=manifest
             )
             fname = os.path.basename(filepath)
-            manifest[fname] = url
+            record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
             save_download_manifest(output_dir, manifest)
             print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
             return filepath
@@ -1189,7 +1194,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         os.replace(filepath, new_path)
                         filepath = new_path
                         fname = html_name
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
@@ -1226,7 +1231,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                         filepath = new_path
                         fname = html_name
                 size_kb = os.path.getsize(filepath) / 1024
-                manifest[fname] = url
+                record_manifest_entry(manifest, fname, url, source_url=referer or "", table_ids=cand_table_ids)
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
@@ -1484,11 +1489,11 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     print(f"    Renamed folder from HTML title to: {os.path.abspath(article_dir)}")
 
         manifest = load_download_manifest(article_dir)
-        downloaded_urls = set(manifest.values())
+        downloaded_urls = {manifest_entry_url(v) for v in manifest.values()}
         existing_basenames = {os.path.basename(f) for f in existing_files}
         downloaded_mmcs = set()
         for k, v in manifest.items():
-            for s in (k, v):
+            for s in (k, manifest_entry_url(v)):
                 m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))
@@ -1540,7 +1545,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             downloaded_mmcs = set()
             manifest = load_download_manifest(article_dir)
             for k, v in manifest.items():
-                for s in (k, v):
+                for s in (k, manifest_entry_url(v)):
                     m = MMC_NUM_REGEX.search(s)
                     if m:
                         downloaded_mmcs.add(int(m.group(1)))
@@ -1944,7 +1949,7 @@ def run_download(args, bsk_runtime):
         downloaded_mmcs = set()
         manifest = load_download_manifest(article_dir)
         for k, v in manifest.items():
-            for s in (k, v):
+            for s in (k, manifest_entry_url(v)):
                 m = MMC_NUM_REGEX.search(s)
                 if m:
                     downloaded_mmcs.add(int(m.group(1)))

@@ -242,3 +242,73 @@ def test_h5_table_range_still_drives_missing_check():
     html = '<section id="supplementary">Tables S1-S3<a href="/S1.xlsx">Table S1</a><a href="/S2.xlsx">Table S2</a></section>'
     result = find_all_candidates(html, BASE)
     assert result.is_incomplete and 'S3' in result.incomplete_reason
+
+
+# ── P0 H6: explicit candidate table ids, dedup merge, structured manifest ──
+
+def test_h6_same_url_two_labels_keeps_both_table_ids():
+    html = ('<section id="supplementary">Tables S1-S2'
+            '<a href="/all.xlsx">Table S1</a><a href="/all.xlsx">Table S2</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert result.candidates[0].covered_table_ids == {'S1', 'S2'}
+    assert not result.is_incomplete
+
+
+def test_h6_download_marker_query_params_do_not_duplicate():
+    html = ('<section id="supplementary">'
+            '<a href="/all.xlsx?download=1">Table S1</a>'
+            '<a href="/all.xlsx?download=2">Table S1</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+
+
+def test_h6_distinct_query_params_are_not_merged():
+    html = ('<section id="supplementary">'
+            '<a href="/dl?id=1">Table S1</a><a href="/dl?id=2">Table S2</a></section>')
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 2
+
+
+def test_h6_parent_text_label_is_recorded_on_candidate():
+    html = '<section id="supplementary"><ul><li>Table S2 <a href="/dl">Download</a></li></ul></section>'
+    result = find_all_candidates(html, BASE)
+    assert len(result.candidates) == 1
+    assert 'S2' in result.candidates[0].covered_table_ids
+
+
+def test_h6_covered_table_ids_prefers_explicit_field():
+    from supp_finder import Candidate, covered_table_ids
+    cand = Candidate(url='https://journal.example/dl', filename='dl.bin', link_text='Download',
+                     covered_table_ids={'S9'})
+    assert covered_table_ids([cand]) == {'S9'}
+
+
+def test_h6_manifest_is_structured_and_atomic(tmp_path):
+    from supp_finder import save_download_manifest, load_download_manifest
+    manifest = {}
+    manifest['S1.xlsx'] = {'url': 'https://journal.example/S1.xlsx', 'source_url': BASE,
+                           'table_ids': ['S1'], 'size': 12, 'sha256': 'ab' * 32, 'status': 'downloaded'}
+    save_download_manifest(str(tmp_path), manifest)
+    assert not [p for p in tmp_path.iterdir() if p.suffix == '.tmp']
+    loaded = load_download_manifest(str(tmp_path))
+    entry = loaded['S1.xlsx']
+    assert entry['url'] == 'https://journal.example/S1.xlsx'
+    assert entry['source_url'] == BASE
+    assert entry['table_ids'] == ['S1']
+    assert entry['size'] == 12 and entry['sha256'] == 'ab' * 32 and entry['status'] == 'downloaded'
+
+
+def test_h6_corrupt_manifest_warns_instead_of_silently_empty(tmp_path, capsys):
+    from supp_finder import load_download_manifest
+    (tmp_path / '.download_manifest.json').write_text('{not json')
+    assert load_download_manifest(str(tmp_path)) == {}
+    captured = capsys.readouterr()
+    assert 'manifest' in (captured.err + captured.out).lower()
+
+
+def test_h6_old_string_manifest_still_loads(tmp_path):
+    from supp_finder import save_download_manifest, load_download_manifest, manifest_entry_url
+    save_download_manifest(str(tmp_path), {'S1.xlsx': 'https://journal.example/S1.xlsx'})
+    loaded = load_download_manifest(str(tmp_path))
+    assert manifest_entry_url(loaded['S1.xlsx']) == 'https://journal.example/S1.xlsx'
