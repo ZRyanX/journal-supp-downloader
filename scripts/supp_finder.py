@@ -1996,24 +1996,175 @@ _DOM_SUPP_SECTIONS = {
 }
 
 
+_CN_TABLE_DIGITS = {
+    '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5,
+    '六': 6, '七': 7, '八': 8, '九': 9, '十': 10,
+}
+
+
+def _parse_table_number(raw: str) -> Optional[str]:
+    """Normalize a table number to its canonical digit form ('01' -> '1', '一' -> '1').
+
+    Hierarchical numbers keep their dotted parts ('1.1' stays '1.1').
+    Returns None for values that are not a plain or Chinese numeral.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if raw[0].isdigit():
+        parts = raw.split(".")
+        try:
+            return ".".join(str(int(p)) for p in parts)
+        except ValueError:
+            return None
+    if all(ch in _CN_TABLE_DIGITS for ch in raw):
+        if '十' in raw:
+            head, _, tail = raw.partition('十')
+            tens = _CN_TABLE_DIGITS.get(head, 1) if head else 1
+            ones = _CN_TABLE_DIGITS.get(tail, 0) if tail else 0
+            return str(tens * 10 + ones)
+        if len(raw) == 1:
+            return str(_CN_TABLE_DIGITS[raw])
+    return None
+
+
+# One table-id token: an optional table-word prefix, an optional S/A/E letter,
+# and a (possibly hierarchical or Chinese) number. A trailing table word
+# ('S4 Table') also counts as explicit table context.
+_TABLE_TOKEN_RE = re.compile(
+    r"(?:(?P<pw>(?:supplementary|supplemental|supporting|additional|extended\s+data|appendix)"
+    r"\b(?:\s+(?:information|info|materials?|data))?(?:\s+tables?)?"
+    r"|附表|附录|tables?|tabs?\.?|tbls?\.?)\s*)?"
+    r"(?:(?P<letter>[SAE])[-_.\s]*)?(?P<num>\d+(?:\.\d+)*|[一二两三四五六七八九十]+)"
+    r"(?P<post>\s+(?:tables?|tabs?\.?|tbls?\.?|datasets?|data|files?|表格|数据|文件))?",
+    re.IGNORECASE,
+)
+_TABLE_RANGE_SEP_RE = re.compile(r"^\s*(?:-|\bto\b|至|~|到)\s*$", re.IGNORECASE)
+_TABLE_LIST_SEP_RE = re.compile(r"^\s*(?:[,、，/]\s*)?(?:and|&|和|及|与)?\s*$", re.IGNORECASE)
+
+
+def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optional[str]) -> Optional[str]:
+    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides."""
+    if letter:
+        return letter.upper()
+    if pw:
+        low = pw.lower()
+        if "appendix" in low or "附录" in pw:
+            return "A"
+        if "extended" in low:
+            return "E"
+        if any(w in low for w in ("supplement", "supporting", "additional", "附表")):
+            return "S"
+    if post:
+        return None
+    return None
+
+
+def _expand_table_range(start: str, end: str) -> Optional[List[str]]:
+    """Expand '1'->'3' to ['1','2','3'] and '1.1'->'1.3' to ['1.1','1.2','1.3'] (same major)."""
+    if "." not in start and "." not in end:
+        try:
+            s, e = int(start), int(end)
+        except ValueError:
+            return None
+        if 1 <= s <= e <= 999 and e - s <= 99:
+            return [str(i) for i in range(s, e + 1)]
+        return None
+    s_parts, e_parts = start.split("."), end.split(".")
+    if len(s_parts) == len(e_parts) == 2 and s_parts[0] == e_parts[0]:
+        try:
+            s, e = int(s_parts[1]), int(e_parts[1])
+            major = int(s_parts[0])
+        except ValueError:
+            return None
+        if 1 <= major <= 999 and 0 <= s <= e <= 999 and e - s <= 99:
+            return [f"{major}.{i}" for i in range(s, e + 1)]
+    return None
+
+
 def supplementary_table_ids(text):
-    """Return namespaced identities (S1, A1), never bare ordinal counts."""
+    """Return namespaced table identities (S1, S1.1, A1, E1), never bare ordinal counts.
+
+    Hierarchical numbers keep their suffix ('Table S1.1' -> 'S1.1', not 'S1').
+    Ranges expand: 'Tables S1 to S3', bare 'S1-S3', 'Appendix A1-A3' and
+    'Extended Data Tables 1-3' all enumerate every member. Lists ('S1, S2 and S3')
+    enumerate their members. A bare 'S1' with no table context or range/list
+    neighbour is ignored, as is a bare main-text 'Table 1'.
+    """
     result = set()
     text = str(text or "")
-    pattern = r'(?:tables?|附表)[\s_-]*([SA])\s*(\d+)((?:\s*(?:[-–—至]|,\s*(?:and\s+)?|and\s+)\s*(?:[SA]\s*)?\d+)*)'
-    for match in re.finditer(pattern, text, re.I):
-        prefix, number = match[1].upper(), int(match[2])
-        if not 0 < number <= 999:
+    # Normalize unicode dashes so range separators are uniform.
+    text = re.sub(r"[‐‑‒–—―]", "-", text)
+    tokens = []  # (namespace-or-None, number, has_context, start, end)
+    for m in _TABLE_TOKEN_RE.finditer(text):
+        pw = m.group("pw")
+        letter = m.group("letter")
+        post = m.group("post")
+        num = _parse_table_number(m.group("num"))
+        if num is None:
             continue
-        result.add(f'{prefix}{number}')
-        for item in re.finditer(r'([-–—至]|,\s*(?:and\s+)?|and)\s*([SA])?\s*(\d+)', match[3], re.I):
-            next_prefix, end = (item[2] or prefix).upper(), int(item[3])
-            if 0 < end <= 999:
-                if item[1] in '-–—至' and next_prefix == prefix and number <= end:
-                    result.update(f'{prefix}{i}' for i in range(number, end + 1))
-                else:
-                    result.add(f'{next_prefix}{end}')
-            prefix, number = next_prefix, end
+        # A Latin prefix word glued to a bare number ('Supplementary3') is not
+        # a table id unless an S/A/E letter is present; Chinese 附表/附录
+        # legitimately take the number with no space.
+        if pw and not letter and pw not in ("附表", "附录"):
+            id_start = m.start("num")
+            if id_start == m.end("pw"):
+                continue
+        # A bare number with neither a prefix word, a letter, nor a trailing
+        # table word is not a table id on its own; kept as a weak token so it
+        # can still inherit the namespace of a range/list neighbour
+        # ('Supplementary Tables 2-5' -> S2..S5).
+        if not pw and not letter and not post:
+            tokens.append({"ns": None, "num": num, "context": False, "start": m.start(), "end": m.end()})
+            continue
+        ns = _table_token_namespace(pw, letter, post)
+        if ns is None:
+            continue
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "start": m.start(), "end": m.end()})
+
+    # Group consecutive tokens joined only by a range/list separator.
+    groups = []  # each: [(token, sep_from_previous)] with sep None for the first
+    for tok in tokens:
+        if not groups:
+            groups.append([(tok, None)])
+            continue
+        prev_tok = groups[-1][-1][0]
+        between = text[prev_tok["end"]:tok["start"]]
+        if _TABLE_RANGE_SEP_RE.match(between):
+            groups[-1].append((tok, "range"))
+        elif between.strip() and _TABLE_LIST_SEP_RE.match(between):
+            groups[-1].append((tok, "list"))
+        else:
+            groups.append([(tok, None)])
+
+    for group in groups:
+        if len(group) == 1:
+            tok = group[0][0]
+            # A lone bare 'S1' (no table word anywhere) is not evidence.
+            if tok["context"]:
+                result.add(f"{tok['ns']}{tok['num']}")
+            continue
+        # Weak (bare-number) members inherit the namespace of the nearest
+        # preceding namespaced member of the same group.
+        resolved = []
+        last_ns = None
+        for tok, sep in group:
+            ns = tok["ns"] or last_ns
+            if ns is None:
+                continue
+            last_ns = ns
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"]}, sep))
+        expanded: Set[str] = set()
+        for idx, (tok, sep) in enumerate(resolved):
+            if sep == "range" and idx > 0:
+                prev_tok = resolved[idx - 1][0]
+                if prev_tok["ns"] == tok["ns"]:
+                    span = _expand_table_range(prev_tok["num"], tok["num"])
+                    if span is not None:
+                        expanded.update(f"{tok['ns']}{n}" for n in span)
+                        continue
+            expanded.add(f"{tok['ns']}{tok['num']}")
+        result.update(expanded)
     return result
 
 

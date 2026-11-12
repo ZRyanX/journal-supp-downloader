@@ -155,3 +155,37 @@ def test_redirected_retry_uses_new_base(tmp_path, capsys):
     with patch.object(sys, 'argv', ['journal_downloader.py', BASE, '-o', str(tmp_path), '--no-bsk', '--no-oa', '--list-only']), patch.object(j, 'load_saved_cookies', return_value=[]), patch.object(j.StealthyFetcher, 'fetch', side_effect=[first, retry]):
         j.main()
     assert 'https://mirror.example/paper/files/S1.xlsx' in capsys.readouterr().out
+
+
+# ── P0 H4: table ids keep hierarchy, 'to' ranges, Appendix / Extended Data ──
+
+def test_h4_hierarchical_table_ids_do_not_collapse():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Table S1.1 and Table S1.2') == {'S1.1', 'S1.2'}
+
+
+def test_h4_to_range_is_expanded():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Tables S1 to S3') == {'S1', 'S2', 'S3'}
+
+
+def test_h4_bare_s_range_is_expanded():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('S1-S3') == {'S1', 'S2', 'S3'}
+
+
+def test_h4_appendix_and_extended_data_prefixes():
+    from supp_finder import supplementary_table_ids
+    assert supplementary_table_ids('Appendix A1-A3') == {'A1', 'A2', 'A3'}
+    assert supplementary_table_ids('Extended Data Table 1') == {'E1'}
+    assert supplementary_table_ids('Extended Data Tables 1-3') == {'E1', 'E2', 'E3'}
+
+
+def test_h4_to_range_missing_member_is_reported():
+    result = find_all_candidates('<section id="supplementary">Tables S1 to S3<a href="/S1.xlsx">Table S1</a><a href="/S2.xlsx">Table S2</a></section>', BASE)
+    assert result.is_incomplete and 'S3' in result.incomplete_reason
+
+
+def test_h4_hierarchical_missing_member_is_reported():
+    result = find_all_candidates('<section id="supplementary">Tables S1.1 and S1.2<a href="/S1-1.xlsx">Table S1.1</a></section>', BASE)
+    assert result.is_incomplete and 'S1.2' in result.incomplete_reason
