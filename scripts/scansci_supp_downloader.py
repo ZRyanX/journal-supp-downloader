@@ -1089,6 +1089,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             return filepath
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
+    last_error = ""  # P1 (50-paper test, Cause G): keep the last failure reason for the final FAIL line
 
     # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
     # H9: stream to a same-directory temp file, validate it, then commit
@@ -1152,8 +1153,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = f"requests: {e}"
         finally:
             discard_temp_file(tmp_path)
 
@@ -1209,8 +1210,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
-        except Exception:
-            pass
+        except Exception as e:
+            last_error = f"scrapling: {e}"
         finally:
             discard_temp_file(tmp_path)
 
@@ -1310,7 +1311,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 return filepath
-        except Exception:
+        except Exception as e:
+            last_error = f"browser: {e}"
             try:
                 session_stealth.close()
             except Exception:
@@ -1362,12 +1364,12 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
-    except Exception:
-        pass
+    except Exception as e:
+        last_error = f"curl: {e}"
     finally:
         discard_temp_file(tmp_path)
 
-    print("FAIL")
+    print(f"FAIL ({last_error})" if last_error else "FAIL")
     return None
 
 

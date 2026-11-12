@@ -2328,6 +2328,13 @@ _TABLE_TOKEN_RE = re.compile(
 )
 _TABLE_RANGE_SEP_RE = re.compile(r"^\s*(?:-|\bto\b|至|~|到)\s*$", re.IGNORECASE)
 _TABLE_LIST_SEP_RE = re.compile(r"^\s*(?:[,、，/]\s*)?(?:and|&|和|及|与)?\s*$", re.IGNORECASE)
+# URLs and DOIs must never be read for table ids: a DOI path segment such as
+# 's41467-025-61134-0' otherwise parses as S41467/S25/S61134/S0 (50-paper test,
+# Cause A). Masked with same-length spaces so token offsets stay valid.
+_URL_DOI_MASK_RE = re.compile(
+    r"(?:https?://|doi\.org/)[^\s\"'<>\]]+|\b10\.\d{4,9}/[^\s\"'<>\]]+",
+    re.IGNORECASE,
+)
 
 
 def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optional[str]) -> Optional[str]:
@@ -2382,6 +2389,8 @@ def supplementary_table_ids(text):
     text = str(text or "")
     # Normalize unicode dashes so range separators are uniform.
     text = re.sub(r"[‐‑‒–—―]", "-", text)
+    # Blank out URLs/DOIs (same length, offsets preserved) before scanning.
+    text = _URL_DOI_MASK_RE.sub(lambda m: " " * len(m.group(0)), text)
     tokens = []  # (namespace-or-None, number, has_context, start, end)
     for m in _TABLE_TOKEN_RE.finditer(text):
         pw = m.group("pw")
@@ -2390,6 +2399,16 @@ def supplementary_table_ids(text):
         num = _parse_table_number(m.group("num"))
         if num is None:
             continue
+        # Reject implausible table numbers: supplementary tables are numbered
+        # from 1 and stay well under 1000; larger digit runs are article
+        # numbers, years or accessions, not table ids.
+        if num[0].isdigit():
+            num_parts = num.split(".")
+            try:
+                if int(num_parts[0]) < 1 or any(int(p) > 999 for p in num_parts):
+                    continue
+            except ValueError:
+                continue
         # A Latin prefix word glued to a bare number ('Supplementary3') is not
         # a table id unless an S/A/E letter is present; Chinese 附表/附录
         # legitimately take the number with no space.
@@ -2402,12 +2421,12 @@ def supplementary_table_ids(text):
         # can still inherit the namespace of a range/list neighbour
         # ('Supplementary Tables 2-5' -> S2..S5).
         if not pw and not letter and not post:
-            tokens.append({"ns": None, "num": num, "context": False, "start": m.start(), "end": m.end()})
+            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "start": m.start(), "end": m.end()})
             continue
         ns = _table_token_namespace(pw, letter, post)
         if ns is None:
             continue
-        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "start": m.start(), "end": m.end()})
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "start": m.start(), "end": m.end()})
 
     # Group consecutive tokens joined only by a range/list separator.
     groups = []  # each: [(token, sep_from_previous)] with sep None for the first
@@ -2440,7 +2459,7 @@ def supplementary_table_ids(text):
             if ns is None:
                 continue
             last_ns = ns
-            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"]}, sep))
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False)}, sep))
         expanded: Set[str] = set()
         for idx, (tok, sep) in enumerate(resolved):
             if sep == "range" and idx > 0:
@@ -2449,6 +2468,10 @@ def supplementary_table_ids(text):
                     span = _expand_table_range(prev_tok["num"], tok["num"])
                     if span is not None:
                         expanded.update(f"{tok['ns']}{n}" for n in span)
+                        continue
+                    if tok.get("bare"):
+                        # A failed range expansion must not mint a table id
+                        # from a bare number (e.g. a year after 'S1, 2020-2021').
                         continue
             expanded.add(f"{tok['ns']}{tok['num']}")
         result.update(expanded)
