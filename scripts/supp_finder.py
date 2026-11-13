@@ -1896,6 +1896,45 @@ def browser_budget_from_args(args, phase_deadline=None):
 _PRIORITY_DATA_EXTENSIONS = frozenset(DATA_EXTENSIONS) | {".pdf"}
 
 
+# P1 round-3 minor (a): the MITM egress proxy re-signs TLS with its own
+# CA, which Chromium does not trust -- round 3, Wiley #21-#23: one page's
+# first goto timed out and the retry failed with
+# net::ERR_CERT_AUTHORITY_INVALID, while a later attempt in the same
+# fetch went through. No call site passed any explicit trust config:
+# trust was entirely implicit in scrapling's own default
+# (StealthySessionMixin sets ignore_https_errors=True inside its
+# _context_options), so nothing guaranteed a fresh context or a retry
+# path carried the same trust config as the first context. One shared
+# helper builds that config so every StealthyFetcher.fetch /
+# StealthySession call -- first call and every retry, which copy the
+# same kwargs dict -- carries identical proxy + trust settings:
+#   * context level: additional_args={"ignore_https_errors": True}
+#     (scrapling merges additional_args into the context options with
+#     priority over its own defaults, so this also pins the behaviour
+#     if a scrapling upgrade ever drops the implicit default);
+#   * browser-launch level: extra_flags=["--ignore-certificate-errors"]
+#     (applied from process start, before any context exists -- this is
+#     what covers a first-navigation window in a fresh browser).
+# It returns {} with no proxy, so direct runs keep full certificate
+# validation; only proxy mode relaxes it, because the proxy CA is the
+# reason certs fail there. A fresh dict is built on every call so a
+# caller mutating one call's kwargs cannot leak into the next.
+# CDP / BrowserSkill paths attach to a live browser and cannot take a
+# per-request proxy or trust config; they are intentionally untouched.
+def proxy_browser_trust_kwargs(proxy):
+    """StealthyFetcher / StealthySession kwargs carrying the MITM-proxy
+    certificate trust config for ``proxy`` (``http://[user:pass@]host:port``).
+
+    Returns {} when no proxy is set (no trust relaxation at all).
+    """
+    if not proxy:
+        return {}
+    return {
+        "additional_args": {"ignore_https_errors": True},
+        "extra_flags": ["--ignore-certificate-errors"],
+    }
+
+
 def candidate_priority(cand: "Candidate") -> int:
     """Priority tier for download order (P1-CE; lower runs first).
 

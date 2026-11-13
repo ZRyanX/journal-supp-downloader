@@ -70,6 +70,9 @@ from supp_finder import (
     DEFAULT_PHASE_TIMEOUT_SECONDS,
     resolve_phase_timeout,
     sort_candidates_by_priority,
+    # P1 round-3 minor (a): MITM-proxy certificate trust for the browser
+    # layer (first call and every retry carry the same config).
+    proxy_browser_trust_kwargs,
     # P1 H-1: independent budget for the browser fallback.
     DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
     DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
@@ -601,6 +604,11 @@ def run_download(args, bsk_runtime):
         "page_action": expand_page_accordions_action,
         "google_search": False,
     }
+    # P1 round-3 minor (a): the MITM proxy's CA trust config. fetch_kwargs
+    # is built once and every later fetch copies it (CDP retry, OA mirror,
+    # browser retry), so first call and retries carry identical proxy +
+    # trust settings -- proxy mode only; no proxy means no trust keys.
+    fetch_kwargs.update(proxy_browser_trust_kwargs(args.proxy))
     if cookies:
         fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
 

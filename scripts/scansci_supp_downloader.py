@@ -99,6 +99,9 @@ from supp_finder import (
     DEFAULT_PHASE_TIMEOUT_SECONDS,
     resolve_phase_timeout,
     sort_candidates_by_priority,
+    # P1 round-3 minor (a): MITM-proxy certificate trust for the browser
+    # layer (first call and every retry carry the same config).
+    proxy_browser_trust_kwargs,
     # P1 H-1: independent budget for the browser fallback.
     DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
     DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
@@ -1519,6 +1522,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             _proxy_cfg = playwright_proxy_config(proxy)
             if _proxy_cfg is not None:
                 _stealth_kwargs["proxy"] = _proxy_cfg
+            # P1 round-3 minor (a): the MITM proxy's CA trust rides on
+            # every fresh StealthySession context, not just the first
+            # fetch -- proxy mode only; no proxy means no trust keys.
+            _stealth_kwargs.update(proxy_browser_trust_kwargs(proxy))
             session_stealth = StealthySession(**_stealth_kwargs)
             session_stealth.start()
             context = session_stealth.context
@@ -1842,6 +1849,10 @@ def fetch_page_html(
         # entirely when no proxy so unset behaviour is unchanged.
         if proxy:
             sc_args["proxy"] = proxy
+        # P1 round-3 minor (a): the MITM proxy's CA trust config, same
+        # on the first attempt and on the no-CDP retry below (it copies
+        # sc_args) -- proxy mode only; no proxy means no trust keys.
+        sc_args.update(proxy_browser_trust_kwargs(proxy))
         if cdp_url:
             sc_args["cdp_url"] = cdp_url
             print(f"    (Connecting over CDP to live browser: {cdp_url})")
