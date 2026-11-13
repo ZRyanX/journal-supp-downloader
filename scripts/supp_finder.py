@@ -313,6 +313,10 @@ class FindingDiagnostics:
     incomplete_reason: str = ""
     candidates: List[Candidate] = field(default_factory=list)
     excluded_links: List[Tuple[str, str]] = field(default_factory=list)
+    # P1-B: (url, reason) for candidates dropped by the junk-candidate
+    # filter (junk_candidate_reason); unlike excluded_links these are
+    # logged with their reason instead of being silently discarded.
+    junk_filtered: List[Tuple[str, str]] = field(default_factory=list)
     strategy_counts: Dict[str, int] = field(default_factory=dict)
     # H3: static parsing could not settle the page; a browser render is
     # needed (supplementary heading/section with no candidates, or inline
@@ -328,6 +332,135 @@ def _iter_base_urls(base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) 
     if isinstance(base_url, str):
         return [base_url]
     return [u for u in base_url if isinstance(u, str) and u]
+
+
+def _host_of(url: str) -> str:
+    try:
+        host = urllib.parse.urlsplit(url).netloc.lower()
+    except ValueError:
+        return ""
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.split(":", 1)[0]
+
+
+def _same_pmc_instance(url: str, base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) -> bool:
+    """True when a PMC /bin/ candidate comes from the same article instance
+    as the page it was found on (so it is that article's own file)."""
+    m = re.search(r"/instance/(\d+)/", url or "")
+    if not m:
+        return False
+    return any(f"/instance/{m.group(1)}/" in b for b in _iter_base_urls(base_url))
+
+
+def junk_candidate_reason(
+    url: str,
+    text: str = "",
+    filename: str = "",
+    attrs: Optional[Dict[str, str]] = None,
+    base_url: Union[str, List[str], Tuple[str, ...], Set[str]] = "",
+    is_data_file: bool = False,
+    is_explicit_supp: bool = False,
+) -> Optional[str]:
+    """Reason a candidate is confirmed junk (P1-B), or None.
+
+    Only patterns confirmed in the 50-paper live test are listed. The
+    GEO / CC rules never fire on a real data file or an explicitly
+    supplementary link, so genuine supplements
+    (xlsx/xls/csv/tsv/docx/pdf/zip/...) are unaffected; the CRAN and
+    Table/Appendix rules use page-shape guards instead (a CRAN tarball
+    lives under /src/contrib/, not on a package page; an explicit
+    'Supplementary Table S1' served as HTML is kept). The first two
+    groups are checked regardless of extension because a challenge page
+    and a preprint-version attachment are never this article's supplement
+    even when they happen to be a PDF.
+    """
+    if not url:
+        return None
+    url_lower = url.lower()
+    labels = [(text or ""), (filename or "")]
+    if attrs:
+        labels.extend(str(v) for v in attrs.values() if isinstance(v, str))
+
+    # Client Challenge page (eLife anti-bot wall): the link *is* the wall.
+    for label in labels:
+        if re.sub(r"\s+", " ", label.strip().lower()) == "client challenge":
+            return "client_challenge_page"
+    if "client-challenge" in url_lower:
+        return "client_challenge_page"
+
+    # bioRxiv / medRxiv preprint attachments: the preprint version's
+    # supplement (e.g. the NIHPP...-supplement-1.pdf filed under a
+    # different PMC instance, #46), not the published article's file.
+    # Not junk when the page being scanned IS the preprint itself.
+    base_hosts = {_host_of(b) for b in _iter_base_urls(base_url)}
+    base_is_preprint = bool(base_hosts & {"biorxiv.org", "medrxiv.org"}) or any(
+        "10.1101/" in b.lower() for b in _iter_base_urls(base_url)
+    )
+    if not base_is_preprint:
+        host = _host_of(url)
+        if host in {"biorxiv.org", "medrxiv.org"} or "10.1101/" in url_lower:
+            return "biorxiv_preprint_attachment"
+        base_name = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(url).path)).lower()
+        fname_lower = (filename or "").lower()
+        if (
+            re.match(r"nihpp\d{4}\.\d{2}\.\d{2}\.", base_name)
+            or re.match(r"nihpp\d{4}\.\d{2}\.\d{2}\.", fname_lower)
+        ) and not _same_pmc_instance(url, base_url):
+            return "biorxiv_preprint_attachment"
+
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    host = _host_of(url)
+    path = parts.path.lower()
+
+    # CRAN package page (e.g. /web/packages/MASS/index.html, or the home
+    # page). Checked before the data-file immunity because
+    # check_data_extension mistakes the '.r-' in 'cran.r-project.org' for
+    # an R-script extension; the page-like path condition is what protects
+    # real CRAN files (tarballs live under /src/contrib/, not here).
+    if host in {"cran.r-project.org", "www.cran.r-project.org"} and (
+        path == "/" or path.startswith("/web/packages/") or path.endswith((".html", ".htm"))
+    ):
+        return "cran_package_page"
+
+    # Table / Appendix .html navigation page: an in-article table rendered
+    # as a web page, not a downloadable supplement. Only when the link is
+    # a bare 'Table N' / 'Appendix N' label (or filename) pointing at an
+    # .html page with no supplementary marker (/bin/, mmc, esm, supp...).
+    # Exempted only by an explicit supplementary word, not by the bare
+    # table label itself: 'Appendix 7' is a table label, 'Supplementary
+    # Table S1' is a supplement.
+    if (
+        path.endswith((".html", ".htm"))
+        and not is_data_file
+        and not any(marker in url_lower for marker in ("/bin/", "mmc", "esm", "supp"))
+        and "suppl" not in ((text or "") + " " + (filename or "")).lower()
+    ):
+        text_norm = (text or "").strip()
+        fname_norm = (filename or "").strip()
+        base_name = os.path.basename(urllib.parse.unquote(parts.path))
+        if (
+            re.match(r"^(?:table|appendix)\s+\S+$", text_norm, re.IGNORECASE)
+            or re.match(r"^(?:table|appendix)\b.*\.html?$", fname_norm, re.IGNORECASE)
+            or re.match(r"^(?:table|appendix)[ _-]?\w*\.html?$", base_name, re.IGNORECASE)
+        ):
+            return "table_appendix_html_nav"
+
+    if is_data_file or is_explicit_supp:
+        return None
+
+    # GEO query page: an accession lookup (acc.cgi?acc=GSE...), not a file.
+    if host in {"ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov"} and path.startswith("/geo/query/acc.cgi"):
+        return "geo_acc_cgi"
+    # Creative Commons licence page (e.g. /licenses/by/4.0/).
+    if host == "creativecommons.org" and path.startswith("/licenses/"):
+        return "cc_license"
+    return None
 
 
 def is_same_page_fragment(url: str, base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) -> bool:
@@ -366,8 +499,16 @@ def is_excluded_url(
     base_url: Union[str, List[str], Tuple[str, ...], Set[str]] = "",
     text: str = "",
     attrs: Optional[Dict[str, str]] = None,
+    filename: str = "",
+    diag: Optional["FindingDiagnostics"] = None,
 ) -> bool:
-    """Check if a URL should be excluded (references, external sites, anchors, etc.)."""
+    """Check if a URL should be excluded (references, external sites, anchors, etc.).
+
+    P1-B: a URL dropped by the junk-candidate filter is recorded in
+    ``diag.junk_filtered`` with its reason and logged as a ``[Filtered]``
+    line instead of being silently discarded (only when ``diag`` is given,
+    i.e. inside a find_all_candidates run).
+    """
     if not url or url.startswith("javascript:") or url.startswith("mailto:") or url.startswith("tel:"):
         return True
     if url.startswith("#"):
@@ -387,6 +528,18 @@ def is_excluded_url(
         (text and is_explicit_supp_table(text))
         or (attrs and any(is_explicit_supp_table(str(v)) for v in attrs.values() if v))
     )
+
+    # P1-B: confirmed junk candidates (GEO acc.cgi, CC licence, CRAN,
+    # Table/Appendix .html nav, bioRxiv preprint, Client Challenge).
+    junk_reason = junk_candidate_reason(
+        url, text=text, filename=filename, attrs=attrs, base_url=base_url,
+        is_data_file=is_data_or_supp_file, is_explicit_supp=is_explicit_supp_context,
+    )
+    if junk_reason:
+        if diag is not None and (url, junk_reason) not in diag.junk_filtered:
+            diag.junk_filtered.append((url, junk_reason))
+            print(f"    [Filtered] {url} ({junk_reason})")
+        return True
 
     for pattern in EXCLUDE_URL_PATTERNS:
         if pattern == r"doi\.org/10\.\d+/":
@@ -1420,7 +1573,106 @@ def _normalize_url_for_dedup(url: str) -> str:
     ]
     kept.sort()
     query = urllib.parse.urlencode(kept)
-    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+    # P1-B: a default port is not a different file (PMC serves the same
+    # /bin/ file with and without :443, e.g. #46's MOESM1 x3).
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        prefix = userinfo + "@"
+    else:
+        hostport, prefix = netloc, ""
+    if scheme == "https" and hostport.endswith(":443"):
+        hostport = hostport[:-4]
+    elif scheme == "http" and hostport.endswith(":80"):
+        hostport = hostport[:-3]
+    netloc = prefix + hostport
+    return urllib.parse.urlunsplit((scheme, netloc, parts.path, query, ""))
+
+
+# P1-B: a trailing _N on a filename is (almost always) a collision suffix
+# produced by the D2 disambiguators (find_all_candidates / download_file),
+# not part of the file's identity: 'MOESM1_ESM_2.pdf', 'Appendix 7_18.bin'
+# and 's001_2.docx' are the same file as their unsuffixed form. A large
+# number is a real identifier instead (Wiley attachment_1001), so only
+# _2.._999 are stripped. Generic placeholder names carry no identity at
+# all and are exempt from filename dedup (URL dedup still applies).
+_DUP_SUFFIX_RE = re.compile(r"_(\d+)$")
+_GENERIC_DEDUP_EXEMPT_FILENAMES = frozenset({
+    "download.bin", "download", "attachment.bin", "attachment",
+    "file.bin", "file", "asset.bin", "content.bin",
+    "index.html", "index.htm",
+})
+
+
+def filename_dedup_key(filename: str) -> Optional[str]:
+    """Normalized filename dedup key, or None when the name carries no
+    identity (empty / generic placeholder) and must not dedup by name."""
+    name = urllib.parse.unquote((filename or "").strip()).lower()
+    if not name or name in _GENERIC_DEDUP_EXEMPT_FILENAMES:
+        return None
+    base, ext = os.path.splitext(name)
+    while True:
+        m = _DUP_SUFFIX_RE.search(base)
+        if not m:
+            break
+        if not 2 <= int(m.group(1)) <= 999:
+            break
+        base = base[:m.start()]
+    key = base + ext
+    if not key or key in _GENERIC_DEDUP_EXEMPT_FILENAMES:
+        return None
+    return key
+
+
+def dedupe_candidates(candidates: List["Candidate"]) -> List["Candidate"]:
+    """Merge candidates that point at the same file by normalized URL or by
+    normalized filename (P1-B). Order is preserved; the first occurrence is
+    kept and absorbs the table ids of the duplicates (H6 merge)."""
+    kept: List["Candidate"] = []
+    by_url: Dict[str, "Candidate"] = {}
+    by_fname: Dict[str, "Candidate"] = {}
+    for cand in candidates:
+        raw_url = (cand.url or "").strip()
+        norm_url = _normalize_url_for_dedup(raw_url.split("#")[0].strip()) if raw_url else ""
+        fname_key = filename_dedup_key(cand.filename)
+        existing = by_url.get(norm_url) if norm_url else None
+        if existing is None and fname_key is not None:
+            existing = by_fname.get(fname_key)
+        if existing is not None:
+            _merge_duplicate_candidate(existing, cand)
+            continue
+        if norm_url:
+            by_url[norm_url] = cand
+        if fname_key is not None:
+            by_fname[fname_key] = cand
+        kept.append(cand)
+    return kept
+
+
+def _merge_duplicate_candidate(existing: "Candidate", cand: "Candidate") -> None:
+    """Fold a duplicate candidate into the kept one (H6): union the table
+    ids, prefer an explicit supplementary label, prefer a specific filename
+    over a generic one, and prefer the unsuffixed filename (P1-B)."""
+    existing.covered_table_ids |= cand.covered_table_ids
+    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
+        existing.link_text = cand.link_text
+    is_existing_generic = (
+        existing.filename.endswith(".bin")
+        or existing.filename.startswith("download_")
+        or existing.filename.startswith("attachment_")
+    )
+    is_cand_specific = not (
+        cand.filename.endswith(".bin")
+        or cand.filename.startswith("download_")
+        or cand.filename.startswith("attachment_")
+    )
+    if is_existing_generic and is_cand_specific:
+        existing.filename = cand.filename
+    elif _DUP_SUFFIX_RE.search(os.path.splitext(existing.filename)[0] or "") and not _DUP_SUFFIX_RE.search(
+        os.path.splitext(cand.filename)[0] or ""
+    ):
+        existing.filename = cand.filename
 
 
 def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
@@ -1528,6 +1780,7 @@ def find_all_candidates(
 
     soup = BeautifulSoup(html_content, DEFAULT_PARSER)
     seen_urls: Set[str] = set()
+    seen_fnames: Set[str] = set()
     candidates: List[Candidate] = []
 
     def add_candidate(cand: Candidate):
@@ -1539,7 +1792,7 @@ def find_all_candidates(
         if not raw_cand_url:
             return
         # Check raw_cand_url BEFORE stripping '#' so in-page fragments are caught
-        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
+        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs, filename=cand.filename, diag=diag):
             diag.excluded_links.append((raw_cand_url, "excluded_url_pattern"))
             return
         norm_url = raw_cand_url.split("#")[0].strip()
@@ -1548,7 +1801,7 @@ def find_all_candidates(
         if is_same_article_page_url(norm_url, page_urls):
             diag.excluded_links.append((norm_url, "same_article_page_url"))
             return
-        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
+        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs, filename=cand.filename, diag=diag):
             diag.excluded_links.append((norm_url, "excluded_url_pattern"))
             return
         if is_article_figure_url(norm_url, text=cand.link_text, attrs=evidence_attrs):
@@ -1566,24 +1819,24 @@ def find_all_candidates(
             # 'Table S2') keeps ONE candidate but merges both labels/table ids.
             for existing in candidates:
                 if _normalize_url_for_dedup(existing.url.split("#")[0].strip()) == dedup_key:
-                    existing.covered_table_ids |= cand.covered_table_ids
-                    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
-                        existing.link_text = cand.link_text
-                    is_existing_generic = (
-                        existing.filename.endswith(".bin")
-                        or existing.filename.startswith("download_")
-                        or existing.filename.startswith("attachment_")
-                    )
-                    is_cand_specific = not (
-                        cand.filename.endswith(".bin")
-                        or cand.filename.startswith("download_")
-                        or cand.filename.startswith("attachment_")
-                    )
-                    if is_existing_generic and is_cand_specific:
-                        existing.filename = cand.filename
+                    _merge_duplicate_candidate(existing, cand)
+                    break
+            return
+        # P1-B: same file reached via a different (mirror) URL -- e.g. the
+        # Springer static-content URL and the PMC /bin/ URL for one MOESM
+        # (#46), or the 18 /table/app7tableN/ links all labelled
+        # 'Appendix 7' (#36) -- keeps ONE candidate, keyed on the
+        # normalized filename (_2-style collision suffixes ignored).
+        fname_key = filename_dedup_key(cand.filename)
+        if fname_key is not None and fname_key in seen_fnames:
+            for existing in candidates:
+                if filename_dedup_key(existing.filename) == fname_key:
+                    _merge_duplicate_candidate(existing, cand)
                     break
             return
         seen_urls.add(dedup_key)
+        if fname_key is not None:
+            seen_fnames.add(fname_key)
         candidates.append(cand)
 
     # ── Strategy 1: Targeted Meta & Link Tags (Highwire, Nature, etc.) ────
@@ -1628,7 +1881,7 @@ def find_all_candidates(
         attrs = {k: tag[k] for k in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption", "value"] if tag.has_attr(k)}
 
         full_url = urllib.parse.urljoin(effective_base, target_raw)
-        if is_excluded_url(full_url, base_url=page_urls, text=link_text, attrs=attrs):
+        if is_excluded_url(full_url, base_url=page_urls, text=link_text, attrs=attrs, diag=diag):
             diag.excluded_links.append((full_url, "excluded_url_pattern"))
             continue
         if is_same_article_page_url(full_url, page_urls):
@@ -1716,10 +1969,10 @@ def find_all_candidates(
         any(d in combined_url for d in ["ncbi.nlm.nih.gov", "pmc", "europepmc"])
         or soup.find("a", attrs={"data-ga-action": re.compile(r"click_(?:feat_)?suppl", re.IGNORECASE)}) is not None
     ):
-        _extract_pmc_candidates(soup, effective_base, add_candidate)
+        _extract_pmc_candidates(soup, effective_base, add_candidate, diag=diag)
 
     # Embedded JSON data structures (Next.js / Nuxt / Publisher JSON payloads)
-    _extract_embedded_json_candidates(soup, effective_base, add_candidate)
+    _extract_embedded_json_candidates(soup, effective_base, add_candidate, diag=diag)
 
     # Disambiguate identical filenames across different candidates (D2)
     # Use case-insensitive tracking to prevent collisions on case-insensitive filesystems (macOS/Windows)
@@ -1872,7 +2125,7 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
         ))
 
 
-def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
+def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=None):
     """PMC (PubMed Central) and Europe PMC supplementary material extraction."""
     # 1. Links inside PMC supplementary sections
     for sec in soup.find_all(
@@ -1888,7 +2141,7 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
                 continue
             link_text = a.get_text(separator=" ", strip=True)
             full_url = urllib.parse.urljoin(base_url, target)
-            if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+            if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
                 continue
             fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
             add_func(Candidate(
@@ -1905,7 +2158,7 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
         href = a.get("href")
         link_text = a.get_text(separator=" ", strip=True)
         full_url = urllib.parse.urljoin(base_url, href)
-        if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+        if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
             continue
         fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
         add_func(Candidate(
@@ -1923,7 +2176,7 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
         if href:
             link_text = a.get_text(separator=" ", strip=True)
             full_url = urllib.parse.urljoin(base_url, href)
-            if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+            if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
                 continue
             fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
             add_func(Candidate(
@@ -1964,11 +2217,11 @@ def _is_plausible_json_url_or_path(cand_raw: str) -> bool:
     return True
 
 
-def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: Optional[Set[str]] = None):
+def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: Optional[Set[str]] = None, diag=None):
     """Recursively inspect parsed JSON objects for extensionless supplementary/table download entries."""
     if isinstance(node, list):
         for item in node:
-            _walk_json_for_supp_objects(item, base_url, add_func, consumed_names)
+            _walk_json_for_supp_objects(item, base_url, add_func, consumed_names, diag=diag)
         return
     if not isinstance(node, dict):
         return
@@ -2008,7 +2261,7 @@ def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: O
             cand_path = urllib.parse.urlsplit(cand_url).path.lower()
             if not any(cand_path.endswith(ext) for ext in [".js", ".css", ".map", ".svg", ".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf"]):
                 if not any(kw in cand_path for kw in ["table-of-contents", "table_of_contents", "/support", "customer-support", "/toc"]):
-                    if not is_excluded_url(cand_url, base_url=base_url, text=best_name) and not is_article_figure_url(cand_url, text=best_name):
+                    if not is_excluded_url(cand_url, base_url=base_url, text=best_name, diag=diag) and not is_article_figure_url(cand_url, text=best_name):
                         fname = extract_filename_from_url(cand_url, default_name=best_name)
                         add_func(Candidate(
                             url=cand_url,
@@ -2021,10 +2274,10 @@ def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: O
 
     for val in node.values():
         if isinstance(val, (dict, list)):
-            _walk_json_for_supp_objects(val, base_url, add_func, consumed_names)
+            _walk_json_for_supp_objects(val, base_url, add_func, consumed_names, diag=diag)
 
 
-def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func):
+def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=None):
     """Extract supplementary URLs embedded inside <script> JSON, LD-JSON, or inline scripts (B3)."""
     valid_data_exts = "|".join(re.escape(ext.lstrip(".")) for ext in SORTED_DATA_EXTENSIONS)
     pattern = re.compile(
@@ -2060,7 +2313,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
             if str_stripped.startswith(("{", "[")):
                 try:
                     parsed_json = json.loads(str_stripped)
-                    _walk_json_for_supp_objects(parsed_json, base_url, add_func, consumed_names)
+                    _walk_json_for_supp_objects(parsed_json, base_url, add_func, consumed_names, diag=diag)
                 except Exception:
                     pass
             else:
@@ -2069,7 +2322,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                     start_idx = assign_m.start(1)
                     try:
                         parsed_sub, _ = decoder.raw_decode(content_unescaped, start_idx)
-                        _walk_json_for_supp_objects(parsed_sub, base_url, add_func, consumed_names)
+                        _walk_json_for_supp_objects(parsed_sub, base_url, add_func, consumed_names, diag=diag)
                     except Exception:
                         pass
             # Also scan inline JS object literals containing downloadUrl/fileUrl + fileName/title
@@ -2077,7 +2330,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                 try:
                     obj_data = json.loads(obj_m.group(0))
                     if isinstance(obj_data, dict):
-                        _walk_json_for_supp_objects(obj_data, base_url, add_func, consumed_names)
+                        _walk_json_for_supp_objects(obj_data, base_url, add_func, consumed_names, diag=diag)
                 except Exception:
                     pass
 
@@ -2099,7 +2352,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                 # Exclude navigation/UI routes
                 if any(kw in cand_path for kw in ["table-of-contents", "table_of_contents", "/support", "customer-support", "/toc"]):
                     continue
-                if not is_excluded_url(cand_url, base_url=base_url) and not is_article_figure_url(cand_url):
+                if not is_excluded_url(cand_url, base_url=base_url, diag=diag) and not is_article_figure_url(cand_url):
                     add_func(Candidate(
                         url=cand_url,
                         filename=extract_filename_from_url(cand_url),

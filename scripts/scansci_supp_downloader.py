@@ -71,6 +71,8 @@ from supp_finder import (
     is_excluded_url,
     is_article_figure_url,
     check_data_extension,
+    filename_dedup_key,
+    dedupe_candidates,
     is_explicit_supp_table,
     is_table_text_or_attribute,
     should_match_candidate,
@@ -1907,6 +1909,23 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         manifest = load_download_manifest(article_dir)
         downloaded_urls = {manifest_entry_url(v) for v in manifest.values()}
         existing_basenames = {os.path.basename(f) for f in existing_files}
+        # P1-B: resume set by normalized filename, not just URL: a file
+        # already downloaded via another mirror URL -- or left behind as a
+        # _2 copy by an earlier run -- counts as already downloaded.
+        downloaded_fnames = {
+            k for k in (
+                filename_dedup_key(name)
+                for name in list(manifest)
+                + [os.path.basename(f) for f in existing_files]
+            ) if k is not None
+        }
+        if os.path.exists(article_dir):
+            for f in os.listdir(article_dir):
+                if f.startswith("."):
+                    continue
+                key = filename_dedup_key(f)
+                if key is not None:
+                    downloaded_fnames.add(key)
         downloaded_mmcs = set()
         for k, v in manifest.items():
             for s in (k, manifest_entry_url(v)):
@@ -1928,6 +1947,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     downloaded_mmcs.add(int(m_f.group(1)))
 
         seen_cand_urls = set()
+        seen_cand_fnames = set()
         new_candidates = []
         for cand in diag.candidates:
             if cand.url in downloaded_urls or cand.url in seen_cand_urls:
@@ -1935,11 +1955,19 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             cand_fname = cand.filename or extract_filename_from_url(cand.url)
             if cand_fname in existing_basenames:
                 continue
+            # P1-B: same filename (normalized, _2 suffix ignored) already
+            # downloaded in this run / a previous run, or seen twice in
+            # this batch under different URLs -- download it once.
+            cand_fkey = filename_dedup_key(cand_fname)
+            if cand_fkey is not None and (cand_fkey in downloaded_fnames or cand_fkey in seen_cand_fnames):
+                continue
             # Skip if candidate refers to an MMC file that was already downloaded
             m_cand = MMC_NUM_REGEX.search(cand.url + " " + cand_fname)
             if m_cand and int(m_cand.group(1)) in downloaded_mmcs:
                 continue
             seen_cand_urls.add(cand.url)
+            if cand_fkey is not None:
+                seen_cand_fnames.add(cand_fkey)
             new_candidates.append(cand)
 
         if new_candidates:
@@ -2380,6 +2408,9 @@ def run_download(args, bsk_runtime):
         return
 
     candidates = expand_repository_candidates(candidates)
+    # P1-B: tiers / mirrors can re-discover the same file under another URL
+    # (Springer vs PMC, :443 vs plain); download it once.
+    candidates = dedupe_candidates(candidates)
     diag.candidates = candidates
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 

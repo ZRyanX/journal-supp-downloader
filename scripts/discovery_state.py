@@ -5,6 +5,7 @@ from supp_finder import (BeautifulSoup, DEFAULT_PARSER, supplementary_table_ids,
                          declared_file_count, covered_table_ids,
                          detect_declared_supplement_count,
                          detect_declared_table_range,
+                         filename_dedup_key,
                          is_result_obviously_incomplete,
                          page_fetch_is_failure)
 
@@ -298,9 +299,15 @@ def download_with_recovery(candidates, download, mirrors, expand,
     allowed_retries = max_retries if retry_download is not None else min(max_retries, 1)
     attempted, successful, failed = set(), [], []
     successful_urls = set()
+    # P1-B: normalized filenames already downloaded in this run. A second
+    # URL for the same filename (e.g. a PMC mirror of a Springer file) is
+    # not downloaded again; a *failed* file is NOT in this set, so it still
+    # gets its fresh mirror-round attempt (H8).
+    successful_filenames = set()
 
     def attempt(items):
         seen_this_round = set()
+        seen_fnames_this_round = set()
         for candidate in items:
             if candidate.url in seen_this_round:
                 continue
@@ -309,6 +316,11 @@ def download_with_recovery(candidates, download, mirrors, expand,
                 # Already downloaded in an earlier round; only failed
                 # URLs get a fresh attempt in a later round.
                 continue
+            fname_key = filename_dedup_key(getattr(candidate, "filename", "") or "")
+            if fname_key is not None:
+                if fname_key in successful_filenames or fname_key in seen_fnames_this_round:
+                    continue
+                seen_fnames_this_round.add(fname_key)
             attempted.add(candidate.url)
             ok, last_reason = False, None
             for n in range(allowed_retries + 1):
@@ -334,6 +346,8 @@ def download_with_recovery(candidates, download, mirrors, expand,
             if ok:
                 successful.append(candidate)
                 successful_urls.add(candidate.url)
+                if fname_key is not None:
+                    successful_filenames.add(fname_key)
             else:
                 failed.append(candidate)
                 failures[candidate.url] = last_reason
