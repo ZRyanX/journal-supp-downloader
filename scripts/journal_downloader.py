@@ -434,21 +434,29 @@ def main():
         help="Overall budget in seconds for this phase (discovery + "
              "download). On expiry, already-discovered candidates are kept "
              "in the partial results file and downloading stops instead of "
-             "being killed mid-list (default: 150)"
+             "being killed mid-list. Every page load is additionally capped "
+             "at the remaining phase budget, so one load can never run past "
+             "the deadline (default: 150)"
     )
     # P1 H-1: the browser fallback gets its own quotas -- one page goto
     # at most 30s, 60s of browser time in total per phase. Either quota
     # running out degrades to the OA mirror round instead of killing
     # the phase inside one page load (round 3: #1 hung 120s+ on
     # nature.com, mirrors never ran, 0 files).
+    # P1 C: both quotas are additionally capped at the remaining phase
+    # budget -- a single goto runs at most min(goto, total remaining,
+    # phase remaining), and the fallback budget counts as exhausted
+    # once the phase deadline passes.
     parser.add_argument(
         "--browser-goto-timeout", type=float, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
         help="Max seconds for one browser page load (goto) in the "
-             "fallback path (default: 30)"
+             "fallback path, capped at the remaining phase budget "
+             "(default: 30)"
     )
     parser.add_argument(
         "--browser-fallback-budget", type=float, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
-        help="Max total seconds of browser fallback time per phase; "
+        help="Max total seconds of browser fallback time per phase, "
+             "capped at the remaining phase budget; "
              "once spent, the run degrades to the OA mirror round "
              "instead of launching another browser (default: 60)"
     )
@@ -517,11 +525,21 @@ def run_download(args, bsk_runtime):
     def _phase_expired():
         return time.monotonic() >= phase_deadline
 
+    def _phase_remaining():
+        """Seconds of phase budget left (0 once expired). Page-load
+        timeouts are clamped to this (P1 C), so no load starts with
+        more time than the phase has left."""
+        return max(0.0, phase_deadline - time.monotonic())
+
     print(f"Phase timeout: {phase_timeout:g}s")
 
     # P1 H-1: the browser fallback's own quota (default: one goto 30s,
     # 60s total per phase), shared by every browser attempt below.
-    browser_budget = browser_budget_from_args(args)
+    # P1 C: the run's phase deadline is passed in as well, so the
+    # fallback quota can never outlive the phase: one attempt runs at
+    # most min(goto, total remaining, phase remaining), and the budget
+    # counts as exhausted once the phase deadline passes.
+    browser_budget = browser_budget_from_args(args, phase_deadline=phase_deadline)
     print(f"Browser fallback budget: {browser_budget.goto_timeout:g}s per page, "
           f"{browser_budget.total_budget:g}s total")
 
@@ -573,7 +591,11 @@ def run_download(args, bsk_runtime):
         # P1 H-1: the page fetch is a browser goto too -- cap it at the
         # goto timeout (30s by default) instead of --timeout (60s), so
         # step [1/3] alone cannot eat the phase budget (round 3 #1).
-        "timeout": min(args.timeout, int(browser_budget.goto_timeout * 1000)),
+        # P1 C: cap it at the *attempt* timeout, not just the goto
+        # quota -- the attempt timeout is min(goto, total remaining,
+        # phase remaining), so a fetch launched with 10s of phase
+        # left runs at most 10s.
+        "timeout": min(args.timeout, browser_budget.attempt_timeout_ms()),
         "proxy": args.proxy,
         "wait_selector": args.wait_selector,
         "page_action": expand_page_accordions_action,
@@ -584,7 +606,10 @@ def run_download(args, bsk_runtime):
 
     page = None
     # Primary BrowserSkill check if requested via --bsk / --browserskill
-    if getattr(args, "browserskill", False):
+    # P1 C: no load starts once the phase deadline has passed (here
+    # vacuous -- the phase just started -- but the check belongs on
+    # every load entry, including this one).
+    if getattr(args, "browserskill", False) and not _phase_expired():
         print("  [BrowserSkill] Fetching page via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
@@ -618,7 +643,7 @@ def run_download(args, bsk_runtime):
         else:
             print("  [CDP] No active browser CDP port detected. Falling back to standalone stealth browser.")
 
-    if cdp_target and page is None:
+    if cdp_target and page is None and not _phase_expired():
         # Extract live authenticated cookies from the browser session
         try:
             live_cdp_c = extract_cdp_cookies(cdp_target)
@@ -649,29 +674,41 @@ def run_download(args, bsk_runtime):
             print(f"  [CDP] Live tab attachment notice: {e_cdp}. Falling back to StealthyFetcher...")
 
     # Secondary: Scrapling StealthyFetcher fallback
-    if page is None:
+    # P1 C: each link of this chain is a page load of its own -- none
+    # of them starts once the phase deadline has passed, so the chain
+    # cannot spend 30s + 30s + 30s after the budget is already gone
+    # (round 3: the phase died inside one such load and the next links
+    # still ran until the runner killed the process).
+    if page is None and not _phase_expired():
         ws_cdp_url = resolve_cdp_ws_url(cdp_target) if cdp_target else None
         if ws_cdp_url:
             fetch_kwargs["cdp_url"] = ws_cdp_url
             fetch_kwargs.pop("real_chrome", None)
 
+        # P1 C: re-cap the timeout at launch -- the BSK / CDP attempts
+        # above may already have spent phase time since fetch_kwargs
+        # was built.
+        fetch_kwargs["timeout"] = min(args.timeout, browser_budget.attempt_timeout_ms())
         try:
             page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
         except Exception as e:
             print(f"  [Warning] Browser fetch encountered error: {e}")
-            if "cdp_url" in fetch_kwargs:
+            if "cdp_url" in fetch_kwargs and not _phase_expired():
                 print("  [Recovery] Retrying with standalone stealth browser...")
                 fb_kwargs = dict(fetch_kwargs)
                 fb_kwargs.pop("cdp_url", None)
+                fb_kwargs["timeout"] = min(args.timeout, browser_budget.attempt_timeout_ms())
                 try:
                     page = StealthyFetcher.fetch(fetch_url, **fb_kwargs)
                 except Exception as e2:
                     print(f"  [Warning] Standalone browser fetch also failed: {e2}")
 
-            if page is None:
+            if page is None and not _phase_expired():
                 print("  [Recovery] Attempting HTTP direct fetch fallback...")
                 try:
-                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout / 1000.0, 30.0)}
+                    # P1 C: the HTTP fallback is a load too -- clamp
+                    # its timeout to the remaining phase budget.
+                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout / 1000.0, 30.0, _phase_remaining())}
                     if cookies:
                         http_kwargs["cookies"] = cookies_to_dict(cookies, fetch_url)
                     resp = Fetcher.get(fetch_url, **http_kwargs)
@@ -686,7 +723,7 @@ def run_download(args, bsk_runtime):
     # (None, from BrowserSkill/CDP) must not crash the comparison.
     _page_html = str(getattr(page, "html_content", None) or getattr(page, "text", "") or "") if page is not None else ""
     _page_status = getattr(page, "status", None) if page is not None else None
-    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill:
+    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill and not _phase_expired():
         try:
             html, status, landing = fetch_page_via_browserskill(
                 fetch_url, wait_selector=args.wait_selector,
@@ -846,8 +883,15 @@ def run_download(args, bsk_runtime):
         or extract_doi_from_html(html_content)
     )
     def fetch_mirror(oa_url):
+        # P1 C: no mirror load starts once the phase deadline has
+        # passed, and the requests timeout is capped at the remaining
+        # phase budget (the old hardcoded 20s could overshoot a
+        # nearly-spent phase on its own).
+        if _phase_expired():
+            return "", 0, oa_url
         try:
-            response = Fetcher.get(oa_url, stealthy_headers=True, timeout=20)
+            response = Fetcher.get(oa_url, stealthy_headers=True,
+                                   timeout=min(20, _phase_remaining()))
             document = getattr(response, "html_content", None) or response.text
             if response.status < 400 and document:
                 return str(document), response.status, getattr(response, "url", None) or oa_url

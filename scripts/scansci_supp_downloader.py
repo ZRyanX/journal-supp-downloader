@@ -1678,6 +1678,7 @@ def fetch_page_html(
     tunnel_tracker=None,
     browser_budget=None,
     browser_goto_timeout=None,
+    deadline=None,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
@@ -1695,6 +1696,18 @@ def fetch_page_html(
     remaining total), and no browser attempt starts once the total is
     spent -- the caller then degrades to the OA mirror round instead of
     being killed inside a page load.
+    P1 C: ``deadline`` (a ``time.monotonic()`` value, normally the run's
+    phase deadline) is checked before *every* load this function would
+    start -- once it has passed, no requests / BSK / CDP / browser load
+    starts at all and ("", 0, url) is returned at once, so a load that
+    returns late stops the phase instead of starting the next stage.
+    The deadline also caps the requests timeout (30s hardcoded before)
+    and, via the budget's phase awareness, every browser timeout, so
+    one load can never run past the remaining phase budget. A deadline
+    passed here always wins over a phase deadline the budget may
+    already carry. When the underlying call is already in flight, its
+    own timeout is the only interrupt available -- hence the clamp
+    before launch, not a mid-flight cancel (no API here offers one).
     """
     html_content = ""
     final_url = url
@@ -1710,6 +1723,14 @@ def fetch_page_html(
         budget = BrowserFallbackBudget(goto_timeout=browser_goto_timeout)
     else:
         budget = BrowserFallbackBudget()
+    # P1 C: the phase deadline caps every attempt below (and makes the
+    # budget exhausted once it passes). An explicit deadline always
+    # wins over one the budget already carries.
+    if deadline is not None:
+        budget.set_phase_deadline(deadline)
+        if time.monotonic() >= deadline:
+            # No load of any kind starts once the deadline has passed.
+            return "", 0, url
 
     # Primary BrowserSkill Method: Fetch via Tencent BrowserSkill session
     if use_bsk and budget.exhausted:
@@ -1768,7 +1789,13 @@ def fetch_page_html(
     # Method 1: requests session (fast, but often blocked by Cloudflare)
     if session and not force_browser and not cdp_url:
         try:
-            resp = session.get(url, timeout=30, verify=False)
+            # P1 C: the requests timeout is a real interrupt, but the
+            # old hardcoded 30s could overshoot the phase on its own --
+            # clamp it to the remaining phase budget when one is set.
+            req_timeout = 30
+            if deadline is not None:
+                req_timeout = min(30.0, deadline - time.monotonic())
+            resp = session.get(url, timeout=req_timeout, verify=False)
             if resp.status_code < 400:
                 final_url = resp.url or url
                 text = resp.text
@@ -2267,18 +2294,25 @@ def main():
     # being killed mid-list.
     parser.add_argument("--phase-timeout", type=float, default=DEFAULT_PHASE_TIMEOUT_SECONDS,
                         help="Overall budget in seconds for this phase (discovery + download). "
-                             "On expiry, downloading stops and already-downloaded files are kept "
-                             "(default: 150)")
+                             "On expiry, downloading stops and already-downloaded files are kept. "
+                             "Every page load is additionally capped at the remaining phase budget, "
+                             "so one load can never run past the deadline (default: 150)")
     # P1 H-1: the browser fallback gets its own quotas -- one page goto
     # at most 30s, 60s of browser time in total per phase. Either quota
     # running out degrades to the OA mirror round instead of killing
     # the phase inside one page load (round 3: #1 hung 120s+ on
     # nature.com, mirrors never ran, 0 files).
+    # P1 C: both quotas are additionally capped at the remaining phase
+    # budget -- a single goto runs at most min(goto, total remaining,
+    # phase remaining), and the fallback budget counts as exhausted
+    # once the phase deadline passes.
     parser.add_argument("--browser-goto-timeout", type=float, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
                         help="Max seconds for one browser page load (goto) in the "
-                             "fallback path (default: 30)")
+                             "fallback path, capped at the remaining phase budget "
+                             "(default: 30)")
     parser.add_argument("--browser-fallback-budget", type=float, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
-                        help="Max total seconds of browser fallback time per phase; "
+                        help="Max total seconds of browser fallback time per phase, "
+                             "capped at the remaining phase budget; "
                              "once spent, the run degrades to the OA mirror round "
                              "instead of launching another browser (default: 60)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
@@ -2317,7 +2351,11 @@ def run_download(args, bsk_runtime):
 
     # P1 H-1: the browser fallback's own quota (default: one goto 30s,
     # 60s total per phase), shared by every browser attempt below.
-    browser_budget = browser_budget_from_args(args)
+    # P1 C: the run's phase deadline is passed in as well, so the
+    # fallback quota can never outlive the phase: one attempt runs at
+    # most min(goto, total remaining, phase remaining), and the budget
+    # counts as exhausted once the phase deadline passes.
+    browser_budget = browser_budget_from_args(args, phase_deadline=phase_deadline)
     print(f"  Browser fallback budget: {browser_budget.goto_timeout:g}s per page, "
           f"{browser_budget.total_budget:g}s total")
 
@@ -2432,6 +2470,9 @@ def run_download(args, bsk_runtime):
     session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
     # Fetch page with redirect resolution (Fixing Issue #1)
+    # P1 C: the phase deadline rides along, so a load that starts
+    # after the deadline never starts, and a load that returns late
+    # stops the phase instead of starting the next stage.
     html_content, status, final_url = fetch_page_html(
         url,
         session,
@@ -2445,6 +2486,7 @@ def run_download(args, bsk_runtime):
         proxy=proxy,
         tunnel_tracker=_TUNNEL_TRACKER,
         browser_budget=browser_budget,
+        deadline=phase_deadline,
     )
     if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill and _browser_allowed():
         try:
@@ -2528,10 +2570,17 @@ def run_download(args, bsk_runtime):
     def fetch_mirror(oa_url):
         return fetch_page_html(oa_url, session, play_cookies, args.headful,
                                proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
-                               browser_budget=browser_budget)
+                               browser_budget=browser_budget,
+                               deadline=phase_deadline)
 
     mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
-    if not candidates or is_inc or args.oa:
+    # P1 C: the mirror round is a page-load round -- it must not start
+    # once the phase deadline has passed inside the publisher fetch
+    # above (round 3: the phase died in a load and the next rounds
+    # still launched loads until the runner killed the process). The
+    # candidates found so far still reach the download loop below,
+    # where download_with_recovery prints the graceful-stop line.
+    if (not candidates or is_inc or args.oa) and time.monotonic() < phase_deadline:
         known = {c.url for c in candidates}
         additions = [c for c in mirrors.discover() if c.url not in known]
         candidates = additions + candidates if args.oa else candidates + additions
@@ -2687,6 +2736,13 @@ def run_download(args, bsk_runtime):
             if args.convert_markdown:
                 convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
+        # P1 C: say so explicitly when the phase died inside a page
+        # load with nothing found -- otherwise a run killed by the
+        # budget looks identical to a paper with no supplements, and
+        # the graceful-stop line never appears (round 3: 0 times).
+        if time.monotonic() >= phase_deadline:
+            print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+                  f"no candidates were found before the budget ran out.")
         if diag.incomplete_reason:
             print(f"  [Diagnostic] {diag.incomplete_reason}")
         if diag.excluded_links:

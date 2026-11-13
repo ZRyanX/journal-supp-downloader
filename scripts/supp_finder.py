@@ -1746,6 +1746,24 @@ def resolve_phase_timeout(value, default=DEFAULT_PHASE_TIMEOUT_SECONDS):
 # timeout from us (P1-D legacy note); those paths only receive the
 # capped timeout value where their API accepts one, and are skipped
 # outright once the budget is gone.
+#
+# P1 C: the two quotas above are not the whole story -- the *phase*
+# deadline (P1-CE, --phase-timeout, default 150s) is a third cap. A
+# 60s fallback quota can outlive a short phase, and a 30s goto
+# launched with 10s of phase left overshoots the deadline on its own;
+# that is exactly how round 3 died inside page loads (the deadline
+# logic fired 0 times: every load took its full slice and the runner
+# killed the phase before the download loop's deadline check ever
+# ran). The budget therefore takes the phase deadline as well: one
+# attempt runs at most min(goto, total remaining, phase remaining),
+# and the budget counts as exhausted once the phase deadline passes,
+# so the fallback quota can never exceed the remaining phase budget.
+# Enforcement happens *before launch* (clamping the timeout passed
+# to the underlying call) because no API can interrupt a call already
+# in flight beyond its own timeout: BSK navigate() honours its
+# subprocess timeout, CDP page.goto() honours its timeout, and the
+# requests/StealthyFetcher timeouts are real interrupts too -- but
+# only if they are given a value that respects the deadline.
 
 DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS = 30
 DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS = 60
@@ -1776,11 +1794,20 @@ class BrowserFallbackBudget:
     attempt in it, so the total browser time -- not just one goto --
     is capped. Uses time.monotonic, so tests can drive it with a fake
     clock the same way the phase-deadline tests do.
+
+    P1 C: ``phase_deadline`` (a ``time.monotonic()`` value, normally
+    the run's ``--phase-timeout`` deadline) is a third cap on top of
+    the goto and total quotas: one attempt runs at most min(goto,
+    total remaining, phase remaining), and the budget counts as
+    exhausted once the phase deadline passes. With no phase deadline
+    the budget behaves exactly as H-1 left it.
     """
 
-    def __init__(self, goto_timeout=None, total_budget=None):
+    def __init__(self, goto_timeout=None, total_budget=None,
+                 phase_deadline=None):
         self.goto_timeout = resolve_browser_goto_timeout(goto_timeout)
         self.total_budget = resolve_browser_fallback_budget(total_budget)
+        self.phase_deadline = phase_deadline
         self._started_at = time.monotonic()
         self._announced = False
 
@@ -1792,15 +1819,38 @@ class BrowserFallbackBudget:
         """Seconds of the total budget not yet spent (<= 0 when gone)."""
         return self.total_budget - self.elapsed()
 
+    def phase_remaining(self):
+        """Seconds until the phase deadline, or None when this budget
+        has no phase deadline attached."""
+        if self.phase_deadline is None:
+            return None
+        return self.phase_deadline - time.monotonic()
+
+    def set_phase_deadline(self, deadline):
+        """Attach (or replace) the phase deadline. Used by
+        fetch_page_html when the caller passes a deadline without a
+        run-shared budget; the explicit deadline always wins."""
+        self.phase_deadline = deadline
+
     @property
     def exhausted(self):
-        """True once the total browser budget is spent."""
-        return self.remaining() <= 0
+        """True once the total browser budget is spent, or once the
+        phase deadline has passed (P1 C: the fallback quota must not
+        outlive the phase)."""
+        if self.remaining() <= 0:
+            return True
+        remaining_phase = self.phase_remaining()
+        return remaining_phase is not None and remaining_phase <= 0
 
     def attempt_timeout(self):
         """Seconds the next browser attempt may run: the per-page goto
-        timeout, capped at whatever of the total budget is left."""
-        return max(0.0, min(self.goto_timeout, self.remaining()))
+        timeout, capped at whatever of the total budget is left and
+        at the remaining phase budget (P1 C)."""
+        cap = min(self.goto_timeout, self.remaining())
+        remaining_phase = self.phase_remaining()
+        if remaining_phase is not None:
+            cap = min(cap, remaining_phase)
+        return max(0.0, cap)
 
     def attempt_timeout_ms(self):
         """attempt_timeout() in milliseconds (StealthyFetcher units)."""
@@ -1813,19 +1863,30 @@ class BrowserFallbackBudget:
         if self._announced:
             return False
         self._announced = True
+        # P1 C: say when the phase deadline (not the fallback quota)
+        # is what ran out, so the log does not blame the 60s quota
+        # for a stop the 150s phase caused.
+        phase_note = ""
+        if (self.phase_deadline is not None
+                and self.phase_remaining() <= 0
+                and self.remaining() > 0):
+            phase_note = "，阶段预算已到"
         print(f"  [Browser] 回退预算耗尽，降级到 OA 镜像轮次"
               f"（已用 {self.elapsed():.1f}s / 配额 {self.total_budget:g}s，"
-              f"单页 {self.goto_timeout:g}s）")
+              f"单页 {self.goto_timeout:g}s{phase_note}）")
         return True
 
 
-def browser_budget_from_args(args):
+def browser_budget_from_args(args, phase_deadline=None):
     """Build a BrowserFallbackBudget from CLI-parsed args (getattr, so
     direct callers / old tests that lack the new attributes still get
-    the 30s/60s defaults)."""
+    the 30s/60s defaults). ``phase_deadline`` (P1 C) is the run's
+    ``time.monotonic()`` phase deadline, or None for a standalone
+    budget with no phase to respect."""
     return BrowserFallbackBudget(
         goto_timeout=getattr(args, "browser_goto_timeout", None),
         total_budget=getattr(args, "browser_fallback_budget", None),
+        phase_deadline=phase_deadline,
     )
 
 
