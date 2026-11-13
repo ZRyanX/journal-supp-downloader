@@ -152,7 +152,16 @@ def test_p1a_legitimate_table_mentions_still_work():
     assert supplementary_table_ids("Supplementary Tables 2-5") == {"S2", "S3", "S4", "S5"}
     assert supplementary_table_ids("Supplementary Table S1 and S2") == {"S1", "S2"}
     assert supplementary_table_ids("Results presented in S4 Table.") == {"S4"}
-    # Figure ranges keep the pre-existing contract (attached-letter range).
+    # INTENTIONAL SEMANTIC CHANGE (P1FIX round-3, Cause A(c)): a lettered
+    # range after a figure word ("Figures S1-S3", "Fig. S1-S3") is a figure
+    # reference, not a table declaration -- it no longer mints table ids.
+    # The old P1-A contract ("a compact range is itself an id mention")
+    # is kept only for bare S ranges and for ranges whose prefix names
+    # tables. Same convention as the P1-B update of test_d2: the old
+    # expectation is changed in place, not deleted.
+    assert supplementary_table_ids("Figures S1-S3") == set()
+    # The combined sentence still yields S1-S4, now contributed by the
+    # Tables range alone (the Figures range contributes nothing).
     assert supplementary_table_ids(
         "Supplementary Materials and Methods, Figures S1-S3, Tables S1-S4") == {
         "S1", "S2", "S3", "S4"}

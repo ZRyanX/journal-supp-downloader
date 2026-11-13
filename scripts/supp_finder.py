@@ -2812,7 +2812,16 @@ _URL_DOI_MASK_RE = re.compile(
 
 
 def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optional[str]) -> Optional[str]:
-    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides."""
+    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides.
+
+    P1FIX round-3 Cause A(c): a supplementary/supporting/additional prefix
+    only names a table when it carries the word "table" -- "Supplementary
+    Data 1", "Supplementary Files 2" and the like are data files, not
+    tables, and must not mint S ids. "Appendix ..." and "Extended Data ..."
+    keep their A/E namespaces: an appendix or extended-data number is a
+    supplementary item number, and the bare forms ("Appendix 1-4",
+    "Extended Data 1-3") are established legitimate inputs.
+    """
     if letter:
         return letter.upper()
     if pw:
@@ -2821,8 +2830,19 @@ def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optio
             return "A"
         if "extended" in low:
             return "E"
-        if any(w in low for w in ("supplement", "supporting", "additional", "附表")):
+        # A "supplement(ary|al)/supporting/additional" prefix names a table
+        # only when it also carries the word "table" -- "Supplementary
+        # Data 1" is a data file, not a table. A bare "Tables N" prefix,
+        # on the other hand, is a main-text table, not a supplementary
+        # declaration (H5/P1: "Tables 1 to 3" declares nothing), so it
+        # assigns no namespace. "附表" is inherently a supplementary
+        # table and always maps to S.
+        if "附表" in pw:
             return "S"
+        if "table" in low and any(
+                w in low for w in ("supplement", "supporting", "additional")):
+            return "S"
+        return None
     if post:
         return None
     return None
@@ -2879,26 +2899,130 @@ def _group_has_supp_signal(text: str, start: int, end: int) -> bool:
     return _SUPP_CONTEXT_RE.search(text[lo:hi]) is not None
 
 
-def _group_is_anchored(resolved, text: str) -> bool:
-    """True when a resolved token group is a table declaration (P1-A).
+# A figure/movie word immediately before a lettered range ("Figures S1-S3",
+# "Fig. S1-S3", "Supplementary Fig. S1-S3") names figures, not tables
+# (P1FIX round-3, Cause A(c)). A mixed "Tables and Figures" phrase names
+# tables too and is not blocked.
+_FIGURE_PREFIX_RE = re.compile(
+    r"(?:figs?\.?|figures?|movies?|videos?|films?)\s*$", re.IGNORECASE)
+_MIXED_TABLE_FIGURE_RE = re.compile(
+    r"tables?\b\s+and\s+(?:figs?\.?|figures?)\b"
+    r"|(?:figs?\.?|figures?)\b\s+and\s+tables?\b",
+    re.IGNORECASE,
+)
+_FIGURE_PREFIX_WINDOW = 60
 
-    Anchored by an explicit table/supplementary word on some member
-    ("Table S1", "Supplementary Tables 2-5"), by an attached-letter range
-    ("S1-S3", "Figures S1-S3" -- a compact range is itself an id mention),
-    or by a supplementary signal word near the group. A bare list of
-    lettered ids with none of these (sample ids, reference numbers) is
-    not anchored and must not mint table ids.
+
+def _group_is_figure_prefixed(text: str, start: int) -> bool:
+    """True when the words right before a token group name figures/movies
+    rather than tables (P1FIX round-3, Cause A(c))."""
+    window = text[max(0, start - _FIGURE_PREFIX_WINDOW):start]
+    if not _FIGURE_PREFIX_RE.search(window.rstrip()):
+        return False
+    if _MIXED_TABLE_FIGURE_RE.search(window):
+        return False
+    return True
+
+
+def _group_is_large_numbered_nonsupp(resolved) -> bool:
+    """True when every member is an E/A id numbered above 99 (P1FIX
+    round-3, Cause A(a)): e-page numbers such as e115-e120 are three-digit
+    by nature, while genuine Extended Data / Appendix tables are numbered
+    small; a nearby supplementary signal alone must not bless a large
+    E/A group."""
+    for tok, _sep in resolved:
+        if tok["ns"] not in ("E", "A"):
+            return False
+        try:
+            first = int(str(tok["num"]).split(".")[0])
+        except ValueError:
+            return False
+        if first <= 99:
+            return False
+    return len(resolved) > 0
+
+
+def _range_is_multisegment_code(text: str, start_tok, end_tok, is_group_start: bool) -> bool:
+    """True when a token range sits inside a longer dashed code such as an
+    ethics approval number ("R-FP-S-2-0023-0000" -> S2-S23, P1FIX round-3
+    Cause A(b)). Two tells, either suffices:
+
+    * the range end is followed at once by "-<digits>" where the range end
+      itself or the following segment is zero-padded ("-0023-0000"): a
+      trailing zero-padded segment is a code segment, not a new range
+      member. A plain year suffix ("Tables S1-S3-2024") is not: neither
+      segment is zero-padded.
+    * the range start is glued to a preceding dashed code segment
+      ("...FP-S-2..."): a dash with an alphanumeric before it. This tell
+      only applies to the group's first pair: later pairs are separated
+      from their predecessor by a range dash by construction.
     """
-    if any(tok["context"] for tok, _sep in resolved):
-        return True
+    end = end_tok["end"]
+    m = re.match(r"-(\d+)", text[end:])
+    if m:
+        end_raw = str(end_tok.get("raw_num", ""))
+        if end_raw.startswith("0") or m.group(1).startswith("0"):
+            return True
+    if is_group_start:
+        start = start_tok["start"]
+        if start >= 2 and text[start - 1] == "-" and text[start - 2].isalnum():
+            return True
+    return False
+
+
+def _drop_multisegment_code_ranges(resolved, text: str):
+    """Drop range pairs that sit inside a longer dashed code (P1FIX round-3,
+    Cause A(b)) before anchoring/expansion, so an approval number mints
+    neither endpoint. Other members of the group survive."""
+    drop = set()
     for idx in range(1, len(resolved)):
         tok, sep = resolved[idx]
         prev_tok = resolved[idx - 1][0]
-        if (sep == "range" and prev_tok["ns"] == tok["ns"]
+        if sep != "range" or prev_tok["ns"] != tok["ns"]:
+            continue
+        if _range_is_multisegment_code(text, prev_tok, tok, is_group_start=(idx - 1 == 0)):
+            drop.add(idx - 1)
+            drop.add(idx)
+    if not drop:
+        return resolved
+    return [item for i, item in enumerate(resolved) if i not in drop]
+
+
+def _group_is_anchored(resolved, text: str) -> bool:
+    """True when a resolved token group is a table declaration (P1-A, P1FIX round-3).
+
+    Anchored by an explicit table/supplementary word on some member
+    ("Table S1", "Supplementary Tables 2-5"), by an attached-letter range
+    in the S namespace only ("S1-S3" -- a bare S range is a long-standing
+    contract forced by existing tests), or by a supplementary signal word
+    near the group. Two P1FIX round-3 tightenings:
+
+    * An attached-letter range in the E/A namespace ("e115-e120") is NOT
+      self-anchoring: e-page numbers look exactly like one, so they need a
+      supplementary signal or an explicit table word. A nearby signal
+      still does not anchor a large-numbered E/A group (every member above
+      99): those are e-page numbers.
+    * A group immediately preceded by a figure/movie word ("Figures S1-S3",
+      "Fig. S1-S3") is a figure reference, not a table declaration, and is
+      never anchored -- not even by a nearby supplementary signal. A mixed
+      "Tables and Figures" phrase still counts as a table mention.
+    A bare list of lettered ids with none of these (sample ids, reference
+    numbers) is not anchored and must not mint table ids.
+    """
+    if any(tok["context"] for tok, _sep in resolved):
+        return True
+    if _group_is_figure_prefixed(text, resolved[0][0]["start"]):
+        return False
+    for idx in range(1, len(resolved)):
+        tok, sep = resolved[idx]
+        prev_tok = resolved[idx - 1][0]
+        if (sep == "range" and prev_tok["ns"] == tok["ns"] == "S"
                 and prev_tok.get("attached") and not prev_tok.get("bare")):
             return True
-    return _group_has_supp_signal(
-        text, resolved[0][0]["start"], resolved[-1][0]["end"])
+    if not _group_has_supp_signal(
+            text, resolved[0][0]["start"], resolved[-1][0]["end"]):
+        return False
+    return not _group_is_large_numbered_nonsupp(resolved)
 
 
 def supplementary_table_ids(text, in_supplementary_context=False):
@@ -2975,12 +3099,12 @@ def supplementary_table_ids(text, in_supplementary_context=False):
         # can still inherit the namespace of a range/list neighbour
         # ('Supplementary Tables 2-5' -> S2..S5).
         if not pw and not letter and not post:
-            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "attached": attached, "start": m.start(), "end": m.end()})
+            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "attached": attached, "start": m.start(), "end": m.end(), "raw_num": m.group("num")})
             continue
         ns = _table_token_namespace(pw, letter, post)
         if ns is None:
             continue
-        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "attached": attached, "start": m.start(), "end": m.end()})
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "attached": attached, "start": m.start(), "end": m.end(), "raw_num": m.group("num")})
 
     # Group consecutive tokens joined only by a range/list separator.
     groups = []  # each: [(token, sep_from_previous)] with sep None for the first
@@ -3013,8 +3137,22 @@ def supplementary_table_ids(text, in_supplementary_context=False):
             if ns is None:
                 continue
             last_ns = ns
-            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False), "attached": tok.get("attached", False), "start": tok["start"], "end": tok["end"]}, sep))
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False), "attached": tok.get("attached", False), "start": tok["start"], "end": tok["end"], "raw_num": tok.get("raw_num", tok["num"])}, sep))
         if not resolved:
+            continue
+        # P1FIX round-3 Cause A(b): a range inside a longer dashed code
+        # (ethics approval numbers) is not a table range; drop the pair
+        # before anchoring/expansion so it mints neither endpoint.
+        resolved = _drop_multisegment_code_ranges(resolved, text)
+        if not resolved:
+            continue
+        if len(resolved) == 1:
+            # A group reduced to one token follows the lone-token rule:
+            # an explicit table word on it, or caller-supplied
+            # supplementary context, is required.
+            tok = resolved[0][0]
+            if in_supplementary_context or tok["context"]:
+                result.add(f"{tok['ns']}{tok['num']}")
             continue
         # P1-A: a multi-token group with no anchor is not a declaration
         # (bare list of lettered ids, e.g. sample ids or reference numbers).
