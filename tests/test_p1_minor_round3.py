@@ -398,10 +398,11 @@ def test_sort_puts_pmc_bin_s_files_before_zenodo_packages():
     assert [c.url for c in tier0] == [
         s_xlsx.url, plain_xlsx.url, zen_csv.url, zen_zip.url], tier0
     # Tier 2: the s tiff comes before the Zenodo / Data Availability
-    # package and the plain page.
+    # package (and the neutral page sits between them: only s files
+    # are promoted and repository packages demoted within a tier).
     tier2 = [c for c in ordered if candidate_priority(c) == 2]
     assert [c.url for c in tier2] == [
-        s_tiff.url, zen_landing.url, plain_page.url], tier2
+        s_tiff.url, plain_page.url, zen_landing.url], tier2
 
 
 def test_sort_still_stable_and_lossless_for_non_zenodo_lists():

@@ -1973,13 +1973,70 @@ def candidate_priority(cand: "Candidate") -> int:
     return 2
 
 
+_PMC_BIN_S_FILE_RE = re.compile(r"\.s\d+\.", re.IGNORECASE)
+
+
+def _is_pmc_bin_s_file(cand: "Candidate") -> bool:
+    """True for a PMC /bin/ s file (P1 round-3 minor (c), #31:
+    ``pbio.3003193.s001.tiff`` -- the article's own supplementary
+    files, as opposed to a repository data package)."""
+    url = getattr(cand, "url", "") or ""
+    path = urllib.parse.urlparse(url).path.lower()
+    if "/bin/" not in path:
+        return False
+    name = getattr(cand, "filename", "") or ""
+    return bool(_PMC_BIN_S_FILE_RE.search(name) or _PMC_BIN_S_FILE_RE.search(url))
+
+
+def _is_repository_data_package(cand: "Candidate") -> bool:
+    """True for a repository data package as opposed to an article
+    supplement file (P1 round-3 minor (c), #31): a zenodo.org record
+    link, or a Data Availability section link. These are real research
+    data, but they are not the article's s files and must not consume
+    the download budget before them."""
+    url = getattr(cand, "url", "") or ""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host == "zenodo.org" or host.endswith(".zenodo.org"):
+        return True
+    label = " ".join(
+        str(v) for v in (
+            getattr(cand, "link_text", ""),
+            getattr(cand, "section", ""),
+        ) if v
+    ).lower()
+    return "data availability" in label
+
+
+def _priority_sub_rank(cand: "Candidate") -> int:
+    """Within-tier download order (P1 round-3 minor (c)).
+
+    0 -- a PMC /bin/ s file; 1 -- anything else; 2 -- a repository
+    data package (Zenodo / Data Availability). Only the order *inside*
+    a tier changes: the tier itself still comes from
+    ``candidate_priority`` (0 real file / 1 explicitly supplementary /
+    2 other), so a tier-2 s file never jumps ahead of a tier-0 file.
+    """
+    if _is_pmc_bin_s_file(cand):
+        return 0
+    if _is_repository_data_package(cand):
+        return 2
+    return 1
+
+
 def sort_candidates_by_priority(candidates):
     """Return candidates in download order: tier 0, then 1, then 2.
 
     Stable within a tier (discovery order is kept) and lossless -- the
-    result is a permutation of the input, never a filter.
+    result is a permutation of the input, never a filter. Within a
+    tier, PMC /bin/ s files run before repository data packages
+    (Zenodo / Data Availability, P1 round-3 minor (c)): on #31 the
+    Zenodo .csv/.zip packages and the true s files were interleaved
+    and a Phase B timeout left all 17 s files undownloaded.
     """
-    return sorted(candidates, key=candidate_priority)
+    return sorted(
+        candidates,
+        key=lambda c: (candidate_priority(c), _priority_sub_rank(c)),
+    )
 
 
 def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
