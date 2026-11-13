@@ -99,6 +99,11 @@ from supp_finder import (
     DEFAULT_PHASE_TIMEOUT_SECONDS,
     resolve_phase_timeout,
     sort_candidates_by_priority,
+    # P1 H-1: independent budget for the browser fallback.
+    DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+    DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+    BrowserFallbackBudget,
+    browser_budget_from_args,
 )
 
 try:
@@ -1671,6 +1676,8 @@ def fetch_page_html(
     bsk_runtime=None,
     proxy=None,
     tunnel_tracker=None,
+    browser_budget=None,
+    browser_goto_timeout=None,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
@@ -1682,21 +1689,39 @@ def fetch_page_html(
     browser attempt for a host whose tunnel failures reached the threshold.
     CDP / BrowserSkill paths attach to a live browser and cannot take a
     per-request proxy, so they are unchanged.
+    P1 H-1: ``browser_budget`` (a run-shared BrowserFallbackBudget, or a
+    fresh 30s-goto / 60s-total one when omitted) caps every browser
+    attempt here: one goto runs at most the goto timeout (capped at the
+    remaining total), and no browser attempt starts once the total is
+    spent -- the caller then degrades to the OA mirror round instead of
+    being killed inside a page load.
     """
     html_content = ""
     final_url = url
     # P1-D: resolve the tunnel breaker (explicit tracker wins, else the
     # run-shared one).
     tracker = tunnel_tracker if tunnel_tracker is not None else _TUNNEL_TRACKER
+    # P1 H-1: resolve the browser budget (explicit budget wins; a lone
+    # goto timeout gets a fresh default-total budget; otherwise a fresh
+    # default budget so a standalone call is still capped).
+    if browser_budget is not None:
+        budget = browser_budget
+    elif browser_goto_timeout is not None:
+        budget = BrowserFallbackBudget(goto_timeout=browser_goto_timeout)
+    else:
+        budget = BrowserFallbackBudget()
 
     # Primary BrowserSkill Method: Fetch via Tencent BrowserSkill session
-    if use_bsk:
+    if use_bsk and budget.exhausted:
+        # P1 H-1: no browser attempt once the fallback budget is gone.
+        budget.announce_exhausted()
+    elif use_bsk:
         try:
             print(f"    (Fetching via Tencent BrowserSkill bsk ...)")
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
                 url,
                 wait_selector=None,
-                timeout=60.0,
+                timeout=budget.attempt_timeout(),
                 browser=bsk_browser,
                 tab_id=bsk_tab,
                 session=bsk_session,
@@ -1712,14 +1737,20 @@ def fetch_page_html(
             print(f"    BrowserSkill fetch notice: {e_bsk}. Falling back to default pipeline...")
 
     # Primary CDP Method: Attach directly to running browser via CDP
-    if cdp_url:
+    # P1 H-1: skipped outright once the fallback budget is gone; the
+    # timeout is the capped goto timeout, not the old hardcoded 60s.
+    # (CDP attaches to a live browser, so no per-request proxy or goto
+    # timeout can be injected beyond this value -- see supp_finder.)
+    if cdp_url and budget.exhausted:
+        budget.announce_exhausted()
+    elif cdp_url:
         try:
             wait_sel = None
             if force_browser:
                 wait_sel = SUPP_WAIT_SELECTOR
             print(f"    (Attaching to live browser tab via CDP: {cdp_url} ...)")
             cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
-                cdp_url, url, wait_selector=wait_sel, timeout=60.0
+                cdp_url, url, wait_selector=wait_sel, timeout=budget.attempt_timeout()
             )
             if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 if cdp_cookies:
@@ -1762,6 +1793,11 @@ def fetch_page_html(
     # P1-D: skip the browser entirely once this host's tunnel failures
     # tripped the breaker -- the requests path above already had its
     # chance, and another browser launch would only burn the budget.
+    # P1 H-1: skip it entirely once the fallback budget is gone, too --
+    # the caller degrades to the OA mirror round instead.
+    if budget.exhausted:
+        budget.announce_exhausted()
+        return "", 0, url
     if HAS_SCRAPLING and tracker.is_tripped(url):
         if tracker.take_skip_notice(url):
             print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
@@ -1772,7 +1808,7 @@ def fetch_page_html(
             "headless": not headful,
             "solve_cloudflare": True,
             "network_idle": True,
-            "timeout": 60000,
+            "timeout": budget.attempt_timeout_ms(),
             "page_action": expand_page_accordions_action,
         }
         # P1-D: same --proxy syntax as journal_downloader.py; omitted
@@ -1807,11 +1843,19 @@ def fetch_page_html(
             if tracker.record_failure(url, e):
                 print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
                       f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
-            if cdp_url and not tracker.is_tripped(url):
+            # P1 H-1: a failed browser attempt that spent the budget is
+            # the downgrade point -- say so once, here, so the log shows
+            # why the mirror round runs next instead of another browser.
+            if budget.exhausted:
+                budget.announce_exhausted()
+            if cdp_url and not tracker.is_tripped(url) and not budget.exhausted:
                 print("    (Retrying without CDP using standalone stealth browser...)")
                 try:
                     sc_nocdp = dict(sc_args)
                     sc_nocdp.pop("cdp_url", None)
+                    # P1 H-1: re-cap the retry at the remaining budget --
+                    # the first attempt already spent goto time.
+                    sc_nocdp["timeout"] = budget.attempt_timeout_ms()
                     page = StealthyFetcher.fetch(url, **sc_nocdp)
                     html_content = str(page.html_content)
                     final_url = getattr(page, "url", None) or url
@@ -1825,6 +1869,9 @@ def fetch_page_html(
                     if tracker.record_failure(url, e2):
                         print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
                               f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
+                    # P1 H-1: same downgrade point as the first attempt.
+                    if budget.exhausted:
+                        budget.announce_exhausted()
 
     return html_content, 0, final_url
 
@@ -1903,6 +1950,9 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         cdp_target = getattr(args, "cdp_url", None)
         # P1-D: proxy / tunnel breaker for this run's browser attempts.
         _scrape_proxy = getattr(args, "proxy", None)
+        # P1 H-1: same 30s-goto / 60s-total fallback budget as the main
+        # run (fresh here: this scrape is a separate post-success pass).
+        _scrape_budget = browser_budget_from_args(args)
         session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
         html_content, status, final_url = fetch_page_html(
@@ -1914,6 +1964,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             bsk_runtime=bsk_runtime,
             proxy=_scrape_proxy,
             tunnel_tracker=_TUNNEL_TRACKER,
+            browser_budget=_scrape_budget,
         )
 
         url_to_use = final_url or url
@@ -1944,6 +1995,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 bsk_runtime=bsk_runtime,
                 proxy=_scrape_proxy,
                 tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=_scrape_budget,
             )
             if html_content_b:
                 html_content = html_content_b
@@ -2217,6 +2269,18 @@ def main():
                         help="Overall budget in seconds for this phase (discovery + download). "
                              "On expiry, downloading stops and already-downloaded files are kept "
                              "(default: 150)")
+    # P1 H-1: the browser fallback gets its own quotas -- one page goto
+    # at most 30s, 60s of browser time in total per phase. Either quota
+    # running out degrades to the OA mirror round instead of killing
+    # the phase inside one page load (round 3: #1 hung 120s+ on
+    # nature.com, mirrors never ran, 0 files).
+    parser.add_argument("--browser-goto-timeout", type=float, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+                        help="Max seconds for one browser page load (goto) in the "
+                             "fallback path (default: 30)")
+    parser.add_argument("--browser-fallback-budget", type=float, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+                        help="Max total seconds of browser fallback time per phase; "
+                             "once spent, the run degrades to the OA mirror round "
+                             "instead of launching another browser (default: 60)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
@@ -2250,6 +2314,24 @@ def run_download(args, bsk_runtime):
     phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
     phase_deadline = time.monotonic() + phase_timeout
     print(f"  Phase timeout: {phase_timeout:g}s")
+
+    # P1 H-1: the browser fallback's own quota (default: one goto 30s,
+    # 60s total per phase), shared by every browser attempt below.
+    browser_budget = browser_budget_from_args(args)
+    print(f"  Browser fallback budget: {browser_budget.goto_timeout:g}s per page, "
+          f"{browser_budget.total_budget:g}s total")
+
+    def _browser_allowed():
+        """True while the fallback budget lasts. Once it is gone, log
+        the downgrade line (once) and return False -- callers then skip
+        the browser attempt and the OA mirror round (already run, P1
+        H-1 reorder) / download round still proceed. Only called when
+        a browser attempt is actually pending, so a complete run never
+        logs a spurious exhaustion."""
+        if browser_budget.exhausted:
+            browser_budget.announce_exhausted()
+            return False
+        return True
 
     # P1-D: validate the proxy up front (fail fast on a typo'd value
     # instead of silently going direct) and arm the per-host tunnel
@@ -2362,10 +2444,12 @@ def run_download(args, bsk_runtime):
         bsk_tab=getattr(args, "bsk_tab", None),
         proxy=proxy,
         tunnel_tracker=_TUNNEL_TRACKER,
+        browser_budget=browser_budget,
     )
-    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill:
+    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill and _browser_allowed():
         try:
-            html_content, status, final_url = fetch_page_via_browserskill(url, runtime=bsk_runtime)
+            html_content, status, final_url = fetch_page_via_browserskill(
+                url, timeout=browser_budget.attempt_timeout(), runtime=bsk_runtime)
         except BrowserSkillError as exc:
             if bsk_runtime.browser or bsk_runtime.tab_id:
                 raise
@@ -2425,12 +2509,54 @@ def run_download(args, bsk_runtime):
     # evidence check still reports missing files. When the supplements
     # are already complete, do not force.
     is_inc, inc_reason = evidence.check(candidates)
+
+    # P1 H-1: the OA mirror round runs BEFORE any browser fallback.
+    # Mirrors are fetched over requests (cheap, seconds), while one
+    # browser page load over the proxy takes 60-90s -- in round 3 the
+    # browser retry ran first, hung, and the mirrors never ran at all
+    # (#1: 13 files in R2, 0 in R3). Files reachable without a browser
+    # are therefore collected first; the browser retry below only runs
+    # for what the mirrors did not already cover, and only while its
+    # own budget lasts.
+    doi_val = (
+        extract_doi(args.url_or_doi)
+        or extract_doi(url)
+        or extract_doi(effective_base)
+        or extract_doi_from_html(html_content)
+        or config.get("_last_api_doi")
+    )
+    def fetch_mirror(oa_url):
+        return fetch_page_html(oa_url, session, play_cookies, args.headful,
+                               proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+                               browser_budget=browser_budget)
+
+    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    if not candidates or is_inc or args.oa:
+        known = {c.url for c in candidates}
+        additions = [c for c in mirrors.discover() if c.url not in known]
+        candidates = additions + candidates if args.oa else candidates + additions
+    if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
+        _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
+
+    # P1-E2: seed from the Phase A candidate list left in this article
+    # directory (separate Phase A process, same -o). Without this, a
+    # Phase A timeout preserved candidates on disk that Phase B never
+    # downloaded from (round 3: 348 candidates across 15 papers).
+    seed_candidates, seed_source = load_seed_candidates(article_dir)
+    if seed_candidates:
+        candidates, seeds_added = merge_seed_candidates(candidates, seed_candidates)
+        if seeds_added:
+            print(f"  [Info] Seeded {seeds_added} candidate(s) from Phase A "
+                  f"candidate list ({seed_source}).")
+
+    is_inc, inc_reason = evidence.check(candidates)
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill:
+    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill and _browser_allowed():
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
             url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url,
             proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+            browser_budget=browser_budget,
         )
         if html_content_browser:
             url = final_url_browser or url
@@ -2451,7 +2577,7 @@ def run_download(args, bsk_runtime):
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
+    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled and _browser_allowed():
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -2471,6 +2597,7 @@ def run_download(args, bsk_runtime):
             cdp_html, cdp_status, cdp_final = fetch_page_html(
                 url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0],
                 proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=browser_budget,
             )
             if cdp_html:
                 cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
@@ -2493,12 +2620,12 @@ def run_download(args, bsk_runtime):
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled:
+    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled and _browser_allowed():
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
                 url,
-                timeout=60.0,
+                timeout=browser_budget.attempt_timeout(),
                 browser=getattr(args, "bsk_browser", None),
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
@@ -2525,37 +2652,6 @@ def run_download(args, bsk_runtime):
             print(f"  [Tier 3-BSK] Notice: {e_bsk}")
 
     is_inc, inc_reason = evidence.check(candidates)
-
-    # Tier OA Penetration: If still no candidates, incomplete, or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
-    doi_val = (
-        extract_doi(args.url_or_doi)
-        or extract_doi(url)
-        or extract_doi(effective_base)
-        or extract_doi_from_html(html_content)
-        or config.get("_last_api_doi")
-    )
-    def fetch_mirror(oa_url):
-        return fetch_page_html(oa_url, session, play_cookies, args.headful,
-                               proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER)
-
-    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
-    if not candidates or is_inc or args.oa:
-        known = {c.url for c in candidates}
-        additions = [c for c in mirrors.discover() if c.url not in known]
-        candidates = additions + candidates if args.oa else candidates + additions
-    if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
-        _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
-
-    # P1-E2: seed from the Phase A candidate list left in this article
-    # directory (separate Phase A process, same -o). Without this, a
-    # Phase A timeout preserved candidates on disk that Phase B never
-    # downloaded from (round 3: 348 candidates across 15 papers).
-    seed_candidates, seed_source = load_seed_candidates(article_dir)
-    if seed_candidates:
-        candidates, seeds_added = merge_seed_candidates(candidates, seed_candidates)
-        if seeds_added:
-            print(f"  [Info] Seeded {seeds_added} candidate(s) from Phase A "
-                  f"candidate list ({seed_source}).")
 
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:

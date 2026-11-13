@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
@@ -1721,6 +1722,111 @@ def resolve_phase_timeout(value, default=DEFAULT_PHASE_TIMEOUT_SECONDS):
     if seconds <= 0 or seconds != seconds:  # <= 0 or NaN
         return float(default)
     return seconds
+
+
+# ── P1 H-1: independent budget for the browser fallback ───────────────────
+# Round-3 report (~/workspace/jsd-50-paper-test-p1fix-report.md, sec. 2(h)
+# H-1, sec. 4 item 1): after --proxy fixed the tunnel failures, the
+# browser fallback stopped failing fast and started hanging -- one page
+# load over the proxy takes 60-90s, so the 150s phase budget dies inside
+# a single page load and the OA mirror / download rounds never run
+# (#1: R2 13 files via mirrors after a fast browser failure; R3 0 files
+# after a 120s+ hang on nature.com). The phase budget alone cannot fix
+# this: a single StealthyFetcher.fetch / page.goto call has no notion
+# of the phase deadline (P1-CE legacy note). The browser fallback
+# therefore gets its own two quotas, shared by both entry points:
+# one page goto at most 30s, 60s of browser time in total per phase.
+# Either quota running out degrades to the OA mirror round (requests)
+# instead of killing the phase.
+#
+# The quotas bound *attempts*, not a blocking call already in flight:
+# a goto is launched with timeout=min(goto, remaining), and no new
+# browser attempt starts once the total is spent. A live CDP /
+# BrowserSkill browser cannot take a per-request proxy or a goto
+# timeout from us (P1-D legacy note); those paths only receive the
+# capped timeout value where their API accepts one, and are skipped
+# outright once the budget is gone.
+
+DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS = 30
+DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS = 60
+
+
+def resolve_browser_goto_timeout(value, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS):
+    """Normalize a --browser-goto-timeout value to seconds (float).
+
+    Same contract as resolve_phase_timeout: numbers and numeric
+    strings accepted; anything missing, non-numeric, or <= 0 falls
+    back to *default* (30s).
+    """
+    return resolve_phase_timeout(value, default=default)
+
+
+def resolve_browser_fallback_budget(value, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS):
+    """Normalize a --browser-fallback-budget value to seconds (float).
+
+    Same contract as resolve_phase_timeout, default 60s.
+    """
+    return resolve_phase_timeout(value, default=default)
+
+
+class BrowserFallbackBudget:
+    """Wall-clock quota for browser fallback attempts within one phase.
+
+    Created once per phase (run_download) and shared by every browser
+    attempt in it, so the total browser time -- not just one goto --
+    is capped. Uses time.monotonic, so tests can drive it with a fake
+    clock the same way the phase-deadline tests do.
+    """
+
+    def __init__(self, goto_timeout=None, total_budget=None):
+        self.goto_timeout = resolve_browser_goto_timeout(goto_timeout)
+        self.total_budget = resolve_browser_fallback_budget(total_budget)
+        self._started_at = time.monotonic()
+        self._announced = False
+
+    def elapsed(self):
+        """Seconds of wall time since this budget was created."""
+        return time.monotonic() - self._started_at
+
+    def remaining(self):
+        """Seconds of the total budget not yet spent (<= 0 when gone)."""
+        return self.total_budget - self.elapsed()
+
+    @property
+    def exhausted(self):
+        """True once the total browser budget is spent."""
+        return self.remaining() <= 0
+
+    def attempt_timeout(self):
+        """Seconds the next browser attempt may run: the per-page goto
+        timeout, capped at whatever of the total budget is left."""
+        return max(0.0, min(self.goto_timeout, self.remaining()))
+
+    def attempt_timeout_ms(self):
+        """attempt_timeout() in milliseconds (StealthyFetcher units)."""
+        return int(self.attempt_timeout() * 1000)
+
+    def announce_exhausted(self):
+        """Print the downgrade line once and return True; later calls
+        are silent and return False, so the log is not spammed once
+        per skipped attempt."""
+        if self._announced:
+            return False
+        self._announced = True
+        print(f"  [Browser] 回退预算耗尽，降级到 OA 镜像轮次"
+              f"（已用 {self.elapsed():.1f}s / 配额 {self.total_budget:g}s，"
+              f"单页 {self.goto_timeout:g}s）")
+        return True
+
+
+def browser_budget_from_args(args):
+    """Build a BrowserFallbackBudget from CLI-parsed args (getattr, so
+    direct callers / old tests that lack the new attributes still get
+    the 30s/60s defaults)."""
+    return BrowserFallbackBudget(
+        goto_timeout=getattr(args, "browser_goto_timeout", None),
+        total_budget=getattr(args, "browser_fallback_budget", None),
+    )
 
 
 # A .pdf candidate is a real supplement file here (candidates are already
