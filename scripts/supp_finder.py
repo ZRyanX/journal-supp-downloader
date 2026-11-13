@@ -12,6 +12,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import urllib.parse
 import zipfile
 from dataclasses import dataclass, field
@@ -301,6 +302,28 @@ class Candidate:
             "covered_table_ids": sorted(self.covered_table_ids),
         }
 
+    @classmethod
+    def from_dict(cls, data):
+        """Rebuild a Candidate from a to_dict() payload (P1-E2).
+
+        Used to seed Phase B downloads from the Phase A candidate list
+        file. Returns None for entries without a URL so one bad entry
+        never poisons the whole seed list.
+        """
+        if not isinstance(data, dict) or not data.get("url"):
+            return None
+        return cls(
+            url=data["url"],
+            filename=data.get("filename", "") or "",
+            link_text=data.get("link_text", "") or "",
+            section=data.get("section", "") or "",
+            match_rule=data.get("match_rule", "") or "",
+            source_tag=data.get("source_tag", "") or "a",
+            extra_info=data.get("extra_info", {}) or {},
+            source_url=data.get("source_url", "") or "",
+            covered_table_ids=set(data.get("covered_table_ids", []) or []),
+        )
+
 
 @dataclass
 class FindingDiagnostics:
@@ -313,6 +336,10 @@ class FindingDiagnostics:
     incomplete_reason: str = ""
     candidates: List[Candidate] = field(default_factory=list)
     excluded_links: List[Tuple[str, str]] = field(default_factory=list)
+    # P1-B: (url, reason) for candidates dropped by the junk-candidate
+    # filter (junk_candidate_reason); unlike excluded_links these are
+    # logged with their reason instead of being silently discarded.
+    junk_filtered: List[Tuple[str, str]] = field(default_factory=list)
     strategy_counts: Dict[str, int] = field(default_factory=dict)
     # H3: static parsing could not settle the page; a browser render is
     # needed (supplementary heading/section with no candidates, or inline
@@ -328,6 +355,135 @@ def _iter_base_urls(base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) 
     if isinstance(base_url, str):
         return [base_url]
     return [u for u in base_url if isinstance(u, str) and u]
+
+
+def _host_of(url: str) -> str:
+    try:
+        host = urllib.parse.urlsplit(url).netloc.lower()
+    except ValueError:
+        return ""
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    if host.startswith("["):
+        return host.split("]", 1)[0] + "]"
+    return host.split(":", 1)[0]
+
+
+def _same_pmc_instance(url: str, base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) -> bool:
+    """True when a PMC /bin/ candidate comes from the same article instance
+    as the page it was found on (so it is that article's own file)."""
+    m = re.search(r"/instance/(\d+)/", url or "")
+    if not m:
+        return False
+    return any(f"/instance/{m.group(1)}/" in b for b in _iter_base_urls(base_url))
+
+
+def junk_candidate_reason(
+    url: str,
+    text: str = "",
+    filename: str = "",
+    attrs: Optional[Dict[str, str]] = None,
+    base_url: Union[str, List[str], Tuple[str, ...], Set[str]] = "",
+    is_data_file: bool = False,
+    is_explicit_supp: bool = False,
+) -> Optional[str]:
+    """Reason a candidate is confirmed junk (P1-B), or None.
+
+    Only patterns confirmed in the 50-paper live test are listed. The
+    GEO / CC rules never fire on a real data file or an explicitly
+    supplementary link, so genuine supplements
+    (xlsx/xls/csv/tsv/docx/pdf/zip/...) are unaffected; the CRAN and
+    Table/Appendix rules use page-shape guards instead (a CRAN tarball
+    lives under /src/contrib/, not on a package page; an explicit
+    'Supplementary Table S1' served as HTML is kept). The first two
+    groups are checked regardless of extension because a challenge page
+    and a preprint-version attachment are never this article's supplement
+    even when they happen to be a PDF.
+    """
+    if not url:
+        return None
+    url_lower = url.lower()
+    labels = [(text or ""), (filename or "")]
+    if attrs:
+        labels.extend(str(v) for v in attrs.values() if isinstance(v, str))
+
+    # Client Challenge page (eLife anti-bot wall): the link *is* the wall.
+    for label in labels:
+        if re.sub(r"\s+", " ", label.strip().lower()) == "client challenge":
+            return "client_challenge_page"
+    if "client-challenge" in url_lower:
+        return "client_challenge_page"
+
+    # bioRxiv / medRxiv preprint attachments: the preprint version's
+    # supplement (e.g. the NIHPP...-supplement-1.pdf filed under a
+    # different PMC instance, #46), not the published article's file.
+    # Not junk when the page being scanned IS the preprint itself.
+    base_hosts = {_host_of(b) for b in _iter_base_urls(base_url)}
+    base_is_preprint = bool(base_hosts & {"biorxiv.org", "medrxiv.org"}) or any(
+        "10.1101/" in b.lower() for b in _iter_base_urls(base_url)
+    )
+    if not base_is_preprint:
+        host = _host_of(url)
+        if host in {"biorxiv.org", "medrxiv.org"} or "10.1101/" in url_lower:
+            return "biorxiv_preprint_attachment"
+        base_name = os.path.basename(urllib.parse.unquote(urllib.parse.urlsplit(url).path)).lower()
+        fname_lower = (filename or "").lower()
+        if (
+            re.match(r"nihpp\d{4}\.\d{2}\.\d{2}\.", base_name)
+            or re.match(r"nihpp\d{4}\.\d{2}\.\d{2}\.", fname_lower)
+        ) and not _same_pmc_instance(url, base_url):
+            return "biorxiv_preprint_attachment"
+
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    host = _host_of(url)
+    path = parts.path.lower()
+
+    # CRAN package page (e.g. /web/packages/MASS/index.html, or the home
+    # page). Checked before the data-file immunity because
+    # check_data_extension mistakes the '.r-' in 'cran.r-project.org' for
+    # an R-script extension; the page-like path condition is what protects
+    # real CRAN files (tarballs live under /src/contrib/, not here).
+    if host in {"cran.r-project.org", "www.cran.r-project.org"} and (
+        path == "/" or path.startswith("/web/packages/") or path.endswith((".html", ".htm"))
+    ):
+        return "cran_package_page"
+
+    # Table / Appendix .html navigation page: an in-article table rendered
+    # as a web page, not a downloadable supplement. Only when the link is
+    # a bare 'Table N' / 'Appendix N' label (or filename) pointing at an
+    # .html page with no supplementary marker (/bin/, mmc, esm, supp...).
+    # Exempted only by an explicit supplementary word, not by the bare
+    # table label itself: 'Appendix 7' is a table label, 'Supplementary
+    # Table S1' is a supplement.
+    if (
+        path.endswith((".html", ".htm"))
+        and not is_data_file
+        and not any(marker in url_lower for marker in ("/bin/", "mmc", "esm", "supp"))
+        and "suppl" not in ((text or "") + " " + (filename or "")).lower()
+    ):
+        text_norm = (text or "").strip()
+        fname_norm = (filename or "").strip()
+        base_name = os.path.basename(urllib.parse.unquote(parts.path))
+        if (
+            re.match(r"^(?:table|appendix)\s+\S+$", text_norm, re.IGNORECASE)
+            or re.match(r"^(?:table|appendix)\b.*\.html?$", fname_norm, re.IGNORECASE)
+            or re.match(r"^(?:table|appendix)[ _-]?\w*\.html?$", base_name, re.IGNORECASE)
+        ):
+            return "table_appendix_html_nav"
+
+    if is_data_file or is_explicit_supp:
+        return None
+
+    # GEO query page: an accession lookup (acc.cgi?acc=GSE...), not a file.
+    if host in {"ncbi.nlm.nih.gov", "www.ncbi.nlm.nih.gov"} and path.startswith("/geo/query/acc.cgi"):
+        return "geo_acc_cgi"
+    # Creative Commons licence page (e.g. /licenses/by/4.0/).
+    if host == "creativecommons.org" and path.startswith("/licenses/"):
+        return "cc_license"
+    return None
 
 
 def is_same_page_fragment(url: str, base_url: Union[str, List[str], Tuple[str, ...], Set[str]]) -> bool:
@@ -366,8 +522,16 @@ def is_excluded_url(
     base_url: Union[str, List[str], Tuple[str, ...], Set[str]] = "",
     text: str = "",
     attrs: Optional[Dict[str, str]] = None,
+    filename: str = "",
+    diag: Optional["FindingDiagnostics"] = None,
 ) -> bool:
-    """Check if a URL should be excluded (references, external sites, anchors, etc.)."""
+    """Check if a URL should be excluded (references, external sites, anchors, etc.).
+
+    P1-B: a URL dropped by the junk-candidate filter is recorded in
+    ``diag.junk_filtered`` with its reason and logged as a ``[Filtered]``
+    line instead of being silently discarded (only when ``diag`` is given,
+    i.e. inside a find_all_candidates run).
+    """
     if not url or url.startswith("javascript:") or url.startswith("mailto:") or url.startswith("tel:"):
         return True
     if url.startswith("#"):
@@ -387,6 +551,18 @@ def is_excluded_url(
         (text and is_explicit_supp_table(text))
         or (attrs and any(is_explicit_supp_table(str(v)) for v in attrs.values() if v))
     )
+
+    # P1-B: confirmed junk candidates (GEO acc.cgi, CC licence, CRAN,
+    # Table/Appendix .html nav, bioRxiv preprint, Client Challenge).
+    junk_reason = junk_candidate_reason(
+        url, text=text, filename=filename, attrs=attrs, base_url=base_url,
+        is_data_file=is_data_or_supp_file, is_explicit_supp=is_explicit_supp_context,
+    )
+    if junk_reason:
+        if diag is not None and (url, junk_reason) not in diag.junk_filtered:
+            diag.junk_filtered.append((url, junk_reason))
+            print(f"    [Filtered] {url} ({junk_reason})")
+        return True
 
     for pattern in EXCLUDE_URL_PATTERNS:
         if pattern == r"doi\.org/10\.\d+/":
@@ -1420,20 +1596,465 @@ def _normalize_url_for_dedup(url: str) -> str:
     ]
     kept.sort()
     query = urllib.parse.urlencode(kept)
-    return urllib.parse.urlunsplit((parts.scheme.lower(), parts.netloc.lower(), parts.path, query, ""))
+    # P1-B: a default port is not a different file (PMC serves the same
+    # /bin/ file with and without :443, e.g. #46's MOESM1 x3).
+    scheme = parts.scheme.lower()
+    netloc = parts.netloc.lower()
+    if "@" in netloc:
+        userinfo, hostport = netloc.rsplit("@", 1)
+        prefix = userinfo + "@"
+    else:
+        hostport, prefix = netloc, ""
+    if scheme == "https" and hostport.endswith(":443"):
+        hostport = hostport[:-4]
+    elif scheme == "http" and hostport.endswith(":80"):
+        hostport = hostport[:-3]
+    netloc = prefix + hostport
+    return urllib.parse.urlunsplit((scheme, netloc, parts.path, query, ""))
+
+
+# P1-B: a trailing _N on a filename is (almost always) a collision suffix
+# produced by the D2 disambiguators (find_all_candidates / download_file),
+# not part of the file's identity: 'MOESM1_ESM_2.pdf', 'Appendix 7_18.bin'
+# and 's001_2.docx' are the same file as their unsuffixed form. A large
+# number is a real identifier instead (Wiley attachment_1001), so only
+# _2.._999 are stripped. Generic placeholder names carry no identity at
+# all and are exempt from filename dedup (URL dedup still applies).
+_DUP_SUFFIX_RE = re.compile(r"_(\d+)$")
+_GENERIC_DEDUP_EXEMPT_FILENAMES = frozenset({
+    "download.bin", "download", "attachment.bin", "attachment",
+    "file.bin", "file", "asset.bin", "content.bin",
+    "index.html", "index.htm",
+})
+
+
+def filename_dedup_key(filename: str) -> Optional[str]:
+    """Normalized filename dedup key, or None when the name carries no
+    identity (empty / generic placeholder) and must not dedup by name."""
+    name = urllib.parse.unquote((filename or "").strip()).lower()
+    if not name or name in _GENERIC_DEDUP_EXEMPT_FILENAMES:
+        return None
+    base, ext = os.path.splitext(name)
+    while True:
+        m = _DUP_SUFFIX_RE.search(base)
+        if not m:
+            break
+        if not 2 <= int(m.group(1)) <= 999:
+            break
+        base = base[:m.start()]
+    key = base + ext
+    if not key or key in _GENERIC_DEDUP_EXEMPT_FILENAMES:
+        return None
+    return key
+
+
+def dedupe_candidates(candidates: List["Candidate"]) -> List["Candidate"]:
+    """Merge candidates that point at the same file by normalized URL or by
+    normalized filename (P1-B). Order is preserved; the first occurrence is
+    kept and absorbs the table ids of the duplicates (H6 merge)."""
+    kept: List["Candidate"] = []
+    by_url: Dict[str, "Candidate"] = {}
+    by_fname: Dict[str, "Candidate"] = {}
+    for cand in candidates:
+        raw_url = (cand.url or "").strip()
+        norm_url = _normalize_url_for_dedup(raw_url.split("#")[0].strip()) if raw_url else ""
+        fname_key = filename_dedup_key(cand.filename)
+        existing = by_url.get(norm_url) if norm_url else None
+        if existing is None and fname_key is not None:
+            existing = by_fname.get(fname_key)
+        if existing is not None:
+            _merge_duplicate_candidate(existing, cand)
+            continue
+        if norm_url:
+            by_url[norm_url] = cand
+        if fname_key is not None:
+            by_fname[fname_key] = cand
+        kept.append(cand)
+    return kept
+
+
+def _merge_duplicate_candidate(existing: "Candidate", cand: "Candidate") -> None:
+    """Fold a duplicate candidate into the kept one (H6): union the table
+    ids, prefer an explicit supplementary label, prefer a specific filename
+    over a generic one, and prefer the unsuffixed filename (P1-B)."""
+    existing.covered_table_ids |= cand.covered_table_ids
+    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
+        existing.link_text = cand.link_text
+    is_existing_generic = (
+        existing.filename.endswith(".bin")
+        or existing.filename.startswith("download_")
+        or existing.filename.startswith("attachment_")
+    )
+    is_cand_specific = not (
+        cand.filename.endswith(".bin")
+        or cand.filename.startswith("download_")
+        or cand.filename.startswith("attachment_")
+    )
+    if is_existing_generic and is_cand_specific:
+        existing.filename = cand.filename
+    elif _DUP_SUFFIX_RE.search(os.path.splitext(existing.filename)[0] or "") and not _DUP_SUFFIX_RE.search(
+        os.path.splitext(cand.filename)[0] or ""
+    ):
+        existing.filename = cand.filename
+
+
+# ── P1-CE: phase budget + candidate priority ────────────────────────────────
+# 50-paper retest (~/workspace/jsd-50-paper-test-p1-report.md, sec. 4 item 3):
+# Phase A timed out on 49/50 papers and Phase B on 41/50 against a 150s
+# budget that only existed in the test runner, so nothing in the tools
+# knew about it. The budget below is that same 150s, now a real,
+# configurable parameter shared by both entry points.
+
+DEFAULT_PHASE_TIMEOUT_SECONDS = 150
+
+
+def resolve_phase_timeout(value, default=DEFAULT_PHASE_TIMEOUT_SECONDS):
+    """Normalize a --phase-timeout value to seconds (float).
+
+    Accepts numbers and numeric strings; anything missing, non-numeric,
+    or <= 0 falls back to *default* (150s) instead of failing the run or
+    silently disabling the budget.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if seconds <= 0 or seconds != seconds:  # <= 0 or NaN
+        return float(default)
+    return seconds
+
+
+# ── P1 H-1: independent budget for the browser fallback ───────────────────
+# Round-3 report (~/workspace/jsd-50-paper-test-p1fix-report.md, sec. 2(h)
+# H-1, sec. 4 item 1): after --proxy fixed the tunnel failures, the
+# browser fallback stopped failing fast and started hanging -- one page
+# load over the proxy takes 60-90s, so the 150s phase budget dies inside
+# a single page load and the OA mirror / download rounds never run
+# (#1: R2 13 files via mirrors after a fast browser failure; R3 0 files
+# after a 120s+ hang on nature.com). The phase budget alone cannot fix
+# this: a single StealthyFetcher.fetch / page.goto call has no notion
+# of the phase deadline (P1-CE legacy note). The browser fallback
+# therefore gets its own two quotas, shared by both entry points:
+# one page goto at most 30s, 60s of browser time in total per phase.
+# Either quota running out degrades to the OA mirror round (requests)
+# instead of killing the phase.
+#
+# The quotas bound *attempts*, not a blocking call already in flight:
+# a goto is launched with timeout=min(goto, remaining), and no new
+# browser attempt starts once the total is spent. A live CDP /
+# BrowserSkill browser cannot take a per-request proxy or a goto
+# timeout from us (P1-D legacy note); those paths only receive the
+# capped timeout value where their API accepts one, and are skipped
+# outright once the budget is gone.
+#
+# P1 C: the two quotas above are not the whole story -- the *phase*
+# deadline (P1-CE, --phase-timeout, default 150s) is a third cap. A
+# 60s fallback quota can outlive a short phase, and a 30s goto
+# launched with 10s of phase left overshoots the deadline on its own;
+# that is exactly how round 3 died inside page loads (the deadline
+# logic fired 0 times: every load took its full slice and the runner
+# killed the phase before the download loop's deadline check ever
+# ran). The budget therefore takes the phase deadline as well: one
+# attempt runs at most min(goto, total remaining, phase remaining),
+# and the budget counts as exhausted once the phase deadline passes,
+# so the fallback quota can never exceed the remaining phase budget.
+# Enforcement happens *before launch* (clamping the timeout passed
+# to the underlying call) because no API can interrupt a call already
+# in flight beyond its own timeout: BSK navigate() honours its
+# subprocess timeout, CDP page.goto() honours its timeout, and the
+# requests/StealthyFetcher timeouts are real interrupts too -- but
+# only if they are given a value that respects the deadline.
+
+DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS = 30
+DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS = 60
+
+
+def resolve_browser_goto_timeout(value, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS):
+    """Normalize a --browser-goto-timeout value to seconds (float).
+
+    Same contract as resolve_phase_timeout: numbers and numeric
+    strings accepted; anything missing, non-numeric, or <= 0 falls
+    back to *default* (30s).
+    """
+    return resolve_phase_timeout(value, default=default)
+
+
+def resolve_browser_fallback_budget(value, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS):
+    """Normalize a --browser-fallback-budget value to seconds (float).
+
+    Same contract as resolve_phase_timeout, default 60s.
+    """
+    return resolve_phase_timeout(value, default=default)
+
+
+class BrowserFallbackBudget:
+    """Wall-clock quota for browser fallback attempts within one phase.
+
+    Created once per phase (run_download) and shared by every browser
+    attempt in it, so the total browser time -- not just one goto --
+    is capped. Uses time.monotonic, so tests can drive it with a fake
+    clock the same way the phase-deadline tests do.
+
+    P1 C: ``phase_deadline`` (a ``time.monotonic()`` value, normally
+    the run's ``--phase-timeout`` deadline) is a third cap on top of
+    the goto and total quotas: one attempt runs at most min(goto,
+    total remaining, phase remaining), and the budget counts as
+    exhausted once the phase deadline passes. With no phase deadline
+    the budget behaves exactly as H-1 left it.
+    """
+
+    def __init__(self, goto_timeout=None, total_budget=None,
+                 phase_deadline=None):
+        self.goto_timeout = resolve_browser_goto_timeout(goto_timeout)
+        self.total_budget = resolve_browser_fallback_budget(total_budget)
+        self.phase_deadline = phase_deadline
+        self._started_at = time.monotonic()
+        self._announced = False
+
+    def elapsed(self):
+        """Seconds of wall time since this budget was created."""
+        return time.monotonic() - self._started_at
+
+    def remaining(self):
+        """Seconds of the total budget not yet spent (<= 0 when gone)."""
+        return self.total_budget - self.elapsed()
+
+    def phase_remaining(self):
+        """Seconds until the phase deadline, or None when this budget
+        has no phase deadline attached."""
+        if self.phase_deadline is None:
+            return None
+        return self.phase_deadline - time.monotonic()
+
+    def set_phase_deadline(self, deadline):
+        """Attach (or replace) the phase deadline. Used by
+        fetch_page_html when the caller passes a deadline without a
+        run-shared budget; the explicit deadline always wins."""
+        self.phase_deadline = deadline
+
+    @property
+    def exhausted(self):
+        """True once the total browser budget is spent, or once the
+        phase deadline has passed (P1 C: the fallback quota must not
+        outlive the phase)."""
+        if self.remaining() <= 0:
+            return True
+        remaining_phase = self.phase_remaining()
+        return remaining_phase is not None and remaining_phase <= 0
+
+    def attempt_timeout(self):
+        """Seconds the next browser attempt may run: the per-page goto
+        timeout, capped at whatever of the total budget is left and
+        at the remaining phase budget (P1 C)."""
+        cap = min(self.goto_timeout, self.remaining())
+        remaining_phase = self.phase_remaining()
+        if remaining_phase is not None:
+            cap = min(cap, remaining_phase)
+        return max(0.0, cap)
+
+    def attempt_timeout_ms(self):
+        """attempt_timeout() in milliseconds (StealthyFetcher units)."""
+        return int(self.attempt_timeout() * 1000)
+
+    def announce_exhausted(self):
+        """Print the downgrade line once and return True; later calls
+        are silent and return False, so the log is not spammed once
+        per skipped attempt."""
+        if self._announced:
+            return False
+        self._announced = True
+        # P1 C: say when the phase deadline (not the fallback quota)
+        # is what ran out, so the log does not blame the 60s quota
+        # for a stop the 150s phase caused.
+        phase_note = ""
+        if (self.phase_deadline is not None
+                and self.phase_remaining() <= 0
+                and self.remaining() > 0):
+            phase_note = "，阶段预算已到"
+        print(f"  [Browser] 回退预算耗尽，降级到 OA 镜像轮次"
+              f"（已用 {self.elapsed():.1f}s / 配额 {self.total_budget:g}s，"
+              f"单页 {self.goto_timeout:g}s{phase_note}）")
+        return True
+
+
+def browser_budget_from_args(args, phase_deadline=None):
+    """Build a BrowserFallbackBudget from CLI-parsed args (getattr, so
+    direct callers / old tests that lack the new attributes still get
+    the 30s/60s defaults). ``phase_deadline`` (P1 C) is the run's
+    ``time.monotonic()`` phase deadline, or None for a standalone
+    budget with no phase to respect."""
+    return BrowserFallbackBudget(
+        goto_timeout=getattr(args, "browser_goto_timeout", None),
+        total_budget=getattr(args, "browser_fallback_budget", None),
+        phase_deadline=phase_deadline,
+    )
+
+
+# A .pdf candidate is a real supplement file here (candidates are already
+# supplementary-filtered); .pdf is not in DATA_EXTENSIONS because that set
+# is also used to reject bare article PDFs during extraction.
+_PRIORITY_DATA_EXTENSIONS = frozenset(DATA_EXTENSIONS) | {".pdf"}
+
+
+# P1 round-3 minor (a): the MITM egress proxy re-signs TLS with its own
+# CA, which Chromium does not trust -- round 3, Wiley #21-#23: one page's
+# first goto timed out and the retry failed with
+# net::ERR_CERT_AUTHORITY_INVALID, while a later attempt in the same
+# fetch went through. No call site passed any explicit trust config:
+# trust was entirely implicit in scrapling's own default
+# (StealthySessionMixin sets ignore_https_errors=True inside its
+# _context_options), so nothing guaranteed a fresh context or a retry
+# path carried the same trust config as the first context. One shared
+# helper builds that config so every StealthyFetcher.fetch /
+# StealthySession call -- first call and every retry, which copy the
+# same kwargs dict -- carries identical proxy + trust settings:
+#   * context level: additional_args={"ignore_https_errors": True}
+#     (scrapling merges additional_args into the context options with
+#     priority over its own defaults, so this also pins the behaviour
+#     if a scrapling upgrade ever drops the implicit default);
+#   * browser-launch level: extra_flags=["--ignore-certificate-errors"]
+#     (applied from process start, before any context exists -- this is
+#     what covers a first-navigation window in a fresh browser).
+# It returns {} with no proxy, so direct runs keep full certificate
+# validation; only proxy mode relaxes it, because the proxy CA is the
+# reason certs fail there. A fresh dict is built on every call so a
+# caller mutating one call's kwargs cannot leak into the next.
+# CDP / BrowserSkill paths attach to a live browser and cannot take a
+# per-request proxy or trust config; they are intentionally untouched.
+def proxy_browser_trust_kwargs(proxy):
+    """StealthyFetcher / StealthySession kwargs carrying the MITM-proxy
+    certificate trust config for ``proxy`` (``http://[user:pass@]host:port``).
+
+    Returns {} when no proxy is set (no trust relaxation at all).
+    """
+    if not proxy:
+        return {}
+    return {
+        "additional_args": {"ignore_https_errors": True},
+        "extra_flags": ["--ignore-certificate-errors"],
+    }
+
+
+def candidate_priority(cand: "Candidate") -> int:
+    """Priority tier for download order (P1-CE; lower runs first).
+
+    0 -- a real supplement file: the URL/filename ends in a data
+         extension (.xlsx/.xls/.csv/.tsv/.docx/.pdf/.zip/...).
+    1 -- explicitly supplementary-marked but no data extension (a
+         supplementary landing page, a .html supplement table, a
+         repository record labelled as supplementary, or a candidate
+         known to cover table ids).
+    2 -- everything else (external / repository / other pages).
+
+    Nothing is ever dropped by priority; tier 2 only runs last, so a
+    150s budget is spent on real files before junk/external candidates.
+    """
+    for source in (getattr(cand, "url", "") or "", getattr(cand, "filename", "") or ""):
+        ext = check_data_extension(source) if source else None
+        if ext and ext in _PRIORITY_DATA_EXTENSIONS:
+            return 0
+        path = urllib.parse.urlparse(source).path.lower()
+        if path.endswith(".pdf"):
+            return 0
+    label = " ".join(
+        str(v) for v in (
+            getattr(cand, "link_text", ""),
+            getattr(cand, "section", ""),
+            getattr(cand, "match_rule", ""),
+        ) if v
+    )
+    if (
+        getattr(cand, "covered_table_ids", None)
+        or getattr(cand, "section", "") == "supplementary_section"
+        or is_explicit_supp_table(getattr(cand, "link_text", "") or "")
+        or SUPP_KEYWORD_PATTERN.search(label)
+    ):
+        return 1
+    return 2
+
+
+_PMC_BIN_S_FILE_RE = re.compile(r"\.s\d+\.", re.IGNORECASE)
+
+
+def _is_pmc_bin_s_file(cand: "Candidate") -> bool:
+    """True for a PMC /bin/ s file (P1 round-3 minor (c), #31:
+    ``pbio.3003193.s001.tiff`` -- the article's own supplementary
+    files, as opposed to a repository data package)."""
+    url = getattr(cand, "url", "") or ""
+    path = urllib.parse.urlparse(url).path.lower()
+    if "/bin/" not in path:
+        return False
+    name = getattr(cand, "filename", "") or ""
+    return bool(_PMC_BIN_S_FILE_RE.search(name) or _PMC_BIN_S_FILE_RE.search(url))
+
+
+def _is_repository_data_package(cand: "Candidate") -> bool:
+    """True for a repository data package as opposed to an article
+    supplement file (P1 round-3 minor (c), #31): a zenodo.org record
+    link, or a Data Availability section link. These are real research
+    data, but they are not the article's s files and must not consume
+    the download budget before them."""
+    url = getattr(cand, "url", "") or ""
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host == "zenodo.org" or host.endswith(".zenodo.org"):
+        return True
+    label = " ".join(
+        str(v) for v in (
+            getattr(cand, "link_text", ""),
+            getattr(cand, "section", ""),
+        ) if v
+    ).lower()
+    return "data availability" in label
+
+
+def _priority_sub_rank(cand: "Candidate") -> int:
+    """Within-tier download order (P1 round-3 minor (c)).
+
+    0 -- a PMC /bin/ s file; 1 -- anything else; 2 -- a repository
+    data package (Zenodo / Data Availability). Only the order *inside*
+    a tier changes: the tier itself still comes from
+    ``candidate_priority`` (0 real file / 1 explicitly supplementary /
+    2 other), so a tier-2 s file never jumps ahead of a tier-0 file.
+    """
+    if _is_pmc_bin_s_file(cand):
+        return 0
+    if _is_repository_data_package(cand):
+        return 2
+    return 1
+
+
+def sort_candidates_by_priority(candidates):
+    """Return candidates in download order: tier 0, then 1, then 2.
+
+    Stable within a tier (discovery order is kept) and lossless -- the
+    result is a permutation of the input, never a filter. Within a
+    tier, PMC /bin/ s files run before repository data packages
+    (Zenodo / Data Availability, P1 round-3 minor (c)): on #31 the
+    Zenodo .csv/.zip packages and the true s files were interleaved
+    and a Phase B timeout left all 17 s files undownloaded.
+    """
+    return sorted(
+        candidates,
+        key=lambda c: (candidate_priority(c), _priority_sub_rank(c)),
+    )
 
 
 def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
-    """Table ids named by a candidate's own label, filename, or attributes (H6)."""
+    """Table ids named by a candidate's own label, filename, or attributes (H6).
+
+    The label/filename itself is supplementary context (P1-A), so bare
+    lists there still resolve; the word-boundary rule in
+    supplementary_table_ids still applies.
+    """
     ids: Set[str] = set()
     for value in (link_text, filename):
-        ids |= supplementary_table_ids(value)
+        ids |= supplementary_table_ids(value, in_supplementary_context=True)
     for value in (attrs or {}).values():
         if isinstance(value, str):
-            ids |= supplementary_table_ids(value)
+            ids |= supplementary_table_ids(value, in_supplementary_context=True)
         elif isinstance(value, list):
             for item in value:
-                ids |= supplementary_table_ids(str(item))
+                ids |= supplementary_table_ids(str(item), in_supplementary_context=True)
     return ids
 
 
@@ -1471,7 +2092,9 @@ def _parent_direct_table_ids(tag) -> Set[str]:
         return set()
     if not direct_text:
         return set()
-    return supplementary_table_ids(direct_text)
+    # The parent row holds a single download control, so its own text is
+    # supplementary context (P1-A).
+    return supplementary_table_ids(direct_text, in_supplementary_context=True)
 
 
 # Inline JSON payloads whose URLs static parsing may miss (H3).
@@ -1528,6 +2151,7 @@ def find_all_candidates(
 
     soup = BeautifulSoup(html_content, DEFAULT_PARSER)
     seen_urls: Set[str] = set()
+    seen_fnames: Set[str] = set()
     candidates: List[Candidate] = []
 
     def add_candidate(cand: Candidate):
@@ -1539,7 +2163,7 @@ def find_all_candidates(
         if not raw_cand_url:
             return
         # Check raw_cand_url BEFORE stripping '#' so in-page fragments are caught
-        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
+        if is_excluded_url(raw_cand_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs, filename=cand.filename, diag=diag):
             diag.excluded_links.append((raw_cand_url, "excluded_url_pattern"))
             return
         norm_url = raw_cand_url.split("#")[0].strip()
@@ -1548,7 +2172,7 @@ def find_all_candidates(
         if is_same_article_page_url(norm_url, page_urls):
             diag.excluded_links.append((norm_url, "same_article_page_url"))
             return
-        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs):
+        if is_excluded_url(norm_url, base_url=page_urls, text=cand.link_text, attrs=evidence_attrs, filename=cand.filename, diag=diag):
             diag.excluded_links.append((norm_url, "excluded_url_pattern"))
             return
         if is_article_figure_url(norm_url, text=cand.link_text, attrs=evidence_attrs):
@@ -1566,24 +2190,24 @@ def find_all_candidates(
             # 'Table S2') keeps ONE candidate but merges both labels/table ids.
             for existing in candidates:
                 if _normalize_url_for_dedup(existing.url.split("#")[0].strip()) == dedup_key:
-                    existing.covered_table_ids |= cand.covered_table_ids
-                    if not is_explicit_supp_table(existing.link_text) and is_explicit_supp_table(cand.link_text):
-                        existing.link_text = cand.link_text
-                    is_existing_generic = (
-                        existing.filename.endswith(".bin")
-                        or existing.filename.startswith("download_")
-                        or existing.filename.startswith("attachment_")
-                    )
-                    is_cand_specific = not (
-                        cand.filename.endswith(".bin")
-                        or cand.filename.startswith("download_")
-                        or cand.filename.startswith("attachment_")
-                    )
-                    if is_existing_generic and is_cand_specific:
-                        existing.filename = cand.filename
+                    _merge_duplicate_candidate(existing, cand)
+                    break
+            return
+        # P1-B: same file reached via a different (mirror) URL -- e.g. the
+        # Springer static-content URL and the PMC /bin/ URL for one MOESM
+        # (#46), or the 18 /table/app7tableN/ links all labelled
+        # 'Appendix 7' (#36) -- keeps ONE candidate, keyed on the
+        # normalized filename (_2-style collision suffixes ignored).
+        fname_key = filename_dedup_key(cand.filename)
+        if fname_key is not None and fname_key in seen_fnames:
+            for existing in candidates:
+                if filename_dedup_key(existing.filename) == fname_key:
+                    _merge_duplicate_candidate(existing, cand)
                     break
             return
         seen_urls.add(dedup_key)
+        if fname_key is not None:
+            seen_fnames.add(fname_key)
         candidates.append(cand)
 
     # ── Strategy 1: Targeted Meta & Link Tags (Highwire, Nature, etc.) ────
@@ -1621,14 +2245,15 @@ def find_all_candidates(
                     link_text=control_label, section="supplementary_section",
                     source_url=base_url, extra_info={"browser_selector": selector},
                     match_rule="browser_download_control",
-                    covered_table_ids=supplementary_table_ids(control_label)))
+                    covered_table_ids=supplementary_table_ids(
+                        control_label, in_supplementary_context=True)))
             continue
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
         attrs = {k: tag[k] for k in ["aria-label", "title", "download", "data-filename", "data-title", "data-caption", "value"] if tag.has_attr(k)}
 
         full_url = urllib.parse.urljoin(effective_base, target_raw)
-        if is_excluded_url(full_url, base_url=page_urls, text=link_text, attrs=attrs):
+        if is_excluded_url(full_url, base_url=page_urls, text=link_text, attrs=attrs, diag=diag):
             diag.excluded_links.append((full_url, "excluded_url_pattern"))
             continue
         if is_same_article_page_url(full_url, page_urls):
@@ -1716,10 +2341,10 @@ def find_all_candidates(
         any(d in combined_url for d in ["ncbi.nlm.nih.gov", "pmc", "europepmc"])
         or soup.find("a", attrs={"data-ga-action": re.compile(r"click_(?:feat_)?suppl", re.IGNORECASE)}) is not None
     ):
-        _extract_pmc_candidates(soup, effective_base, add_candidate)
+        _extract_pmc_candidates(soup, effective_base, add_candidate, diag=diag)
 
     # Embedded JSON data structures (Next.js / Nuxt / Publisher JSON payloads)
-    _extract_embedded_json_candidates(soup, effective_base, add_candidate)
+    _extract_embedded_json_candidates(soup, effective_base, add_candidate, diag=diag)
 
     # Disambiguate identical filenames across different candidates (D2)
     # Use case-insensitive tracking to prevent collisions on case-insensitive filesystems (macOS/Windows)
@@ -1872,7 +2497,41 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
         ))
 
 
-def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
+def _is_plausible_feat_suppl_link(url: str, link_text: str, filename: str) -> bool:
+    """True when a PMC ``click_feat_suppl`` link actually points at
+    supplementary content (P1 round-3 minor (b)).
+
+    PMC puts ``data-ga-action="click_feat_suppl"`` on *every* external
+    link (``usa-link--external``) -- verified live on PMC12434933
+    (round-3 #50, a Heliyon corrigendum with no supplements): the
+    article's own DOI link *and* the Twingate blog glossary reference
+    link both carry it, so the bare attribute is not a supplement
+    signal at all. A link only counts when its URL, link text or
+    filename carries supplementary signal: a PMC /bin/ attachment, a
+    data extension, a supplementary keyword / table filename / MMC id,
+    or a repository/component DOI. Anything else -- a blog page, a DOI
+    link, a glossary entry -- is dropped by the caller.
+    """
+    parsed = urllib.parse.urlparse(url or "")
+    path = (parsed.path or "").lower()
+    if "/bin/" in path:
+        return True
+    if check_data_extension(url or "") or check_data_extension(filename or ""):
+        return True
+    for value in (url or "", link_text or "", filename or ""):
+        if not value:
+            continue
+        if (
+            SUPP_KEYWORD_PATTERN.search(value)
+            or TABLE_FILENAME_PATTERN.search(value)
+            or MMC_PATTERN.search(value)
+            or REPO_OR_COMPONENT_DOI_PATTERN.search(value)
+        ):
+            return True
+    return False
+
+
+def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=None):
     """PMC (PubMed Central) and Europe PMC supplementary material extraction."""
     # 1. Links inside PMC supplementary sections
     for sec in soup.find_all(
@@ -1888,7 +2547,7 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
                 continue
             link_text = a.get_text(separator=" ", strip=True)
             full_url = urllib.parse.urljoin(base_url, target)
-            if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+            if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
                 continue
             fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
             add_func(Candidate(
@@ -1905,7 +2564,7 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
         href = a.get("href")
         link_text = a.get_text(separator=" ", strip=True)
         full_url = urllib.parse.urljoin(base_url, href)
-        if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+        if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
             continue
         fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
         add_func(Candidate(
@@ -1923,9 +2582,16 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func):
         if href:
             link_text = a.get_text(separator=" ", strip=True)
             full_url = urllib.parse.urljoin(base_url, href)
-            if is_excluded_url(full_url, base_url=base_url, text=link_text) or is_article_figure_url(full_url, text=link_text):
+            if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
                 continue
             fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
+            # P1 round-3 minor (b): PMC stamps click_feat_suppl on every
+            # external link (DOI links, reference links, blog pages), so
+            # the attribute alone mints false candidates (#50 Twingate).
+            # Only links that actually point at supplementary content
+            # become candidates; the rest are skipped, not excluded.
+            if not _is_plausible_feat_suppl_link(full_url, link_text, fname):
+                continue
             add_func(Candidate(
                 url=full_url,
                 filename=sanitize_filename(fname),
@@ -1964,11 +2630,11 @@ def _is_plausible_json_url_or_path(cand_raw: str) -> bool:
     return True
 
 
-def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: Optional[Set[str]] = None):
+def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: Optional[Set[str]] = None, diag=None):
     """Recursively inspect parsed JSON objects for extensionless supplementary/table download entries."""
     if isinstance(node, list):
         for item in node:
-            _walk_json_for_supp_objects(item, base_url, add_func, consumed_names)
+            _walk_json_for_supp_objects(item, base_url, add_func, consumed_names, diag=diag)
         return
     if not isinstance(node, dict):
         return
@@ -2008,7 +2674,7 @@ def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: O
             cand_path = urllib.parse.urlsplit(cand_url).path.lower()
             if not any(cand_path.endswith(ext) for ext in [".js", ".css", ".map", ".svg", ".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf"]):
                 if not any(kw in cand_path for kw in ["table-of-contents", "table_of_contents", "/support", "customer-support", "/toc"]):
-                    if not is_excluded_url(cand_url, base_url=base_url, text=best_name) and not is_article_figure_url(cand_url, text=best_name):
+                    if not is_excluded_url(cand_url, base_url=base_url, text=best_name, diag=diag) and not is_article_figure_url(cand_url, text=best_name):
                         fname = extract_filename_from_url(cand_url, default_name=best_name)
                         add_func(Candidate(
                             url=cand_url,
@@ -2021,10 +2687,10 @@ def _walk_json_for_supp_objects(node, base_url: str, add_func, consumed_names: O
 
     for val in node.values():
         if isinstance(val, (dict, list)):
-            _walk_json_for_supp_objects(val, base_url, add_func, consumed_names)
+            _walk_json_for_supp_objects(val, base_url, add_func, consumed_names, diag=diag)
 
 
-def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func):
+def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=None):
     """Extract supplementary URLs embedded inside <script> JSON, LD-JSON, or inline scripts (B3)."""
     valid_data_exts = "|".join(re.escape(ext.lstrip(".")) for ext in SORTED_DATA_EXTENSIONS)
     pattern = re.compile(
@@ -2060,7 +2726,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
             if str_stripped.startswith(("{", "[")):
                 try:
                     parsed_json = json.loads(str_stripped)
-                    _walk_json_for_supp_objects(parsed_json, base_url, add_func, consumed_names)
+                    _walk_json_for_supp_objects(parsed_json, base_url, add_func, consumed_names, diag=diag)
                 except Exception:
                     pass
             else:
@@ -2069,7 +2735,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                     start_idx = assign_m.start(1)
                     try:
                         parsed_sub, _ = decoder.raw_decode(content_unescaped, start_idx)
-                        _walk_json_for_supp_objects(parsed_sub, base_url, add_func, consumed_names)
+                        _walk_json_for_supp_objects(parsed_sub, base_url, add_func, consumed_names, diag=diag)
                     except Exception:
                         pass
             # Also scan inline JS object literals containing downloadUrl/fileUrl + fileName/title
@@ -2077,7 +2743,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                 try:
                     obj_data = json.loads(obj_m.group(0))
                     if isinstance(obj_data, dict):
-                        _walk_json_for_supp_objects(obj_data, base_url, add_func, consumed_names)
+                        _walk_json_for_supp_objects(obj_data, base_url, add_func, consumed_names, diag=diag)
                 except Exception:
                     pass
 
@@ -2099,7 +2765,7 @@ def _extract_embedded_json_candidates(soup: BeautifulSoup, base_url: str, add_fu
                 # Exclude navigation/UI routes
                 if any(kw in cand_path for kw in ["table-of-contents", "table_of_contents", "/support", "customer-support", "/toc"]):
                     continue
-                if not is_excluded_url(cand_url, base_url=base_url) and not is_article_figure_url(cand_url):
+                if not is_excluded_url(cand_url, base_url=base_url, diag=diag) and not is_article_figure_url(cand_url):
                     add_func(Candidate(
                         url=cand_url,
                         filename=extract_filename_from_url(cand_url),
@@ -2149,18 +2815,24 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
     Table identifiers and table ranges ('Tables S1-S3', 'Supplementary Table S10',
     '5 个附表') are deliberately NOT counted here; see detect_declared_table_range.
     Returns None when no file-count statement is present.
+
+    P1-A: when a page carries several file-count statements that disagree,
+    the FIRST statement in document order wins -- it is the article's own
+    declaration. Taking the largest (the old max()) let a restatement or a
+    sidebar count inflate the declaration, and mixed the file-count reading
+    with the table-range reading; the two readings are counted independently.
     """
     if not html_content:
         return None
     cleaned = _clean_text_for_declarations(html_content)
-    found_counts: List[int] = []
+    found_counts: List[tuple] = []  # (position, value), earliest wins
 
     # Pattern 1: 'N Supplementary Files' / 'N Supplementary Materials' (never 'N Supplementary Tables')
     for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2169,7 +2841,7 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
         try:
             val = int(m.group(1) or m.group(2))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2184,7 +2856,7 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2198,9 +2870,9 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
     ):
         c_num = _parse_declared_numeral(m.group(1) or m.group(2))
         if c_num is not None and 1 <= c_num <= 99:
-            found_counts.append(c_num)
+            found_counts.append((m.start(), c_num))
 
-    return max(found_counts) if found_counts else None
+    return min(found_counts)[1] if found_counts else None
 
 
 def detect_declared_table_range(html_content: str) -> Set[str]:
@@ -2328,10 +3000,26 @@ _TABLE_TOKEN_RE = re.compile(
 )
 _TABLE_RANGE_SEP_RE = re.compile(r"^\s*(?:-|\bto\b|至|~|到)\s*$", re.IGNORECASE)
 _TABLE_LIST_SEP_RE = re.compile(r"^\s*(?:[,、，/]\s*)?(?:and|&|和|及|与)?\s*$", re.IGNORECASE)
+# URLs and DOIs must never be read for table ids: a DOI path segment such as
+# 's41467-025-61134-0' otherwise parses as S41467/S25/S61134/S0 (50-paper test,
+# Cause A). Masked with same-length spaces so token offsets stay valid.
+_URL_DOI_MASK_RE = re.compile(
+    r"(?:https?://|doi\.org/)[^\s\"'<>\]]+|\b10\.\d{4,9}/[^\s\"'<>\]]+",
+    re.IGNORECASE,
+)
 
 
 def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optional[str]) -> Optional[str]:
-    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides."""
+    """Namespace for one token: an explicit S/A/E letter wins, else the prefix word decides.
+
+    P1FIX round-3 Cause A(c): a supplementary/supporting/additional prefix
+    only names a table when it carries the word "table" -- "Supplementary
+    Data 1", "Supplementary Files 2" and the like are data files, not
+    tables, and must not mint S ids. "Appendix ..." and "Extended Data ..."
+    keep their A/E namespaces: an appendix or extended-data number is a
+    supplementary item number, and the bare forms ("Appendix 1-4",
+    "Extended Data 1-3") are established legitimate inputs.
+    """
     if letter:
         return letter.upper()
     if pw:
@@ -2340,8 +3028,19 @@ def _table_token_namespace(pw: Optional[str], letter: Optional[str], post: Optio
             return "A"
         if "extended" in low:
             return "E"
-        if any(w in low for w in ("supplement", "supporting", "additional", "附表")):
+        # A "supplement(ary|al)/supporting/additional" prefix names a table
+        # only when it also carries the word "table" -- "Supplementary
+        # Data 1" is a data file, not a table. A bare "Tables N" prefix,
+        # on the other hand, is a main-text table, not a supplementary
+        # declaration (H5/P1: "Tables 1 to 3" declares nothing), so it
+        # assigns no namespace. "附表" is inherently a supplementary
+        # table and always maps to S.
+        if "附表" in pw:
             return "S"
+        if "table" in low and any(
+                w in low for w in ("supplement", "supporting", "additional")):
+            return "S"
+        return None
     if post:
         return None
     return None
@@ -2369,7 +3068,162 @@ def _expand_table_range(start: str, end: str) -> Optional[List[str]]:
     return None
 
 
-def supplementary_table_ids(text):
+# A supplementary signal word near a bare table-id mention (P1-A). The
+# context gate in supplementary_table_ids() accepts a multi-token group
+# without any explicit table word only when such a signal sits within a
+# short window around it. Deliberately narrow: bare "table" / "data" /
+# "file" / "material" alone are NOT signals -- "Table 5 lists samples
+# S1, S2 ..." and "the data were 10-100" would otherwise bless sample
+# ids and measurement ranges. An explicit prefix/trailing table word on
+# the token itself ("Table S1", "S1 Table") still counts, as before.
+_SUPP_CONTEXT_RE = re.compile(
+    r"supplementar(?:y|ies)|supplemental"
+    r"|supporting\s+(?:information|material|materials?|data|files?|info)"
+    r"|additional\s+(?:files?|materials?|data|information)"
+    r"|appendix|appendices|extended\s+data|suppl\.?"
+    r"|supporting-info|supporting_info|additional-file|additional_file"
+    r"|extended-data|extended_data"
+    r"|附表|附录|补充|附加|支撑材料|扩展数据",
+    re.IGNORECASE,
+)
+_SUPP_CONTEXT_WINDOW = 120
+
+
+def _group_has_supp_signal(text: str, start: int, end: int) -> bool:
+    """True when a supplementary signal word sits within a short window
+    around text[start:end] (P1-A context gate for bare id mentions)."""
+    lo = max(0, start - _SUPP_CONTEXT_WINDOW)
+    hi = min(len(text), end + _SUPP_CONTEXT_WINDOW)
+    return _SUPP_CONTEXT_RE.search(text[lo:hi]) is not None
+
+
+# A figure/movie word immediately before a lettered range ("Figures S1-S3",
+# "Fig. S1-S3", "Supplementary Fig. S1-S3") names figures, not tables
+# (P1FIX round-3, Cause A(c)). A mixed "Tables and Figures" phrase names
+# tables too and is not blocked.
+_FIGURE_PREFIX_RE = re.compile(
+    r"(?:figs?\.?|figures?|movies?|videos?|films?)\s*$", re.IGNORECASE)
+_MIXED_TABLE_FIGURE_RE = re.compile(
+    r"tables?\b\s+and\s+(?:figs?\.?|figures?)\b"
+    r"|(?:figs?\.?|figures?)\b\s+and\s+tables?\b",
+    re.IGNORECASE,
+)
+_FIGURE_PREFIX_WINDOW = 60
+
+
+def _group_is_figure_prefixed(text: str, start: int) -> bool:
+    """True when the words right before a token group name figures/movies
+    rather than tables (P1FIX round-3, Cause A(c))."""
+    window = text[max(0, start - _FIGURE_PREFIX_WINDOW):start]
+    if not _FIGURE_PREFIX_RE.search(window.rstrip()):
+        return False
+    if _MIXED_TABLE_FIGURE_RE.search(window):
+        return False
+    return True
+
+
+def _group_is_large_numbered_nonsupp(resolved) -> bool:
+    """True when every member is an E/A id numbered above 99 (P1FIX
+    round-3, Cause A(a)): e-page numbers such as e115-e120 are three-digit
+    by nature, while genuine Extended Data / Appendix tables are numbered
+    small; a nearby supplementary signal alone must not bless a large
+    E/A group."""
+    for tok, _sep in resolved:
+        if tok["ns"] not in ("E", "A"):
+            return False
+        try:
+            first = int(str(tok["num"]).split(".")[0])
+        except ValueError:
+            return False
+        if first <= 99:
+            return False
+    return len(resolved) > 0
+
+
+def _range_is_multisegment_code(text: str, start_tok, end_tok, is_group_start: bool) -> bool:
+    """True when a token range sits inside a longer dashed code such as an
+    ethics approval number ("R-FP-S-2-0023-0000" -> S2-S23, P1FIX round-3
+    Cause A(b)). Two tells, either suffices:
+
+    * the range end is followed at once by "-<digits>" where the range end
+      itself or the following segment is zero-padded ("-0023-0000"): a
+      trailing zero-padded segment is a code segment, not a new range
+      member. A plain year suffix ("Tables S1-S3-2024") is not: neither
+      segment is zero-padded.
+    * the range start is glued to a preceding dashed code segment
+      ("...FP-S-2..."): a dash with an alphanumeric before it. This tell
+      only applies to the group's first pair: later pairs are separated
+      from their predecessor by a range dash by construction.
+    """
+    end = end_tok["end"]
+    m = re.match(r"-(\d+)", text[end:])
+    if m:
+        end_raw = str(end_tok.get("raw_num", ""))
+        if end_raw.startswith("0") or m.group(1).startswith("0"):
+            return True
+    if is_group_start:
+        start = start_tok["start"]
+        if start >= 2 and text[start - 1] == "-" and text[start - 2].isalnum():
+            return True
+    return False
+
+
+def _drop_multisegment_code_ranges(resolved, text: str):
+    """Drop range pairs that sit inside a longer dashed code (P1FIX round-3,
+    Cause A(b)) before anchoring/expansion, so an approval number mints
+    neither endpoint. Other members of the group survive."""
+    drop = set()
+    for idx in range(1, len(resolved)):
+        tok, sep = resolved[idx]
+        prev_tok = resolved[idx - 1][0]
+        if sep != "range" or prev_tok["ns"] != tok["ns"]:
+            continue
+        if _range_is_multisegment_code(text, prev_tok, tok, is_group_start=(idx - 1 == 0)):
+            drop.add(idx - 1)
+            drop.add(idx)
+    if not drop:
+        return resolved
+    return [item for i, item in enumerate(resolved) if i not in drop]
+
+
+def _group_is_anchored(resolved, text: str) -> bool:
+    """True when a resolved token group is a table declaration (P1-A, P1FIX round-3).
+
+    Anchored by an explicit table/supplementary word on some member
+    ("Table S1", "Supplementary Tables 2-5"), by an attached-letter range
+    in the S namespace only ("S1-S3" -- a bare S range is a long-standing
+    contract forced by existing tests), or by a supplementary signal word
+    near the group. Two P1FIX round-3 tightenings:
+
+    * An attached-letter range in the E/A namespace ("e115-e120") is NOT
+      self-anchoring: e-page numbers look exactly like one, so they need a
+      supplementary signal or an explicit table word. A nearby signal
+      still does not anchor a large-numbered E/A group (every member above
+      99): those are e-page numbers.
+    * A group immediately preceded by a figure/movie word ("Figures S1-S3",
+      "Fig. S1-S3") is a figure reference, not a table declaration, and is
+      never anchored -- not even by a nearby supplementary signal. A mixed
+      "Tables and Figures" phrase still counts as a table mention.
+    A bare list of lettered ids with none of these (sample ids, reference
+    numbers) is not anchored and must not mint table ids.
+    """
+    if any(tok["context"] for tok, _sep in resolved):
+        return True
+    if _group_is_figure_prefixed(text, resolved[0][0]["start"]):
+        return False
+    for idx in range(1, len(resolved)):
+        tok, sep = resolved[idx]
+        prev_tok = resolved[idx - 1][0]
+        if (sep == "range" and prev_tok["ns"] == tok["ns"] == "S"
+                and prev_tok.get("attached") and not prev_tok.get("bare")):
+            return True
+    if not _group_has_supp_signal(
+            text, resolved[0][0]["start"], resolved[-1][0]["end"]):
+        return False
+    return not _group_is_large_numbered_nonsupp(resolved)
+
+
+def supplementary_table_ids(text, in_supplementary_context=False):
     """Return namespaced table identities (S1, S1.1, A1, E1), never bare ordinal counts.
 
     Hierarchical numbers keep their suffix ('Table S1.1' -> 'S1.1', not 'S1').
@@ -2377,19 +3231,55 @@ def supplementary_table_ids(text):
     'Extended Data Tables 1-3' all enumerate every member. Lists ('S1, S2 and S3')
     enumerate their members. A bare 'S1' with no table context or range/list
     neighbour is ignored, as is a bare main-text 'Table 1'.
+
+    P1-A context gate: a table mention must carry supplementary context.
+    A namespace letter must start a word of its own -- the final letter of
+    an ordinary word glued to a following number ("were 10-100" -> E10..E100,
+    "data 1-60" -> A1..A60, "was 113" -> S113 in the 50-paper retest) is
+    never a namespace. A multi-token group with no explicit table word is
+    accepted only as an attached-letter range, when a supplementary signal
+    sits within a short window around it, or when the caller passes
+    in_supplementary_context=True (a candidate's link text / filename /
+    attributes, a single download row, or a supplementary section -- the
+    link or section itself is the supplementary context). When in doubt
+    the extractor under-extracts rather than minting ids: a lone 'S1' and
+    a bare list such as 'Samples S1, S2 and S3' stay unextracted.
     """
     result = set()
     text = str(text or "")
     # Normalize unicode dashes so range separators are uniform.
     text = re.sub(r"[‐‑‒–—―]", "-", text)
+    # Blank out URLs/DOIs (same length, offsets preserved) before scanning.
+    text = _URL_DOI_MASK_RE.sub(lambda m: " " * len(m.group(0)), text)
     tokens = []  # (namespace-or-None, number, has_context, start, end)
     for m in _TABLE_TOKEN_RE.finditer(text):
         pw = m.group("pw")
         letter = m.group("letter")
         post = m.group("post")
+        # P1-A: the letter must start a word of its own. The letter group
+        # also matches the final letter of an ordinary word followed by a
+        # space, which minted whole fake ranges out of measurement ranges
+        # ("were 10" -> E10, "data 1" -> A1, "was 113" -> S113). The only
+        # exception is a letter glued to its own prefix word ("附表S1",
+        # where the prefix ends exactly where the letter starts).
+        if letter:
+            letter_start = m.start("letter")
+            if not (pw and m.end("pw") == letter_start):
+                if letter_start > 0 and text[letter_start - 1].isalpha():
+                    continue
         num = _parse_table_number(m.group("num"))
         if num is None:
             continue
+        # Reject implausible table numbers: supplementary tables are numbered
+        # from 1 and stay well under 1000; larger digit runs are article
+        # numbers, years or accessions, not table ids.
+        if num[0].isdigit():
+            num_parts = num.split(".")
+            try:
+                if int(num_parts[0]) < 1 or any(int(p) > 999 for p in num_parts):
+                    continue
+            except ValueError:
+                continue
         # A Latin prefix word glued to a bare number ('Supplementary3') is not
         # a table id unless an S/A/E letter is present; Chinese 附表/附录
         # legitimately take the number with no space.
@@ -2397,17 +3287,22 @@ def supplementary_table_ids(text):
             id_start = m.start("num")
             if id_start == m.end("pw"):
                 continue
+        # Whether the namespace letter is attached to its number ('S1',
+        # 'S-1', 'S.1' -- but not 'S 1'): only an attached letter can
+        # anchor a bare range, so a spaced-out letter never does.
+        attached = letter is None or not any(
+            ch.isspace() for ch in text[m.end("letter"):m.start("num")])
         # A bare number with neither a prefix word, a letter, nor a trailing
         # table word is not a table id on its own; kept as a weak token so it
         # can still inherit the namespace of a range/list neighbour
         # ('Supplementary Tables 2-5' -> S2..S5).
         if not pw and not letter and not post:
-            tokens.append({"ns": None, "num": num, "context": False, "start": m.start(), "end": m.end()})
+            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "attached": attached, "start": m.start(), "end": m.end(), "raw_num": m.group("num")})
             continue
         ns = _table_token_namespace(pw, letter, post)
         if ns is None:
             continue
-        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "start": m.start(), "end": m.end()})
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "attached": attached, "start": m.start(), "end": m.end(), "raw_num": m.group("num")})
 
     # Group consecutive tokens joined only by a range/list separator.
     groups = []  # each: [(token, sep_from_previous)] with sep None for the first
@@ -2440,7 +3335,27 @@ def supplementary_table_ids(text):
             if ns is None:
                 continue
             last_ns = ns
-            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"]}, sep))
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False), "attached": tok.get("attached", False), "start": tok["start"], "end": tok["end"], "raw_num": tok.get("raw_num", tok["num"])}, sep))
+        if not resolved:
+            continue
+        # P1FIX round-3 Cause A(b): a range inside a longer dashed code
+        # (ethics approval numbers) is not a table range; drop the pair
+        # before anchoring/expansion so it mints neither endpoint.
+        resolved = _drop_multisegment_code_ranges(resolved, text)
+        if not resolved:
+            continue
+        if len(resolved) == 1:
+            # A group reduced to one token follows the lone-token rule:
+            # an explicit table word on it, or caller-supplied
+            # supplementary context, is required.
+            tok = resolved[0][0]
+            if in_supplementary_context or tok["context"]:
+                result.add(f"{tok['ns']}{tok['num']}")
+            continue
+        # P1-A: a multi-token group with no anchor is not a declaration
+        # (bare list of lettered ids, e.g. sample ids or reference numbers).
+        if not in_supplementary_context and not _group_is_anchored(resolved, text):
+            continue
         expanded: Set[str] = set()
         for idx, (tok, sep) in enumerate(resolved):
             if sep == "range" and idx > 0:
@@ -2450,21 +3365,32 @@ def supplementary_table_ids(text):
                     if span is not None:
                         expanded.update(f"{tok['ns']}{n}" for n in span)
                         continue
+                    if tok.get("bare"):
+                        # A failed range expansion must not mint a table id
+                        # from a bare number (e.g. a year after 'S1, 2020-2021').
+                        continue
             expanded.add(f"{tok['ns']}{tok['num']}")
         result.update(expanded)
     return result
 
 
 def declared_file_count(text):
-    """Only explicit file counts; table ranges are a different constraint."""
+    """Only explicit file counts; table ranges are a different constraint.
+
+    P1-A: when several file-count statements disagree, the FIRST statement
+    in document order wins; the old max() let a larger restatement inflate
+    the declaration. The file-count and table-range readings are counted
+    independently -- a table range never feeds this number.
+    """
     patterns = [
         r'\b(\d+)\s+(?:supplementary|supplemental|supporting|additional)\s+files?\b',
         r'(?:supplementary|supplemental|supporting|additional)\s+files?\s*\(\s*(\d+)\s*\)',
         r'(?:supplementary|supporting)\s+(?:information|material)\s*\(\s*(\d+)\s+files?\s*\)',
         r'(\d+)\s*个?\s*(?:补充文件|补充附件|附加文件)',
     ]
-    values = [int(m[1]) for pattern in patterns for m in re.finditer(pattern, text, re.I)]
-    return max(values, default=0)
+    values = [(m.start(), int(m.group(1))) for pattern in patterns
+              for m in re.finditer(pattern, text, re.I)]
+    return min(values)[1] if values else 0
 
 
 def candidate_evidence(candidates):
@@ -2493,7 +3419,8 @@ def covered_table_ids(candidates):
             covered.update(str(t) for t in explicit)
             continue
         for value in (item.get('link_text'), item.get('filename'), item.get('extra_info', {}).get('attributes', {})):
-            covered.update(supplementary_table_ids(value))
+            # A candidate's own label/filename is supplementary context (P1-A).
+            covered.update(supplementary_table_ids(value, in_supplementary_context=True))
     return covered
 
 
@@ -2527,7 +3454,10 @@ def is_result_obviously_incomplete(candidates, html_content, declared_count=None
             for item in evidence)
         if not matched and not meta_satisfies:
             # A named section can be fulfilled by corresponding files on a mirror.
-            section_tables = supplementary_table_ids(section.get_text(' ', strip=True))
+            # The section itself was selected for its supplementary markers,
+            # so its own text is supplementary context (P1-A).
+            section_tables = supplementary_table_ids(
+                section.get_text(' ', strip=True), in_supplementary_context=True)
             if not section_tables or not section_tables <= covered_table_ids(candidates):
                 return True, 'Supplementary container found in HTML but 0 candidates extracted from it (unresolved section)'
     if missing:
@@ -2652,6 +3582,112 @@ def page_fetch_is_failure(html: Optional[str], status: Optional[int] = None) -> 
     return bool(html) and is_blocked_page(html)
 
 
+def single_line(text, max_len: int = 1000) -> str:
+    """Collapse multi-line exception / reason text to a single line.
+
+    P1-F: Playwright exceptions span several lines (``... at <url>\\nCall
+    log:\\n  - navigating to ...\\n)``), so a ``FAIL (...)`` line printed
+    verbatim has its closing paren 2-3 lines later and a single-line
+    regex misreads it as a bare FAIL. Only the formatting changes; the
+    reason content is preserved (truncated at *max_len* with an ellipsis
+    when absurdly long).
+    """
+    flat = re.sub(r"\s+", " ", str(text)).strip()
+    if len(flat) > max_len:
+        flat = flat[:max_len].rstrip() + " \u2026"
+    return flat
+
+
+def remove_invalid_existing_download(filepath: str, manifest=None, reason: str = "") -> bool:
+    """Delete a previously landed file that fails validation (P1-F).
+
+    The H9 download paths validate a temp file before committing, so
+    garbage normally never lands; this is the cleanup for files an
+    earlier run already left on disk. The file is removed from disk and
+    its manifest entry is dropped, so it is not [SKIP]-counted as a
+    success and does not enter completeness statistics. Returns True
+    when a file was removed.
+    """
+    name = os.path.basename(filepath)
+    try:
+        os.remove(filepath)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if manifest is not None and name in manifest:
+        manifest.pop(name, None)
+        try:
+            save_download_manifest(os.path.dirname(filepath) or ".", manifest)
+        except Exception:
+            pass
+    print(f"  [Removed] {name} (invalid existing download: {reason})")
+    return True
+
+
+# ── P1-F: downloaded-file authenticity ──────────────────────────────────────
+# A bare "Table N.html" / "Appendix N.html" filename is an in-article
+# table rendered as a web page, never a supplement -- even when the page
+# contains a genuine data table (BMC #43/#44, eLife #34/#36/#37; #36
+# landed 18 copies of Appendix 7.html). "Table S1.html" and
+# "Supplementary Table S1.html" do NOT match: the S / Supplementary
+# marker is what makes a table a supplement.
+_NAV_PAGE_FILENAME_RE = re.compile(
+    r"^(?:table|appendix)[\s_\-]+\d+(?:_\d+)?\.html?$", re.IGNORECASE
+)
+# NOTE on the separator above: the evidenced navigation pages are
+# "Table 1.html" / "Appendix 7.html" (word, separator, number). A bare
+# "table1.html" with no separator is NOT flagged: that is the D1
+# rename path, where a .bin download that turns out to be an HTML
+# table attachment is legitimately renamed to .html
+# (test_d1_download_html_table_rename).
+
+# Challenge / anti-bot markers that never occur in genuine supplement
+# data, so they reject even without any HTML context (a challenge wall
+# served as .csv / .bin is still a wall).
+_CHALLENGE_CONTENT_MARKERS = (
+    b"client challenge",
+    b"challenge-platform",
+    b"cf-browser-verification",
+    b"checking your browser",
+    b"verify you are human",
+    b"please verify you are human",
+    b"human verification",
+)
+
+
+def _download_basename(filepath: str) -> str:
+    """The intended download name for *filepath*, undoing the H9 temp
+    naming (``.<stem>.<random><ext>``) so a staged ``Table 1.html``
+    is still recognised as ``Table 1.html``."""
+    base = os.path.basename(filepath)
+    stem, ext = os.path.splitext(base)
+    if stem.startswith("."):
+        inner = stem[1:]
+        stem = inner.rsplit(".", 1)[0] if "." in inner else inner
+        base = stem + ext
+    return base
+
+
+def _has_genuine_data_table(sample_lower: bytes) -> bool:
+    """True when *sample_lower* holds a real multi-row data table
+    (at least two rows with cells), as opposed to a one-row layout
+    table on a licence / navigation page."""
+    return sample_lower.count(b"<tr") >= 2 and (
+        sample_lower.count(b"<td") + sample_lower.count(b"<th") >= 2
+    )
+
+
+def _looks_like_license_page(sample_lower: bytes) -> bool:
+    """True when the page presents itself as a Creative Commons licence
+    deed (title or licences link), rather than merely mentioning a
+    licence in passing."""
+    title_match = re.search(rb"<title[^>]*>(.*?)</title>", sample_lower, re.S)
+    if title_match and b"creative commons" in title_match.group(1):
+        return True
+    return b"creativecommons.org/licenses" in sample_lower
+
+
 def validate_downloaded_file(
     filepath: str,
     content_bytes: Optional[bytes] = None,
@@ -2670,6 +3706,15 @@ def validate_downloaded_file(
     file_size = os.path.getsize(filepath)
     if file_size == 0:
         return False, "Downloaded file is empty (0 bytes)"
+
+    # P1-F: a bare "Table N.html" / "Appendix N.html" name is a
+    # navigation page, not a supplement -- whatever its content is.
+    _nav_name = _download_basename(filepath)
+    if _NAV_PAGE_FILENAME_RE.match(_nav_name):
+        return False, (
+            f"Navigation-page filename {_nav_name!r}: an in-article "
+            "Table/Appendix page, not a supplement file"
+        )
 
     if response_status >= 400:
         return False, f"Server returned HTTP error status {response_status}"
@@ -2749,6 +3794,26 @@ def validate_downloaded_file(
     if header_bytes.startswith(b"\x93NUMPY"):
         return True, f"Valid NumPy array signature ({file_size} bytes)"
 
+    # P1-F: a challenge / anti-bot wall is garbage even when it carries
+    # a table or arrives under a data extension. These markers never
+    # occur in genuine supplement data, so no HTML context is required.
+    # (Binary signatures above already returned, so this only sees
+    # text / HTML-ish content.)
+    _sample = content_bytes[:65536] if content_bytes is not None else None
+    if _sample is None:
+        try:
+            with open(filepath, "rb") as _f:
+                _sample = _f.read(65536)
+        except Exception:
+            _sample = header_bytes
+    _sample_lower = _sample.lower()
+    for _marker in _CHALLENGE_CONTENT_MARKERS:
+        if _marker in _sample_lower:
+            return False, (
+                "Challenge/anti-bot page detected: "
+                f"{_marker.decode('latin1')}"
+            )
+
     # 2. Check for HTML content (either via HTML tags or text/html Content-Type)
     header_lower = header_bytes.lower()
     is_html_tag = any(tag in header_lower for tag in [b"<!doctype html", b"<html", b"<head", b"<body", b"<table"])
@@ -2757,6 +3822,12 @@ def validate_downloaded_file(
     hard_error_indicators = [
         b"challenge-platform",
         b"cf-browser-verification",
+        b"client challenge",
+        b"checking your browser",
+        b"verify you are human",
+        b"attention required",
+        b"turnstile",
+        b"human verification",
         b"just a moment",
         b"access denied",
         b"403 forbidden",
@@ -2799,6 +3870,13 @@ def validate_downloaded_file(
         for indicator in hard_error_indicators:
             if indicator in header_lower or indicator in sample_lower:
                 return False, f"HTML error/challenge/login page detected: {indicator.decode('latin1')}"
+
+        # P1-F: a Creative Commons licence deed is not a supplement. A
+        # one-row layout table must not rescue it; a genuine multi-row
+        # data table (e.g. a real HTML supplement that links its
+        # licence) still passes.
+        if _looks_like_license_page(sample_lower) and not _has_genuine_data_table(sample_lower):
+            return False, "Creative Commons licence page detected"
 
         # Check if it contains a genuine data table structure (D1)
         has_table_structure = (

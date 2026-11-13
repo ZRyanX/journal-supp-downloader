@@ -26,6 +26,7 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
 import json
+import threading
 import time
 import subprocess
 import urllib3
@@ -50,6 +51,8 @@ import requests
 from supp_finder import (
     find_all_candidates,
     validate_downloaded_file,
+    single_line,
+    remove_invalid_existing_download,
     sanitize_filename,
     extract_filename_from_url,
     extract_filename_from_content_disposition,
@@ -70,6 +73,8 @@ from supp_finder import (
     is_excluded_url,
     is_article_figure_url,
     check_data_extension,
+    filename_dedup_key,
+    dedupe_candidates,
     is_explicit_supp_table,
     is_table_text_or_attribute,
     should_match_candidate,
@@ -90,6 +95,18 @@ from supp_finder import (
     commit_temp_file,
     discard_temp_file,
     write_bytes_chunked,
+    # P1-CE: shared phase budget + download priority order.
+    DEFAULT_PHASE_TIMEOUT_SECONDS,
+    resolve_phase_timeout,
+    sort_candidates_by_priority,
+    # P1 round-3 minor (a): MITM-proxy certificate trust for the browser
+    # layer (first call and every retry carry the same config).
+    proxy_browser_trust_kwargs,
+    # P1 H-1: independent budget for the browser fallback.
+    DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+    DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+    BrowserFallbackBudget,
+    browser_budget_from_args,
 )
 
 try:
@@ -177,6 +194,195 @@ def load_saved_cookies_standalone():
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+# P1-D (50-paper test, Cause D): the scansci browser layer had no --proxy
+# and every StealthyFetcher.fetch / StealthySession call ran with
+# proxy=None, so in a proxy-only environment every browser attempt died
+# with ERR_TUNNEL_CONNECTION_FAILED -- 521/584 FAILs in the P1 retest --
+# and each candidate burned its own retries until the time budget ran out.
+# The proxy value uses the same syntax as journal_downloader.py
+# (--proxy http://[user:pass@]host:port) and is plumbed unchanged to
+# StealthyFetcher.fetch and, as a Playwright proxy dict, to StealthySession
+# (which builds the launch_persistent_context underneath).
+# CDP / BrowserSkill paths attach to a live browser that was launched
+# elsewhere, so no per-request proxy can be injected there; they are
+# intentionally untouched.
+
+TUNNEL_ERROR_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
+DEFAULT_TUNNEL_FAILURE_THRESHOLD = 3
+# Log line printed when a host is abandoned early (kept verbatim: tests
+# and the P1 report grep for this phrase).
+TUNNEL_FAST_FAIL_MESSAGE = "隧道连续失败、提前放弃该站点"
+
+
+def is_tunnel_error(error):
+    """True when an exception/message is a browser tunnel failure, i.e. the
+    browser could not reach the site at all (proxy missing / proxy down),
+    as opposed to an HTTP error or a blocked page."""
+    return TUNNEL_ERROR_MARKER in str(error or "")
+
+
+def _tunnel_host_key(url_or_host):
+    """Normalize a URL (or bare host) to the per-host breaker key."""
+    text = str(url_or_host or "").strip().lower()
+    if not text:
+        return ""
+    if "://" not in text:
+        return text.split("/")[0].split(":")[0]
+    try:
+        return urlparse(text).hostname or text
+    except Exception:
+        return text
+
+
+def tunnel_failure_host(url):
+    """Public alias: host (lowercased) a URL belongs to for tunnel accounting."""
+    return _tunnel_host_key(url)
+
+
+def redact_proxy_url(proxy):
+    """Proxy URL with any password masked, for safe log lines."""
+    if not proxy:
+        return ""
+    text = str(proxy)
+    try:
+        parsed = urlparse(text)
+        if parsed.password:
+            return text.replace(f":{parsed.password}@", ":****@", 1)
+    except Exception:
+        pass
+    return text
+
+
+def playwright_proxy_config(proxy):
+    """Convert a --proxy value to the Playwright proxy dict scrapling
+    passes to launch_persistent_context: {"server", "username", "password"}.
+    Accepts the same ``http://[user:pass@]host:port`` string as
+    journal_downloader.py (or an already-built dict, returned as-is).
+    Returns None for an empty value; raises ValueError for a value with
+    no host so a typo'd proxy fails fast instead of silently going direct.
+    """
+    if not proxy:
+        return None
+    if isinstance(proxy, dict):
+        return dict(proxy)
+    parsed = urlparse(str(proxy))
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError(
+            f"Invalid proxy URL (expected http://[user:pass@]host:port): {redact_proxy_url(proxy)!r}"
+        ) from None
+    if not parsed.hostname:
+        raise ValueError(
+            f"Invalid proxy URL (expected http://[user:pass@]host:port): {redact_proxy_url(proxy)!r}"
+        )
+    server = f"{parsed.scheme or 'http'}://{parsed.hostname}"
+    if port:
+        server += f":{port}"
+    config = {"server": server}
+    if parsed.username:
+        config["username"] = parsed.username
+    if parsed.password:
+        config["password"] = parsed.password
+    return config
+
+
+class TunnelFailureTracker:
+    """Per-host circuit breaker for browser tunnel failures.
+
+    Counts *consecutive* ERR_TUNNEL_CONNECTION_FAILED failures per host:
+    any non-tunnel failure is ignored and any browser success resets the
+    count, so a transient blip does not trip the breaker and a recovered
+    host is usable again. Once the count reaches ``threshold`` the host is
+    tripped: callers must skip further browser attempts for it instead of
+    retrying every candidate. Thread-safe; one instance is shared by all
+    browser attempts within a run.
+    """
+
+    def __init__(self, threshold=DEFAULT_TUNNEL_FAILURE_THRESHOLD):
+        self.threshold = max(1, int(threshold))
+        self._counts = {}
+        self._tripped = set()
+        self._skip_announced = set()
+        self._lock = threading.Lock()
+
+    def consecutive_failures(self, url_or_host):
+        """Consecutive tunnel failures recorded for this host (0 if none)."""
+        with self._lock:
+            return self._counts.get(_tunnel_host_key(url_or_host), 0)
+
+    def is_tripped(self, url_or_host):
+        """True once this host reached the failure threshold."""
+        return self.consecutive_failures(url_or_host) >= self.threshold
+
+    def record_failure(self, url_or_host, error):
+        """Record one failure. Only tunnel errors count. Returns True when
+        this failure *newly* trips the threshold (the caller should log
+        the fast-fail line exactly then); False otherwise."""
+        if not is_tunnel_error(error):
+            return False
+        host = _tunnel_host_key(url_or_host)
+        if not host:
+            return False
+        with self._lock:
+            count = self._counts.get(host, 0) + 1
+            self._counts[host] = count
+            if count < self.threshold:
+                return False
+            newly = host not in self._tripped
+            self._tripped.add(host)
+            return newly
+
+    def record_success(self, url_or_host):
+        """A browser success for this host clears its failure count."""
+        host = _tunnel_host_key(url_or_host)
+        if not host:
+            return
+        with self._lock:
+            self._counts.pop(host, None)
+            self._tripped.discard(host)
+            self._skip_announced.discard(host)
+
+    def take_skip_notice(self, url_or_host):
+        """True only the first time a tripped host's skip is noticed, so
+        the 'skipping browser' line is logged once per host per run
+        instead of once per candidate."""
+        host = _tunnel_host_key(url_or_host)
+        with self._lock:
+            if host in self._skip_announced:
+                return False
+            self._skip_announced.add(host)
+            return True
+
+    def reset(self, host=None):
+        """Clear counts (one host, or all hosts when host is None)."""
+        with self._lock:
+            if host is None:
+                self._counts.clear()
+                self._tripped.clear()
+                self._skip_announced.clear()
+            else:
+                key = _tunnel_host_key(host)
+                self._counts.pop(key, None)
+                self._tripped.discard(key)
+                self._skip_announced.discard(key)
+
+
+# Shared breaker for one run; run_download() resets it and applies the
+# CLI threshold. Callers may pass their own tracker (tests do) instead.
+_TUNNEL_TRACKER = TunnelFailureTracker()
+
+
+def get_tunnel_tracker():
+    """The run-shared tunnel failure tracker."""
+    return _TUNNEL_TRACKER
+
+
+def reset_tunnel_failure_tracker():
+    """Clear the run-shared tracker (fresh run / test isolation)."""
+    _TUNNEL_TRACKER.reset()
+
 
 def resolve_doi_url(doi_or_url):
     """
@@ -728,11 +934,14 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         filepath = os.path.join(output_dir, fname)
 
         if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-            is_val, _ = validate_downloaded_file(filepath)
+            is_val, reason = validate_downloaded_file(filepath)
             if is_val:
                 print(f"  [SKIP] {fname} (already exists)")
                 found_files.append(filepath)
                 continue
+            # P1-F: garbage landed by an earlier run is removed, not
+            # [SKIP]-counted; the download below then retries it.
+            remove_invalid_existing_download(filepath, manifest, reason)
 
         print(f"  [API→CDN] {fname} ...", end=" ", flush=True)
         tmp_path = None
@@ -746,11 +955,12 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             found_files.append(filepath)
                             continue
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 # H9: stream to a same-directory temp file, validate it,
                 # then commit with os.replace; the final path never holds
@@ -776,11 +986,11 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
-                    print(f"FAIL ({reason})")
+                    print(f"FAIL ({single_line(reason)})")
             else:
                 print(f"FAIL (HTTP {dl_resp.status_code})")
         except Exception as e:
-            print(f"FAIL ({e})")
+            print(f"FAIL ({single_line(e)})")
         finally:
             discard_temp_file(tmp_path)
 
@@ -915,12 +1125,15 @@ def try_elsevier_cdn_brute_force(
             filepath = os.path.join(output_dir, fname)
 
             if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                is_val, _ = validate_downloaded_file(filepath)
+                is_val, reason = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"  [SKIP] {fname} (already exists)")
                     found_files.append(filepath)
                     found_any = True
                     continue
+                # P1-F: garbage landed by an earlier run is removed, not
+                # [SKIP]-counted; the download below then retries it.
+                remove_invalid_existing_download(filepath, manifest, reason)
 
             # Download the file (H9: temp file -> validate -> os.replace)
             print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
@@ -935,12 +1148,13 @@ def try_elsevier_cdn_brute_force(
                         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                         filepath = os.path.join(output_dir, fname)
                         if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                            is_val, _ = validate_downloaded_file(filepath)
+                            is_val, reason = validate_downloaded_file(filepath)
                             if is_val:
                                 print(f"[SKIP] {fname} (already exists)")
                                 found_files.append(filepath)
                                 found_any = True
                                 continue
+                            remove_invalid_existing_download(filepath, manifest, reason)
 
                     os.makedirs(output_dir, exist_ok=True)
                     tmp_path = temp_path_for(filepath)
@@ -964,11 +1178,11 @@ def try_elsevier_cdn_brute_force(
                         found_files.append(filepath)
                         found_any = True
                     else:
-                        print(f"FAIL ({reason})")
+                        print(f"FAIL ({single_line(reason)})")
                 else:
                     print(f"FAIL (HTTP {dl_resp.status_code})")
             except Exception as e:
-                print(f"FAIL ({e})")
+                print(f"FAIL ({single_line(e)})")
             finally:
                 discard_temp_file(tmp_path)
         # A HEAD hit means the file exists even if the follow-up GET
@@ -1032,7 +1246,34 @@ def try_elsevier_cdn_brute_force(
     total_probed = len(probed_mmcs)
     print(f"  [Tier 0 Diagnostic] Probed mmc1..mmc{scanned_count} ({total_probed} total, limit: {max_mmc}). Hits: {len(found_files)}. Stopped: {stop_reason}.")
     if found_files:
-        print(f"  [Tier 0] Found {len(found_files)} file(s) via CDN.")
+        # P1-F: confirm every Tier 0 hit on its own line -- file name,
+        # size and validation result -- so a Tier 0 success is visible
+        # instead of only a bare count (#47's 3 mmc files were
+        # invisible). A file that no longer validates is dropped and
+        # deleted, never counted as a success.
+        confirmed = []
+        for _path in found_files:
+            _name = os.path.basename(_path)
+            try:
+                _size_kb = os.path.getsize(_path) / 1024
+            except OSError:
+                _size_kb = None
+            _is_val, _val_reason = validate_downloaded_file(_path)
+            if not _is_val:
+                print(f"  [Tier 0] \u2717 {_name} failed re-validation ({single_line(_val_reason)}); discarding.")
+                try:
+                    os.remove(_path)
+                except OSError:
+                    pass
+                continue
+            _size_txt = f"{_size_kb:.1f} KB" if _size_kb is not None else "size unknown"
+            print(f"  [Tier 0] \u2713 {_name} ({_size_txt}, validated: {single_line(_val_reason)})")
+            confirmed.append(_path)
+        found_files = confirmed
+        if found_files:
+            print(f"  [Tier 0] Downloaded {len(found_files)} file(s) via CDN (validated).")
+        else:
+            print(f"  [Tier 0] No files found on CDN.")
     else:
         print(f"  [Tier 0] No files found on CDN.")
     return found_files
@@ -1048,8 +1289,15 @@ def is_html_file(filepath):
 MMC_NUM_REGEX = re.compile(r"(?:^|[^a-z0-9])(?:es)?mmc[-_\s]?([1-9]\d{0,2})(?=$|[^0-9])", re.IGNORECASE)
 
 
-def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None):
-    """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session."""
+def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None):
+    """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session.
+
+    P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
+    journal_downloader.py --proxy) is passed to the browser download path
+    (Method 3, StealthySession) as a Playwright proxy dict; ``tunnel_tracker``
+    (default: the run-shared tracker) fast-fails the browser path for a
+    host whose tunnel failures reached the threshold.
+    """
     if isinstance(cand_or_url, Candidate):
         url = cand_or_url.url
         suggested_fname = cand_or_url.filename
@@ -1072,6 +1320,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         url = cand_or_url
         suggested_fname = ""
 
+    # P1-D: resolve the tunnel breaker (explicit tracker wins, else the
+    # run-shared one) before any browser attempt is made.
+    tracker = tunnel_tracker if tunnel_tracker is not None else _TUNNEL_TRACKER
+
     # Table ids the candidate is known to cover (H6), for the manifest record.
     cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
 
@@ -1083,12 +1335,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     filepath = os.path.join(output_dir, fname)
 
     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-        is_val, _ = validate_downloaded_file(filepath)
+        is_val, reason = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
             return filepath
+        # P1-F: garbage landed by an earlier run is removed, not
+        # [SKIP]-counted as a success; the download below retries it.
+        remove_invalid_existing_download(filepath, manifest, reason)
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
+    last_error = ""  # P1 (50-paper test, Cause G): keep the last failure reason for the final FAIL line
 
     # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
     # H9: stream to a same-directory temp file, validate it, then commit
@@ -1107,10 +1363,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 first_chunk = b""
                 tmp_path = temp_path_for(filepath)
@@ -1152,8 +1409,13 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
-        except Exception:
-            pass
+                else:
+                    # P1-F: a validation rejection is a failure reason,
+                    # not a silent fall-through -- otherwise the final
+                    # FAIL line comes out bare with the reason lost.
+                    last_error = f"validation: {reason}"
+        except Exception as e:
+            last_error = f"requests: {e}"
         finally:
             discard_temp_file(tmp_path)
 
@@ -1175,10 +1437,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 if "." not in fname or fname.endswith(".bin"):
                     inferred = infer_file_extension(resp.body, hdr.get("content-type", ""))
@@ -1209,8 +1472,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
-        except Exception:
-            pass
+                else:
+                    # P1-F: keep the validation reason for the final FAIL line.
+                    last_error = f"validation: {reason}"
+        except Exception as e:
+            last_error = f"scrapling: {e}"
         finally:
             discard_temp_file(tmp_path)
 
@@ -1232,16 +1498,35 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # Method 3: Scrapling StealthySession + Playwright sync download fallback
     # H9: the browser download lands in a temp file, is validated, then
     # committed with os.replace; a failure only discards the temp file.
-    if HAS_SCRAPLING:
+    # P1-D: skip the browser entirely once this host's tunnel failures
+    # tripped the breaker -- launching another StealthySession per
+    # candidate would burn the time budget on a dead tunnel. The curl
+    # fallback below still runs (it may use a working env proxy).
+    if HAS_SCRAPLING and tracker.is_tripped(url):
+        if tracker.take_skip_notice(url):
+            print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                  f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器下载尝试。")
+        last_error = f"browser: tunnel failure fast-fail for {tunnel_failure_host(url)}"
+    elif HAS_SCRAPLING:
         tmp_path = None
         try:
             from scrapling.fetchers import StealthySession
-            session_stealth = StealthySession(
-                headless=True,
-                solve_cloudflare=True,
-                network_idle=True,
-                timeout=60000
-            )
+            # P1-D: Playwright proxy dict (same --proxy syntax as
+            # journal_downloader.py); omitted entirely when no proxy.
+            _stealth_kwargs = {
+                "headless": True,
+                "solve_cloudflare": True,
+                "network_idle": True,
+                "timeout": 60000,
+            }
+            _proxy_cfg = playwright_proxy_config(proxy)
+            if _proxy_cfg is not None:
+                _stealth_kwargs["proxy"] = _proxy_cfg
+            # P1 round-3 minor (a): the MITM proxy's CA trust rides on
+            # every fresh StealthySession context, not just the first
+            # fetch -- proxy mode only; no proxy means no trust keys.
+            _stealth_kwargs.update(proxy_browser_trust_kwargs(proxy))
+            session_stealth = StealthySession(**_stealth_kwargs)
             session_stealth.start()
             context = session_stealth.context
             if cookies:
@@ -1309,8 +1594,18 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
+                tracker.record_success(url)
                 return filepath
-        except Exception:
+            else:
+                # P1-F: keep the validation reason for the final FAIL line.
+                last_error = f"validation: {reason}"
+        except Exception as e:
+            last_error = f"browser: {e}"
+            # P1-D: a tunnel failure counts toward the per-host breaker;
+            # log the fast-fail line exactly when the threshold is reached.
+            if tracker.record_failure(url, e):
+                print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                      f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
             try:
                 session_stealth.close()
             except Exception:
@@ -1362,12 +1657,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
-    except Exception:
-        pass
+            else:
+                # P1-F: keep the validation reason for the final FAIL line.
+                last_error = f"validation: {reason}"
+    except Exception as e:
+        last_error = f"curl: {e}"
     finally:
         discard_temp_file(tmp_path)
 
-    print("FAIL")
+    print(f"FAIL ({single_line(last_error)})" if last_error else "FAIL")
     return None
 
 
@@ -1383,22 +1681,75 @@ def fetch_page_html(
     bsk_session=None,
     bsk_tab=None,
     bsk_runtime=None,
+    proxy=None,
+    tunnel_tracker=None,
+    browser_budget=None,
+    browser_goto_timeout=None,
+    deadline=None,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
     Returns (html_content, status, final_url) for accurate base URL resolution.
+
+    P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
+    journal_downloader.py --proxy) is passed to StealthyFetcher.fetch;
+    ``tunnel_tracker`` (default: the run-shared tracker) fast-fails the
+    browser attempt for a host whose tunnel failures reached the threshold.
+    CDP / BrowserSkill paths attach to a live browser and cannot take a
+    per-request proxy, so they are unchanged.
+    P1 H-1: ``browser_budget`` (a run-shared BrowserFallbackBudget, or a
+    fresh 30s-goto / 60s-total one when omitted) caps every browser
+    attempt here: one goto runs at most the goto timeout (capped at the
+    remaining total), and no browser attempt starts once the total is
+    spent -- the caller then degrades to the OA mirror round instead of
+    being killed inside a page load.
+    P1 C: ``deadline`` (a ``time.monotonic()`` value, normally the run's
+    phase deadline) is checked before *every* load this function would
+    start -- once it has passed, no requests / BSK / CDP / browser load
+    starts at all and ("", 0, url) is returned at once, so a load that
+    returns late stops the phase instead of starting the next stage.
+    The deadline also caps the requests timeout (30s hardcoded before)
+    and, via the budget's phase awareness, every browser timeout, so
+    one load can never run past the remaining phase budget. A deadline
+    passed here always wins over a phase deadline the budget may
+    already carry. When the underlying call is already in flight, its
+    own timeout is the only interrupt available -- hence the clamp
+    before launch, not a mid-flight cancel (no API here offers one).
     """
     html_content = ""
     final_url = url
+    # P1-D: resolve the tunnel breaker (explicit tracker wins, else the
+    # run-shared one).
+    tracker = tunnel_tracker if tunnel_tracker is not None else _TUNNEL_TRACKER
+    # P1 H-1: resolve the browser budget (explicit budget wins; a lone
+    # goto timeout gets a fresh default-total budget; otherwise a fresh
+    # default budget so a standalone call is still capped).
+    if browser_budget is not None:
+        budget = browser_budget
+    elif browser_goto_timeout is not None:
+        budget = BrowserFallbackBudget(goto_timeout=browser_goto_timeout)
+    else:
+        budget = BrowserFallbackBudget()
+    # P1 C: the phase deadline caps every attempt below (and makes the
+    # budget exhausted once it passes). An explicit deadline always
+    # wins over one the budget already carries.
+    if deadline is not None:
+        budget.set_phase_deadline(deadline)
+        if time.monotonic() >= deadline:
+            # No load of any kind starts once the deadline has passed.
+            return "", 0, url
 
     # Primary BrowserSkill Method: Fetch via Tencent BrowserSkill session
-    if use_bsk:
+    if use_bsk and budget.exhausted:
+        # P1 H-1: no browser attempt once the fallback budget is gone.
+        budget.announce_exhausted()
+    elif use_bsk:
         try:
             print(f"    (Fetching via Tencent BrowserSkill bsk ...)")
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
                 url,
                 wait_selector=None,
-                timeout=60.0,
+                timeout=budget.attempt_timeout(),
                 browser=bsk_browser,
                 tab_id=bsk_tab,
                 session=bsk_session,
@@ -1414,14 +1765,20 @@ def fetch_page_html(
             print(f"    BrowserSkill fetch notice: {e_bsk}. Falling back to default pipeline...")
 
     # Primary CDP Method: Attach directly to running browser via CDP
-    if cdp_url:
+    # P1 H-1: skipped outright once the fallback budget is gone; the
+    # timeout is the capped goto timeout, not the old hardcoded 60s.
+    # (CDP attaches to a live browser, so no per-request proxy or goto
+    # timeout can be injected beyond this value -- see supp_finder.)
+    if cdp_url and budget.exhausted:
+        budget.announce_exhausted()
+    elif cdp_url:
         try:
             wait_sel = None
             if force_browser:
                 wait_sel = SUPP_WAIT_SELECTOR
             print(f"    (Attaching to live browser tab via CDP: {cdp_url} ...)")
             cdp_html, cdp_status, cdp_final, cdp_cookies = fetch_page_via_cdp(
-                cdp_url, url, wait_selector=wait_sel, timeout=60.0
+                cdp_url, url, wait_selector=wait_sel, timeout=budget.attempt_timeout()
             )
             if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 if cdp_cookies:
@@ -1439,7 +1796,13 @@ def fetch_page_html(
     # Method 1: requests session (fast, but often blocked by Cloudflare)
     if session and not force_browser and not cdp_url:
         try:
-            resp = session.get(url, timeout=30, verify=False)
+            # P1 C: the requests timeout is a real interrupt, but the
+            # old hardcoded 30s could overshoot the phase on its own --
+            # clamp it to the remaining phase budget when one is set.
+            req_timeout = 30
+            if deadline is not None:
+                req_timeout = min(30.0, deadline - time.monotonic())
+            resp = session.get(url, timeout=req_timeout, verify=False)
             if resp.status_code < 400:
                 final_url = resp.url or url
                 text = resp.text
@@ -1461,14 +1824,35 @@ def fetch_page_html(
             pass
 
     # Method 2: Scrapling StealthyFetcher (bypasses Cloudflare)
+    # P1-D: skip the browser entirely once this host's tunnel failures
+    # tripped the breaker -- the requests path above already had its
+    # chance, and another browser launch would only burn the budget.
+    # P1 H-1: skip it entirely once the fallback budget is gone, too --
+    # the caller degrades to the OA mirror round instead.
+    if budget.exhausted:
+        budget.announce_exhausted()
+        return "", 0, url
+    if HAS_SCRAPLING and tracker.is_tripped(url):
+        if tracker.take_skip_notice(url):
+            print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                  f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器抓取。")
+        return "", 0, url
     if HAS_SCRAPLING:
         sc_args = {
             "headless": not headful,
             "solve_cloudflare": True,
             "network_idle": True,
-            "timeout": 60000,
+            "timeout": budget.attempt_timeout_ms(),
             "page_action": expand_page_accordions_action,
         }
+        # P1-D: same --proxy syntax as journal_downloader.py; omitted
+        # entirely when no proxy so unset behaviour is unchanged.
+        if proxy:
+            sc_args["proxy"] = proxy
+        # P1 round-3 minor (a): the MITM proxy's CA trust config, same
+        # on the first attempt and on the no-CDP retry below (it copies
+        # sc_args) -- proxy mode only; no proxy means no trust keys.
+        sc_args.update(proxy_browser_trust_kwargs(proxy))
         if cdp_url:
             sc_args["cdp_url"] = cdp_url
             print(f"    (Connecting over CDP to live browser: {cdp_url})")
@@ -1488,23 +1872,44 @@ def fetch_page_html(
                     return "", 0, final_url
                 # Retry without CDP via the handler below.
                 raise RuntimeError("StealthyFetcher returned a blocked page")
+            tracker.record_success(url)
             return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
-            if cdp_url:
+            # P1-D: a tunnel failure counts toward the per-host breaker;
+            # log the fast-fail line exactly when the threshold is reached.
+            if tracker.record_failure(url, e):
+                print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                      f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
+            # P1 H-1: a failed browser attempt that spent the budget is
+            # the downgrade point -- say so once, here, so the log shows
+            # why the mirror round runs next instead of another browser.
+            if budget.exhausted:
+                budget.announce_exhausted()
+            if cdp_url and not tracker.is_tripped(url) and not budget.exhausted:
                 print("    (Retrying without CDP using standalone stealth browser...)")
                 try:
                     sc_nocdp = dict(sc_args)
                     sc_nocdp.pop("cdp_url", None)
+                    # P1 H-1: re-cap the retry at the remaining budget --
+                    # the first attempt already spent goto time.
+                    sc_nocdp["timeout"] = budget.attempt_timeout_ms()
                     page = StealthyFetcher.fetch(url, **sc_nocdp)
                     html_content = str(page.html_content)
                     final_url = getattr(page, "url", None) or url
                     if page_fetch_is_failure(html_content, page.status):
                         print("    StealthyFetcher standalone page is blocked or an error page.")
                         return "", 0, final_url
+                    tracker.record_success(url)
                     return html_content, page.status, final_url
                 except Exception as e2:
                     print(f"    StealthyFetcher standalone error: {e2}")
+                    if tracker.record_failure(url, e2):
+                        print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                              f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
+                    # P1 H-1: same downgrade point as the first attempt.
+                    if budget.exhausted:
+                        budget.announce_exhausted()
 
     return html_content, 0, final_url
 
@@ -1581,6 +1986,11 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
     """
     try:
         cdp_target = getattr(args, "cdp_url", None)
+        # P1-D: proxy / tunnel breaker for this run's browser attempts.
+        _scrape_proxy = getattr(args, "proxy", None)
+        # P1 H-1: same 30s-goto / 60s-total fallback budget as the main
+        # run (fresh here: this scrape is a separate post-success pass).
+        _scrape_budget = browser_budget_from_args(args)
         session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
         html_content, status, final_url = fetch_page_html(
@@ -1590,6 +2000,9 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             args.headful,
             use_bsk=bool(bsk_runtime and getattr(args, "browserskill", False)),
             bsk_runtime=bsk_runtime,
+            proxy=_scrape_proxy,
+            tunnel_tracker=_TUNNEL_TRACKER,
+            browser_budget=_scrape_budget,
         )
 
         url_to_use = final_url or url
@@ -1618,6 +2031,9 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 force_browser=True,
                 use_bsk=bool(bsk_runtime and bsk_runtime.enabled),
                 bsk_runtime=bsk_runtime,
+                proxy=_scrape_proxy,
+                tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=_scrape_budget,
             )
             if html_content_b:
                 html_content = html_content_b
@@ -1643,6 +2059,23 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         manifest = load_download_manifest(article_dir)
         downloaded_urls = {manifest_entry_url(v) for v in manifest.values()}
         existing_basenames = {os.path.basename(f) for f in existing_files}
+        # P1-B: resume set by normalized filename, not just URL: a file
+        # already downloaded via another mirror URL -- or left behind as a
+        # _2 copy by an earlier run -- counts as already downloaded.
+        downloaded_fnames = {
+            k for k in (
+                filename_dedup_key(name)
+                for name in list(manifest)
+                + [os.path.basename(f) for f in existing_files]
+            ) if k is not None
+        }
+        if os.path.exists(article_dir):
+            for f in os.listdir(article_dir):
+                if f.startswith("."):
+                    continue
+                key = filename_dedup_key(f)
+                if key is not None:
+                    downloaded_fnames.add(key)
         downloaded_mmcs = set()
         for k, v in manifest.items():
             for s in (k, manifest_entry_url(v)):
@@ -1664,6 +2097,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     downloaded_mmcs.add(int(m_f.group(1)))
 
         seen_cand_urls = set()
+        seen_cand_fnames = set()
         new_candidates = []
         for cand in diag.candidates:
             if cand.url in downloaded_urls or cand.url in seen_cand_urls:
@@ -1671,11 +2105,19 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             cand_fname = cand.filename or extract_filename_from_url(cand.url)
             if cand_fname in existing_basenames:
                 continue
+            # P1-B: same filename (normalized, _2 suffix ignored) already
+            # downloaded in this run / a previous run, or seen twice in
+            # this batch under different URLs -- download it once.
+            cand_fkey = filename_dedup_key(cand_fname)
+            if cand_fkey is not None and (cand_fkey in downloaded_fnames or cand_fkey in seen_cand_fnames):
+                continue
             # Skip if candidate refers to an MMC file that was already downloaded
             m_cand = MMC_NUM_REGEX.search(cand.url + " " + cand_fname)
             if m_cand and int(m_cand.group(1)) in downloaded_mmcs:
                 continue
             seen_cand_urls.add(cand.url)
+            if cand_fkey is not None:
+                seen_cand_fnames.add(cand_fkey)
             new_candidates.append(cand)
 
         if new_candidates:
@@ -1690,6 +2132,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     play_cookies,
                     bsk_runtime=bsk_runtime,
                     referer=url_to_use,
+                    proxy=_scrape_proxy,
+                    tunnel_tracker=_TUNNEL_TRACKER,
                 )
         else:
             print("    No additional supplements found beyond CDN files.")
@@ -1738,6 +2182,209 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
 
 # ── Main Logic ───────────────────────────────────────────────────────────────
 
+def print_tier_preserved_files(api_files, cdn_files, article_dir):
+    """Confirm Tier A / Tier 0 files by name (P1-F).
+
+    Used when no candidate list was found: the old line (``Preserved N
+    API/CDN file(s); page completeness remains unverified``) hid which
+    files those were -- #47's 3 mmc files were only visible by counting
+    files on disk. Each file is listed with its size; a path that no
+    longer resolves on disk (e.g. the folder was renamed after the
+    download) is reported as such instead of being silently counted.
+
+    Returns the number of listed files verified on disk (P1-G2).
+    """
+    seen = set()
+    on_disk = 0
+    for tier, files in (("Tier A", api_files or []), ("Tier 0", cdn_files or [])):
+        for path in files:
+            name = os.path.basename(path)
+            if name in seen:
+                continue
+            seen.add(name)
+            resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
+            if os.path.exists(resolved):
+                on_disk += 1
+                size_kb = os.path.getsize(resolved) / 1024
+                print(f"  [{tier}] \u2713 {name} ({size_kb:.1f} KB, downloaded via {tier}, validated on download)")
+            else:
+                print(f"  [{tier}] ? {name} (listed as downloaded but not found on disk)")
+    total = len(seen)
+    print(f"  [Info] {total} API/CDN file(s) preserved; no candidate list was found, "
+          f"so page completeness cannot be verified from the page.")
+    return on_disk
+
+
+def preserved_done_line(count, article_dir):
+    """Countable Done line for the preserved-files path (P1-G2).
+
+    Round-3 #13 (11/11) and #47 (3/3) downloaded via Tier 0 yet were
+    scored failed-timeout downstream because this path printed no
+    "✓ Done:" line at all. The count is real (files verified on disk)
+    but there is no honest denominator -- page completeness is
+    unverified -- so the line deliberately carries no N/M fraction.
+    """
+    return (f"\u2713 Done: {count} file(s) downloaded via Tier A/CDN "
+            f"(page completeness unverified) to {os.path.abspath(article_dir)}")
+
+
+def count_tier_files_on_disk(api_files, cdn_files, article_dir, successful=()):
+    """Count Tier A / Tier 0 files verified on disk (P1-G remainder).
+
+    The candidates-exist path of run_download counts only the
+    candidate loop (plus the extra CDN probe) in its final Done
+    fraction, so Tier A/Tier 0 files downloaded before the loop never
+    entered either side -- round-3 #13 (Tier 0 11/11, candidate loop
+    0) printed "✓ Done: 0/N" and was scored failed despite 11 real
+    files on disk.
+
+    Files are verified on disk by basename under the final article
+    dir, with the same resolution as print_tier_preserved_files (the
+    dir may have migrated since Tier A/Tier 0 ran, so a recorded path
+    can be stale). A file the candidate loop already counted is
+    excluded: the same file reached via both paths (e.g. a same-URL
+    resume, which download_file reports as a loop success) must not
+    be counted twice. Identity follows the P1-B contract --
+    filename_dedup_key, so a _2 collision suffix does not split one
+    file into two; a successful candidate with no usable filename
+    also contributes the filename derived from its URL, so an
+    empty-filename candidate cannot double-count either. Files with
+    no identifying name (key None) are never excluded.
+    """
+    counted_keys = set()
+    for cand in successful or ():
+        for name in (getattr(cand, "filename", "") or "",
+                     extract_filename_from_url(cand.url or "")):
+            key = filename_dedup_key(name)
+            if key is not None:
+                counted_keys.add(key)
+    seen = set()
+    on_disk = 0
+    for files in (api_files or [], cdn_files or []):
+        for path in files:
+            name = os.path.basename(path)
+            if name in seen:
+                continue
+            seen.add(name)
+            key = filename_dedup_key(name)
+            if key is not None and key in counted_keys:
+                continue
+            resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
+            if os.path.exists(resolved):
+                on_disk += 1
+    return on_disk
+
+
+# ── P1-E2: Phase B seeds from the Phase A candidate list ──────────────────
+
+SEED_CANDIDATES_FILENAMES = (
+    "supplementary_candidates.json",
+    "supplementary_candidates.partial.json",
+)
+
+
+def _seed_search_dirs(article_dir):
+    """Directories to search for a Phase A seed list, in order.
+
+    article_dir itself first, then each immediate subdirectory of
+    its parent (the -o output dir), sorted by name for determinism.
+    Phase A writes the list into <output>/<Phase A title>/ while
+    Phase B's article_dir can be a different sibling --
+    <output>/supplements, or a title extracted from a different page
+    source (publisher HTML vs OA mirror title, or a failed fetch
+    leaving the placeholder) -- and run_download only ever
+    migrates/merges <output>/supplements, never a sibling title dir,
+    so the file is often one directory over.
+
+    Only one level down: the seed payload carries no DOI/title to
+    attribute a file with, so a recursive walk could pick up another
+    article's list when -o is shared across papers. With the usual
+    per-article -o (one output dir per paper, as the test runner
+    uses), every sibling here is a title variant of the same article.
+    """
+    root = os.path.abspath(article_dir)
+    dirs = [root]
+    parent = os.path.dirname(root)
+    if parent and parent != root:
+        try:
+            entries = sorted(os.scandir(parent), key=lambda e: e.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir and os.path.abspath(entry.path) != root:
+                dirs.append(os.path.abspath(entry.path))
+    return dirs
+
+
+def load_seed_candidates(article_dir):
+    """Load the Phase A candidate list for this article (P1-E2).
+
+    Phase A (journal_downloader.py) streams every discovered candidate
+    to supplementary_candidates(.partial).json in the article directory
+    so a timeout leaves them readable on disk. Phase B used to
+    re-discover from scratch and never read that file: round 3
+    preserved 348 candidates across 15 papers that nobody downloaded
+    from.
+
+    The list is searched for in article_dir itself first, then in
+    each immediate subdirectory of the output dir (see
+    _seed_search_dirs): Phase A and Phase B can resolve different
+    titles for the same article, so the file often sits in a sibling
+    title directory. The final list wins over the partial one across
+    locations; within one filename kind, article_dir wins, then
+    siblings in name order. A corrupt file falls through to the next
+    candidate location instead of aborting the run; a parseable file
+    -- even one with zero candidates -- is authoritative and stops
+    the search, as before. Entries without a URL are skipped.
+
+    Returns (candidates, source) -- ([], None) when nothing usable
+    is on disk. source is the bare filename for a file in article_dir
+    itself, otherwise "<subdir>/<filename>" so the log line shows
+    which title directory the seed came from.
+    """
+    search_dirs = _seed_search_dirs(article_dir)
+    root_abs = os.path.abspath(article_dir)
+    for name in SEED_CANDIDATES_FILENAMES:
+        for directory in search_dirs:
+            path = os.path.join(directory, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            entries = payload.get("candidates", []) if isinstance(payload, dict) else []
+            cands = []
+            for entry in entries:
+                cand = Candidate.from_dict(entry)
+                if cand is not None:
+                    cands.append(cand)
+            if os.path.abspath(directory) == root_abs:
+                source = name
+            else:
+                source = os.path.join(os.path.basename(directory), name)
+            return cands, source
+    return [], None
+
+
+def merge_seed_candidates(candidates, seeds):
+    """Append seed candidates whose URL is new; return (merged, added).
+
+    Lossless and input-preserving: existing candidates keep their
+    order, seeds follow in file order, duplicates by URL are skipped
+    (the later dedupe_candidates pass still handles filename-level
+    duplicates across tiers).
+    """
+    known = {c.url for c in candidates}
+    added = [c for c in seeds if c.url not in known]
+    return list(candidates) + added, len(added)
+
+
 def main():
     parser = argparse.ArgumentParser(description="ScanSci Integrated Supplementary Downloader v3")
     parser.add_argument("url_or_doi", help="DOI or landing page URL of the paper")
@@ -1749,6 +2396,38 @@ def main():
     parser.add_argument("--skip-cdn", action="store_true", help="Skip CDN brute-force (Tier 0)")
     parser.add_argument("--max-mmc", type=int, default=25, help="Max mmc number to scan in CDN brute-force (default: 25)")
     parser.add_argument("--max-misses", type=int, default=4, help="Max consecutive misses before stopping CDN probe (default: 4)")
+    # P1-D: same --proxy syntax as journal_downloader.py; plumbed to the
+    # StealthyFetcher / StealthySession browser layer.
+    parser.add_argument("--proxy", default=None, help="Proxy URL (e.g. http://user:pass@host:port)")
+    parser.add_argument("--tunnel-fail-threshold", type=int, default=DEFAULT_TUNNEL_FAILURE_THRESHOLD,
+                        help="Consecutive ERR_TUNNEL_CONNECTION_FAILED failures per host before fast-failing "
+                             "that host's browser attempts (default: 3)")
+    # P1-CE: same single-phase budget as journal_downloader.py (default
+    # 150s); the download loop stops cleanly at the deadline instead of
+    # being killed mid-list.
+    parser.add_argument("--phase-timeout", type=float, default=DEFAULT_PHASE_TIMEOUT_SECONDS,
+                        help="Overall budget in seconds for this phase (discovery + download). "
+                             "On expiry, downloading stops and already-downloaded files are kept. "
+                             "Every page load is additionally capped at the remaining phase budget, "
+                             "so one load can never run past the deadline (default: 150)")
+    # P1 H-1: the browser fallback gets its own quotas -- one page goto
+    # at most 30s, 60s of browser time in total per phase. Either quota
+    # running out degrades to the OA mirror round instead of killing
+    # the phase inside one page load (round 3: #1 hung 120s+ on
+    # nature.com, mirrors never ran, 0 files).
+    # P1 C: both quotas are additionally capped at the remaining phase
+    # budget -- a single goto runs at most min(goto, total remaining,
+    # phase remaining), and the fallback budget counts as exhausted
+    # once the phase deadline passes.
+    parser.add_argument("--browser-goto-timeout", type=float, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+                        help="Max seconds for one browser page load (goto) in the "
+                             "fallback path, capped at the remaining phase budget "
+                             "(default: 30)")
+    parser.add_argument("--browser-fallback-budget", type=float, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+                        help="Max total seconds of browser fallback time per phase, "
+                             "capped at the remaining phase budget; "
+                             "once spent, the run degrades to the OA mirror round "
+                             "instead of launching another browser (default: 60)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
@@ -1757,6 +2436,15 @@ def main():
     add_browserskill_arguments(parser)
     parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
+
+    # P1-D: fail fast on a malformed --proxy instead of silently going
+    # direct (run_download re-validates for direct callers).
+    if args.proxy:
+        try:
+            playwright_proxy_config(args.proxy)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     with runtime_from_args(args, parser) as bsk_runtime:
         try:
@@ -1767,6 +2455,49 @@ def main():
 
 
 def run_download(args, bsk_runtime):
+
+    # P1-CE: the phase budget (default 150s, --phase-timeout), shared by
+    # discovery and the download loop below.
+    phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
+    phase_deadline = time.monotonic() + phase_timeout
+    print(f"  Phase timeout: {phase_timeout:g}s")
+
+    # P1 H-1: the browser fallback's own quota (default: one goto 30s,
+    # 60s total per phase), shared by every browser attempt below.
+    # P1 C: the run's phase deadline is passed in as well, so the
+    # fallback quota can never outlive the phase: one attempt runs at
+    # most min(goto, total remaining, phase remaining), and the budget
+    # counts as exhausted once the phase deadline passes.
+    browser_budget = browser_budget_from_args(args, phase_deadline=phase_deadline)
+    print(f"  Browser fallback budget: {browser_budget.goto_timeout:g}s per page, "
+          f"{browser_budget.total_budget:g}s total")
+
+    def _browser_allowed():
+        """True while the fallback budget lasts. Once it is gone, log
+        the downgrade line (once) and return False -- callers then skip
+        the browser attempt and the OA mirror round (already run, P1
+        H-1 reorder) / download round still proceed. Only called when
+        a browser attempt is actually pending, so a complete run never
+        logs a spurious exhaustion."""
+        if browser_budget.exhausted:
+            browser_budget.announce_exhausted()
+            return False
+        return True
+
+    # P1-D: validate the proxy up front (fail fast on a typo'd value
+    # instead of silently going direct) and arm the per-host tunnel
+    # breaker for this run with the CLI threshold.
+    proxy = getattr(args, "proxy", None)
+    if proxy:
+        playwright_proxy_config(proxy)
+        print(f"  Proxy: {redact_proxy_url(proxy)}")
+    try:
+        _TUNNEL_TRACKER.threshold = max(
+            1, int(getattr(args, "tunnel_fail_threshold", DEFAULT_TUNNEL_FAILURE_THRESHOLD)
+                   or DEFAULT_TUNNEL_FAILURE_THRESHOLD))
+    except (TypeError, ValueError):
+        _TUNNEL_TRACKER.threshold = DEFAULT_TUNNEL_FAILURE_THRESHOLD
+    _TUNNEL_TRACKER.reset()
 
     config = load_config() if HAS_SCANSCI else {}
     if os.environ.get("ELSEVIER_API_KEY"):
@@ -1852,6 +2583,9 @@ def run_download(args, bsk_runtime):
     session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
     # Fetch page with redirect resolution (Fixing Issue #1)
+    # P1 C: the phase deadline rides along, so a load that starts
+    # after the deadline never starts, and a load that returns late
+    # stops the phase instead of starting the next stage.
     html_content, status, final_url = fetch_page_html(
         url,
         session,
@@ -1862,10 +2596,15 @@ def run_download(args, bsk_runtime):
         bsk_browser=getattr(args, "bsk_browser", None),
         bsk_runtime=bsk_runtime,
         bsk_tab=getattr(args, "bsk_tab", None),
+        proxy=proxy,
+        tunnel_tracker=_TUNNEL_TRACKER,
+        browser_budget=browser_budget,
+        deadline=phase_deadline,
     )
-    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill:
+    if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill and _browser_allowed():
         try:
-            html_content, status, final_url = fetch_page_via_browserskill(url, runtime=bsk_runtime)
+            html_content, status, final_url = fetch_page_via_browserskill(
+                url, timeout=browser_budget.attempt_timeout(), runtime=bsk_runtime)
         except BrowserSkillError as exc:
             if bsk_runtime.browser or bsk_runtime.tab_id:
                 raise
@@ -1925,11 +2664,66 @@ def run_download(args, bsk_runtime):
     # evidence check still reports missing files. When the supplements
     # are already complete, do not force.
     is_inc, inc_reason = evidence.check(candidates)
+
+    # P1 H-1: the OA mirror round runs BEFORE any browser fallback.
+    # Mirrors are fetched over requests (cheap, seconds), while one
+    # browser page load over the proxy takes 60-90s -- in round 3 the
+    # browser retry ran first, hung, and the mirrors never ran at all
+    # (#1: 13 files in R2, 0 in R3). Files reachable without a browser
+    # are therefore collected first; the browser retry below only runs
+    # for what the mirrors did not already cover, and only while its
+    # own budget lasts.
+    doi_val = (
+        extract_doi(args.url_or_doi)
+        or extract_doi(url)
+        or extract_doi(effective_base)
+        or extract_doi_from_html(html_content)
+        or config.get("_last_api_doi")
+    )
+    def fetch_mirror(oa_url):
+        return fetch_page_html(oa_url, session, play_cookies, args.headful,
+                               proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+                               browser_budget=browser_budget,
+                               deadline=phase_deadline)
+
+    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    # P1 C: the mirror round is a page-load round -- it must not start
+    # once the phase deadline has passed inside the publisher fetch
+    # above (round 3: the phase died in a load and the next rounds
+    # still launched loads until the runner killed the process). The
+    # candidates found so far still reach the download loop below,
+    # where download_with_recovery prints the graceful-stop line.
+    if (not candidates or is_inc or args.oa) and time.monotonic() < phase_deadline:
+        known = {c.url for c in candidates}
+        additions = [c for c in mirrors.discover() if c.url not in known]
+        candidates = additions + candidates if args.oa else candidates + additions
+    if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
+        _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
+
+    # P1-E2: seed from the Phase A candidate list left in this article
+    # directory (separate Phase A process, same -o). Without this, a
+    # Phase A timeout preserved candidates on disk that Phase B never
+    # downloaded from (round 3: 348 candidates across 15 papers).
+    # P1-E remainder: the loader also checks the sibling title
+    # directories under the same output dir -- Phase A and Phase B can
+    # resolve different titles, so the list often sits one directory
+    # over from article_dir (final still wins over partial, corrupt
+    # files still fall through to the next location).
+    seed_candidates, seed_source = load_seed_candidates(article_dir)
+    if seed_candidates:
+        candidates, seeds_added = merge_seed_candidates(candidates, seed_candidates)
+        if seeds_added:
+            print(f"  [Info] Seeded {seeds_added} candidate(s) from Phase A "
+                  f"candidate list ({seed_source}).")
+
+    is_inc, inc_reason = evidence.check(candidates)
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill:
+    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill and _browser_allowed():
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
-            url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
+            url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url,
+            proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+            browser_budget=browser_budget,
         )
         if html_content_browser:
             url = final_url_browser or url
@@ -1950,7 +2744,7 @@ def run_download(args, bsk_runtime):
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled:
+    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled and _browser_allowed():
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -1968,7 +2762,9 @@ def run_download(args, bsk_runtime):
                 pass
 
             cdp_html, cdp_status, cdp_final = fetch_page_html(
-                url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0]
+                url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0],
+                proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=browser_budget,
             )
             if cdp_html:
                 cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
@@ -1991,12 +2787,12 @@ def run_download(args, bsk_runtime):
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled:
+    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled and _browser_allowed():
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
                 url,
-                timeout=60.0,
+                timeout=browser_budget.attempt_timeout(),
                 browser=getattr(args, "bsk_browser", None),
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
@@ -2024,25 +2820,6 @@ def run_download(args, bsk_runtime):
 
     is_inc, inc_reason = evidence.check(candidates)
 
-    # Tier OA Penetration: If still no candidates, incomplete, or --oa requested, probe Open Access repository mirrors (PMC / Europe PMC)
-    doi_val = (
-        extract_doi(args.url_or_doi)
-        or extract_doi(url)
-        or extract_doi(effective_base)
-        or extract_doi_from_html(html_content)
-        or config.get("_last_api_doi")
-    )
-    def fetch_mirror(oa_url):
-        return fetch_page_html(oa_url, session, play_cookies, args.headful)
-
-    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
-    if not candidates or is_inc or args.oa:
-        known = {c.url for c in candidates}
-        additions = [c for c in mirrors.discover() if c.url not in known]
-        candidates = additions + candidates if args.oa else candidates + additions
-    if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
-        _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
-
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
             page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
@@ -2066,10 +2843,24 @@ def run_download(args, bsk_runtime):
                     return
 
         if api_files or cdn_files:
-            print(f"  Preserved {len(set(api_files + cdn_files))} API/CDN file(s); page completeness remains unverified.")
+            # P1-F: confirm each Tier A / Tier 0 file by name instead
+            # of the vague "Preserved ..." line.
+            preserved_count = print_tier_preserved_files(api_files, cdn_files, article_dir)
+            # P1-G2: countable Done line so downstream status parsing
+            # sees the download (round-3 #13/#47 scored failed-timeout
+            # with dl_done empty despite 11/11 and 3/3 on disk).
+            if preserved_count:
+                print(preserved_done_line(preserved_count, article_dir))
             if args.convert_markdown:
                 convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
+        # P1 C: say so explicitly when the phase died inside a page
+        # load with nothing found -- otherwise a run killed by the
+        # budget looks identical to a paper with no supplements, and
+        # the graceful-stop line never appears (round 3: 0 times).
+        if time.monotonic() >= phase_deadline:
+            print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+                  f"no candidates were found before the budget ran out.")
         if diag.incomplete_reason:
             print(f"  [Diagnostic] {diag.incomplete_reason}")
         if diag.excluded_links:
@@ -2079,6 +2870,14 @@ def run_download(args, bsk_runtime):
         return
 
     candidates = expand_repository_candidates(candidates)
+    # P1-B: tiers / mirrors can re-discover the same file under another URL
+    # (Springer vs PMC, :443 vs plain); download it once.
+    candidates = dedupe_candidates(candidates)
+    # P1-CE: download in priority order (real supplement files first,
+    # external/repository pages last); the sort is lossless, so the list
+    # below is the order downloads will be attempted in.
+    discovery_order = list(candidates)
+    candidates = sort_candidates_by_priority(candidates)
     diag.candidates = candidates
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 
@@ -2089,6 +2888,9 @@ def run_download(args, bsk_runtime):
         if cand.link_text:
             print(f"        Text:    {cand.link_text}")
         print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+    if candidates != discovery_order:
+        print("  [Info] Candidates reordered by priority for download "
+              "(real supplement files first, external pages last).")
 
     if evidence.describe():
         print(f"  [Info] {evidence.describe()}")
@@ -2110,8 +2912,9 @@ def run_download(args, bsk_runtime):
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, session, play_cookies,
-                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url),
-        mirrors, expand_repository_candidates, max_retries=1)
+                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url,
+                                   proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER),
+        mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
     success_count = len(successful)
     incomplete, reason = evidence.check(successful)
     if incomplete:
@@ -2119,7 +2922,12 @@ def run_download(args, bsk_runtime):
 
     # Check if page text references additional MMCs not in candidate URLs
     extra_cdn_files = []
-    if pii and not args.skip_cdn and not args.list_only:
+    # P1-CE: the extra CDN probe is a new stage, not part of the download
+    # loop; skip it once the phase budget is gone.
+    if time.monotonic() >= phase_deadline:
+        print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+              f"skipping extra CDN probe.")
+    elif pii and not args.skip_cdn and not args.list_only:
         page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
         downloaded_mmcs = set()
         manifest = load_download_manifest(article_dir)
@@ -2158,7 +2966,24 @@ def run_download(args, bsk_runtime):
     except Exception:
         pass
 
-    total_target = attempted + len(extra_cdn_files)
+    # P1-G remainder: Tier A / Tier 0 files downloaded before the
+    # candidate loop never entered success_count / total_target, so a
+    # run that got everything via Tier 0 (round-3 #13: 11/11) still
+    # printed "✓ Done: 0/N" once any candidate existed. Fold the
+    # on-disk-verified tier files into both sides -- the same
+    # convention as extra_cdn_files above: a file the tool obtained
+    # counts once as a target, too. Files the candidate loop already
+    # counted are excluded by count_tier_files_on_disk, so nothing is
+    # counted twice. The denominator stays honest: it counts distinct
+    # files pursued (candidates attempted + tier files obtained), never
+    # an invented page-completeness total.
+    tier_count = count_tier_files_on_disk(api_files, cdn_files, article_dir, successful)
+    if tier_count:
+        success_count += tier_count
+        print(f"  [Info] {tier_count} Tier A/CDN file(s) downloaded earlier "
+              f"count toward the Done total.")
+
+    total_target = attempted + len(extra_cdn_files) + tier_count
     print(f"\n✓ Done: {success_count}/{total_target} files downloaded to {os.path.abspath(article_dir)}")
 
     # Step 5: Optional MarkItDown conversion

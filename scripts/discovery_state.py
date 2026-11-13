@@ -5,6 +5,7 @@ from supp_finder import (BeautifulSoup, DEFAULT_PARSER, supplementary_table_ids,
                          declared_file_count, covered_table_ids,
                          detect_declared_supplement_count,
                          detect_declared_table_range,
+                         filename_dedup_key,
                          is_result_obviously_incomplete,
                          page_fetch_is_failure)
 
@@ -123,7 +124,10 @@ class MirrorDiscovery:
         # Entries are removed when a later probe of the same URL succeeds.
         self.failures = {}
 
-    def discover(self, force=False):
+    def discover(self, force=False, on_candidate=None):
+        """Probe OA mirrors; *on_candidate* (P1-CE) is called with each
+        newly found candidate as soon as it is discovered, so a caller can
+        stream/print/persist it instead of waiting for every mirror."""
         if (self.queried and not force) or not self.enabled or not self.doi:
             return self.candidates
         if force:
@@ -162,6 +166,8 @@ class MirrorDiscovery:
                     if candidate.url not in seen_files:
                         self.candidates.append(candidate)
                         seen_files.add(candidate.url)
+                        if on_candidate is not None:
+                            on_candidate(candidate)
             except Exception as exc:
                 self.failures[url] = f'{type(exc).__name__}: {exc}'
                 print(f'  [OA Mirror] Fetch failed: {exc}')
@@ -271,8 +277,15 @@ def _normalize_download_result(result):
 
 def download_with_recovery(candidates, download, mirrors, expand,
                            retry_download=None, max_retries=2, sleep=None,
-                           failures=None):
+                           failures=None, deadline=None):
     """Attempt each URL, retrying transient failures on another transport.
+
+    ``deadline`` (P1-CE) is a ``time.monotonic()`` value: once it is
+    reached, no further candidate is attempted and the mirror round is
+    skipped, so a phase that runs out of budget stops cleanly with the
+    files it already has instead of being killed mid-list. Candidates
+    not attempted are simply not in ``successful``/``attempted`` -- they
+    are never reported as failed.
 
     H8: the failure *reason* decides what happens next, not the
     ``attempted`` set. A transient failure (timeout / connection reset /
@@ -298,10 +311,23 @@ def download_with_recovery(candidates, download, mirrors, expand,
     allowed_retries = max_retries if retry_download is not None else min(max_retries, 1)
     attempted, successful, failed = set(), [], []
     successful_urls = set()
+    # P1-B: normalized filenames already downloaded in this run. A second
+    # URL for the same filename (e.g. a PMC mirror of a Springer file) is
+    # not downloaded again; a *failed* file is NOT in this set, so it still
+    # gets its fresh mirror-round attempt (H8).
+    successful_filenames = set()
 
     def attempt(items):
         seen_this_round = set()
+        seen_fnames_this_round = set()
         for candidate in items:
+            # P1-CE: the phase budget is checked before every attempt, so
+            # a download that starts after the deadline never starts.
+            if deadline is not None and time.monotonic() >= deadline:
+                print(f'  [Warning] Phase timeout reached; '
+                      f'{len(items) - len(seen_this_round)} candidate(s) '
+                      f'not attempted in this round.')
+                return
             if candidate.url in seen_this_round:
                 continue
             seen_this_round.add(candidate.url)
@@ -309,6 +335,11 @@ def download_with_recovery(candidates, download, mirrors, expand,
                 # Already downloaded in an earlier round; only failed
                 # URLs get a fresh attempt in a later round.
                 continue
+            fname_key = filename_dedup_key(getattr(candidate, "filename", "") or "")
+            if fname_key is not None:
+                if fname_key in successful_filenames or fname_key in seen_fnames_this_round:
+                    continue
+                seen_fnames_this_round.add(fname_key)
             attempted.add(candidate.url)
             ok, last_reason = False, None
             for n in range(allowed_retries + 1):
@@ -334,12 +365,16 @@ def download_with_recovery(candidates, download, mirrors, expand,
             if ok:
                 successful.append(candidate)
                 successful_urls.add(candidate.url)
+                if fname_key is not None:
+                    successful_filenames.add(fname_key)
             else:
                 failed.append(candidate)
                 failures[candidate.url] = last_reason
 
     attempt(candidates)
-    if failed:
+    # P1-CE: no mirror round once the budget is gone -- rediscovery would
+    # only burn time that no longer exists.
+    if failed and not (deadline is not None and time.monotonic() >= deadline):
         alternatives = expand(mirrors.discover())
         attempt(alternatives)
         known = {c.url for c in candidates}

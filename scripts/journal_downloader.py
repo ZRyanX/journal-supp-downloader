@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -34,6 +35,8 @@ from supp_finder import (
     find_all_candidates,
     is_result_obviously_incomplete,
     validate_downloaded_file,
+    single_line,
+    remove_invalid_existing_download,
     sanitize_filename,
     extract_filename_from_url,
     extract_filename_from_content_disposition,
@@ -63,6 +66,17 @@ from supp_finder import (
     commit_temp_file,
     discard_temp_file,
     write_bytes_chunked,
+    # P1-CE: shared phase budget + download priority order.
+    DEFAULT_PHASE_TIMEOUT_SECONDS,
+    resolve_phase_timeout,
+    sort_candidates_by_priority,
+    # P1 round-3 minor (a): MITM-proxy certificate trust for the browser
+    # layer (first call and every retry carry the same config).
+    proxy_browser_trust_kwargs,
+    # P1 H-1: independent budget for the browser fallback.
+    DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+    DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+    browser_budget_from_args,
 )
 
 
@@ -188,10 +202,13 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
 
     # Check if already exists and is valid for this exact URL
     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-        is_val, _ = validate_downloaded_file(filepath)
+        is_val, reason = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
             return filepath
+        # P1-F: garbage landed by an earlier run is removed, not
+        # [SKIP]-counted as a success; the download below retries it.
+        remove_invalid_existing_download(filepath, manifest, reason)
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     # H9: the body is written in bounded chunks to a same-directory temp
@@ -244,10 +261,11 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
             if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                is_val, _ = validate_downloaded_file(filepath)
+                is_val, reason = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"[SKIP] {fname} (already exists)")
                     return filepath
+                remove_invalid_existing_download(filepath, manifest, reason)
 
         # Infer extension if filename has none or is generic .bin
         if "." not in fname or fname.endswith(".bin"):
@@ -297,13 +315,92 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 filepath = ensure_inferred_extension_on_disk(filepath, output_dir, url, manifest=manifest)
                 print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
                 return filepath
-        print(f"FAIL: {exc}")
+        print(f"FAIL: {single_line(exc)}")
         return None
 
 
 def guess_filename_from_url(url):
     """Derive a readable filename from URL (backward-compatible)."""
     return extract_filename_from_url(url)
+
+
+# ── P1-CE: Phase A streaming partial results ────────────────────────────────
+# 50-paper retest (sec. 4 item 3): Phase A timed out on 49/50 papers and
+# the candidate list was discarded with the timeout, because the list was
+# only printed after every mirror had been probed. Candidates are now
+# streamed: each newly discovered batch is printed immediately and written
+# to the partial-results file below, so a timeout (or Ctrl-C / kill) leaves
+# the already-found candidates readable on disk. The partial file is
+# replaced by the final list only once discovery completes.
+
+PARTIAL_CANDIDATES_FILENAME = "supplementary_candidates.partial.json"
+FINAL_CANDIDATES_FILENAME = "supplementary_candidates.json"
+
+
+def _candidates_payload(candidates, *, complete, sources_completed, timed_out):
+    return {
+        "complete": bool(complete),
+        "partial": not complete,
+        "timed_out": bool(timed_out),
+        "candidate_count": len(candidates),
+        "sources_completed": list(sources_completed),
+        "candidates": [c.to_dict() for c in candidates],
+    }
+
+
+def _write_candidates_json(output_dir, filename, candidates, *, complete,
+                           sources_completed, timed_out):
+    os.makedirs(output_dir, exist_ok=True)
+    final_path = os.path.join(output_dir, filename)
+    tmp_path = temp_path_for(final_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_candidates_payload(
+                candidates, complete=complete,
+                sources_completed=sources_completed, timed_out=timed_out),
+                f, ensure_ascii=False, indent=2, default=str)
+        commit_temp_file(tmp_path, final_path)
+    except Exception:
+        discard_temp_file(tmp_path)
+        raise
+    return final_path
+
+
+def write_partial_candidates(output_dir, candidates, *, complete=False,
+                             sources_completed=(), timed_out=False):
+    """Atomically (re)write the partial candidate list (P1-CE).
+
+    The file always says it is incomplete (``complete: false``) while
+    discovery is still running; call :func:`finalize_candidates` once
+    every source has been probed. Safe to call after every batch: the
+    write goes through a same-directory temp file + os.replace, so a
+    kill mid-write never leaves a torn file.
+    """
+    return _write_candidates_json(
+        output_dir, PARTIAL_CANDIDATES_FILENAME, candidates,
+        complete=complete, sources_completed=sources_completed,
+        timed_out=timed_out)
+
+
+def finalize_candidates(output_dir, candidates, *, sources_completed=(),
+                        timed_out=False):
+    """Publish the complete candidate list and retire the partial file."""
+    final_path = _write_candidates_json(
+        output_dir, FINAL_CANDIDATES_FILENAME, candidates, complete=True,
+        sources_completed=sources_completed, timed_out=timed_out)
+    try:
+        os.remove(os.path.join(output_dir, PARTIAL_CANDIDATES_FILENAME))
+    except OSError:
+        pass
+    return final_path
+
+
+def _print_candidate(cand, index):
+    print(f"    [{index}] {cand.filename}")
+    print(f"        URL:     {cand.url}")
+    if cand.link_text:
+        print(f"        Text:    {cand.link_text}")
+    print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
 
 
 def main():
@@ -334,6 +431,37 @@ def main():
     parser.add_argument(
         "--timeout", type=int, default=60000,
         help="Page load timeout in ms (default: 60000)"
+    )
+    parser.add_argument(
+        "--phase-timeout", type=float, default=DEFAULT_PHASE_TIMEOUT_SECONDS,
+        help="Overall budget in seconds for this phase (discovery + "
+             "download). On expiry, already-discovered candidates are kept "
+             "in the partial results file and downloading stops instead of "
+             "being killed mid-list. Every page load is additionally capped "
+             "at the remaining phase budget, so one load can never run past "
+             "the deadline (default: 150)"
+    )
+    # P1 H-1: the browser fallback gets its own quotas -- one page goto
+    # at most 30s, 60s of browser time in total per phase. Either quota
+    # running out degrades to the OA mirror round instead of killing
+    # the phase inside one page load (round 3: #1 hung 120s+ on
+    # nature.com, mirrors never ran, 0 files).
+    # P1 C: both quotas are additionally capped at the remaining phase
+    # budget -- a single goto runs at most min(goto, total remaining,
+    # phase remaining), and the fallback budget counts as exhausted
+    # once the phase deadline passes.
+    parser.add_argument(
+        "--browser-goto-timeout", type=float, default=DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
+        help="Max seconds for one browser page load (goto) in the "
+             "fallback path, capped at the remaining phase budget "
+             "(default: 30)"
+    )
+    parser.add_argument(
+        "--browser-fallback-budget", type=float, default=DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
+        help="Max total seconds of browser fallback time per phase, "
+             "capped at the remaining phase budget; "
+             "once spent, the run degrades to the OA mirror round "
+             "instead of launching another browser (default: 60)"
     )
     parser.add_argument(
         "--solve-cloudflare", action="store_true", default=True,
@@ -391,6 +519,45 @@ def run_download(args, bsk_runtime):
     os.makedirs(args.output_dir, exist_ok=True)
     solve_cf = not args.no_cloudflare and args.solve_cloudflare
 
+    # P1-CE: the phase budget (default 150s, --phase-timeout). The clock
+    # starts here so the publisher fetch, retries, mirrors, and downloads
+    # all share one budget instead of each stage assuming it has 150s.
+    phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
+    phase_deadline = time.monotonic() + phase_timeout
+
+    def _phase_expired():
+        return time.monotonic() >= phase_deadline
+
+    def _phase_remaining():
+        """Seconds of phase budget left (0 once expired). Page-load
+        timeouts are clamped to this (P1 C), so no load starts with
+        more time than the phase has left."""
+        return max(0.0, phase_deadline - time.monotonic())
+
+    print(f"Phase timeout: {phase_timeout:g}s")
+
+    # P1 H-1: the browser fallback's own quota (default: one goto 30s,
+    # 60s total per phase), shared by every browser attempt below.
+    # P1 C: the run's phase deadline is passed in as well, so the
+    # fallback quota can never outlive the phase: one attempt runs at
+    # most min(goto, total remaining, phase remaining), and the budget
+    # counts as exhausted once the phase deadline passes.
+    browser_budget = browser_budget_from_args(args, phase_deadline=phase_deadline)
+    print(f"Browser fallback budget: {browser_budget.goto_timeout:g}s per page, "
+          f"{browser_budget.total_budget:g}s total")
+
+    def _browser_allowed():
+        """True while the fallback budget lasts. Once it is gone, log
+        the downgrade line (once) and return False -- callers then skip
+        the browser attempt and the OA mirror round (already run, P1
+        H-1 reorder) / download round still proceed. Only called when
+        a browser attempt is actually pending, so a complete run never
+        logs a spurious exhaustion."""
+        if browser_budget.exhausted:
+            browser_budget.announce_exhausted()
+            return False
+        return True
+
     # Normalize DOI input if needed
     input_target = args.url.strip()
     if input_target.startswith("10."):
@@ -424,24 +591,39 @@ def run_download(args, bsk_runtime):
         "hide_canvas": True,
         "real_chrome": args.real_chrome,
         "network_idle": True,
-        "timeout": args.timeout,
+        # P1 H-1: the page fetch is a browser goto too -- cap it at the
+        # goto timeout (30s by default) instead of --timeout (60s), so
+        # step [1/3] alone cannot eat the phase budget (round 3 #1).
+        # P1 C: cap it at the *attempt* timeout, not just the goto
+        # quota -- the attempt timeout is min(goto, total remaining,
+        # phase remaining), so a fetch launched with 10s of phase
+        # left runs at most 10s.
+        "timeout": min(args.timeout, browser_budget.attempt_timeout_ms()),
         "proxy": args.proxy,
         "wait_selector": args.wait_selector,
         "page_action": expand_page_accordions_action,
         "google_search": False,
     }
+    # P1 round-3 minor (a): the MITM proxy's CA trust config. fetch_kwargs
+    # is built once and every later fetch copies it (CDP retry, OA mirror,
+    # browser retry), so first call and retries carry identical proxy +
+    # trust settings -- proxy mode only; no proxy means no trust keys.
+    fetch_kwargs.update(proxy_browser_trust_kwargs(args.proxy))
     if cookies:
         fetch_kwargs["cookies"] = normalize_playwright_cookies(cookies, default_url=fetch_url)
 
     page = None
     # Primary BrowserSkill check if requested via --bsk / --browserskill
-    if getattr(args, "browserskill", False):
+    # P1 C: no load starts once the phase deadline has passed (here
+    # vacuous -- the phase just started -- but the check belongs on
+    # every load entry, including this one).
+    if getattr(args, "browserskill", False) and not _phase_expired():
         print("  [BrowserSkill] Fetching page via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
                 fetch_url,
                 wait_selector=args.wait_selector,
-                timeout=args.timeout / 1000.0,
+                timeout=min(args.timeout / 1000.0, browser_budget.attempt_timeout()),
                 browser=getattr(args, "bsk_browser", None),
                 tab_id=getattr(args, "bsk_tab", None),
                 runtime=bsk_runtime,
@@ -469,7 +651,7 @@ def run_download(args, bsk_runtime):
         else:
             print("  [CDP] No active browser CDP port detected. Falling back to standalone stealth browser.")
 
-    if cdp_target and page is None:
+    if cdp_target and page is None and not _phase_expired():
         # Extract live authenticated cookies from the browser session
         try:
             live_cdp_c = extract_cdp_cookies(cdp_target)
@@ -484,7 +666,7 @@ def run_download(args, bsk_runtime):
         try:
             print(f"  [CDP] Connecting over CDP to live browser: {cdp_target} ...")
             cdp_html, cdp_status, cdp_final_url, cdp_c = fetch_page_via_cdp(
-                cdp_target, fetch_url, wait_selector=args.wait_selector, timeout=args.timeout / 1000.0
+                cdp_target, fetch_url, wait_selector=args.wait_selector, timeout=min(args.timeout / 1000.0, browser_budget.attempt_timeout())
             )
             if cdp_html and not page_fetch_is_failure(cdp_html, cdp_status):
                 print("  [CDP] Successfully retrieved page DOM from live browser session.")
@@ -500,29 +682,41 @@ def run_download(args, bsk_runtime):
             print(f"  [CDP] Live tab attachment notice: {e_cdp}. Falling back to StealthyFetcher...")
 
     # Secondary: Scrapling StealthyFetcher fallback
-    if page is None:
+    # P1 C: each link of this chain is a page load of its own -- none
+    # of them starts once the phase deadline has passed, so the chain
+    # cannot spend 30s + 30s + 30s after the budget is already gone
+    # (round 3: the phase died inside one such load and the next links
+    # still ran until the runner killed the process).
+    if page is None and not _phase_expired():
         ws_cdp_url = resolve_cdp_ws_url(cdp_target) if cdp_target else None
         if ws_cdp_url:
             fetch_kwargs["cdp_url"] = ws_cdp_url
             fetch_kwargs.pop("real_chrome", None)
 
+        # P1 C: re-cap the timeout at launch -- the BSK / CDP attempts
+        # above may already have spent phase time since fetch_kwargs
+        # was built.
+        fetch_kwargs["timeout"] = min(args.timeout, browser_budget.attempt_timeout_ms())
         try:
             page = StealthyFetcher.fetch(fetch_url, **fetch_kwargs)
         except Exception as e:
             print(f"  [Warning] Browser fetch encountered error: {e}")
-            if "cdp_url" in fetch_kwargs:
+            if "cdp_url" in fetch_kwargs and not _phase_expired():
                 print("  [Recovery] Retrying with standalone stealth browser...")
                 fb_kwargs = dict(fetch_kwargs)
                 fb_kwargs.pop("cdp_url", None)
+                fb_kwargs["timeout"] = min(args.timeout, browser_budget.attempt_timeout_ms())
                 try:
                     page = StealthyFetcher.fetch(fetch_url, **fb_kwargs)
                 except Exception as e2:
                     print(f"  [Warning] Standalone browser fetch also failed: {e2}")
 
-            if page is None:
+            if page is None and not _phase_expired():
                 print("  [Recovery] Attempting HTTP direct fetch fallback...")
                 try:
-                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout / 1000.0, 30.0)}
+                    # P1 C: the HTTP fallback is a load too -- clamp
+                    # its timeout to the remaining phase budget.
+                    http_kwargs = {"stealthy_headers": True, "timeout": min(args.timeout / 1000.0, 30.0, _phase_remaining())}
                     if cookies:
                         http_kwargs["cookies"] = cookies_to_dict(cookies, fetch_url)
                     resp = Fetcher.get(fetch_url, **http_kwargs)
@@ -537,11 +731,11 @@ def run_download(args, bsk_runtime):
     # (None, from BrowserSkill/CDP) must not crash the comparison.
     _page_html = str(getattr(page, "html_content", None) or getattr(page, "text", "") or "") if page is not None else ""
     _page_status = getattr(page, "status", None) if page is not None else None
-    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill:
+    if (page is None or page_fetch_is_failure(_page_html, _page_status)) and bsk_runtime.enabled and not args.browserskill and not _phase_expired():
         try:
             html, status, landing = fetch_page_via_browserskill(
                 fetch_url, wait_selector=args.wait_selector,
-                timeout=args.timeout / 1000.0, runtime=bsk_runtime,
+                timeout=min(args.timeout / 1000.0, browser_budget.attempt_timeout()), runtime=bsk_runtime,
             )
             page = type("BrowserSkillPage", (), {"html_content": html, "text": html, "url": landing, "status": status})()
         except BrowserSkillError as exc:
@@ -607,10 +801,45 @@ def run_download(args, bsk_runtime):
 
     # --- Step 2: Find supplementary links ---
     print("\n[2/3] Scanning for supplementary data links...")
+    # P1-CE streaming state: candidates already printed + persisted, and
+    # whether the phase budget has run out.
+    _streamed_urls = set()
+    _sources_done = []
+    phase_timed_out = False
+
+    def _persist(fn, *args, **kwargs):
+        # The candidate-list files are best-effort diagnostics: a
+        # failure to write them (e.g. a read-only / EPERM sandbox
+        # episode) must never abort the run itself.
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            print(f"  [Warning] Could not write candidate list file: {exc}")
+            return None
+
+    def _stream(current, source):
+        """Print + persist every candidate not streamed yet (P1-CE)."""
+        if source not in _sources_done:
+            _sources_done.append(source)
+        fresh = [c for c in current if c.url not in _streamed_urls]
+        for cand in fresh:
+            _streamed_urls.add(cand.url)
+            _print_candidate(cand, len(_streamed_urls))
+        if fresh:
+            _persist(
+                write_partial_candidates,
+                article_dir, list(current), complete=False,
+                sources_completed=list(_sources_done),
+                timed_out=_phase_expired())
+        return fresh
+
     diag = find_all_candidates(html_content, effective_base, original_url=args.url)
     candidates = diag.candidates
     evidence = DiscoveryEvidence()
     evidence.observe("publisher", html_content, effective_base)
+    # P1-CE: stream the publisher candidates now -- do not wait for the
+    # retries / mirrors below, which may never finish inside the budget.
+    _stream(candidates, "publisher")
 
     # H3: force a browser render when the static page shows dynamic
     # signals (diag.needs_browser) but the candidate set is empty or the
@@ -621,10 +850,10 @@ def run_download(args, bsk_runtime):
     # count). When the supplements are already complete, do not force.
     _ev_inc, _ = evidence.check(candidates)
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or _ev_inc)
-    if (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector:
+    if not _phase_expired() and (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector and _browser_allowed():
         try:
             retry_html, _, retry_url = fetch_page_via_browserskill(
-                fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
+                fetch_url, timeout=min(args.timeout / 1000.0, browser_budget.attempt_timeout()), runtime=bsk_runtime,
             )
             _refresh_title_and_dir_from_html_or_str(retry_html)
             retry_base = extract_effective_base_url(retry_html, retry_url)
@@ -641,17 +870,90 @@ def run_download(args, bsk_runtime):
                 raise
             print(f"  [Recovery] BrowserSkill: {exc}")
 
+    _stream(candidates, "browserskill_retry")
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
     # H3 (recomputed after any BSK retry above): diag.is_incomplete is
     # the evidence verdict here, so the flag again follows the task rule.
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or diag.is_incomplete)
-    if (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill:
+
+    # P1 H-1: the OA mirror round runs BEFORE the Stealthy browser
+    # retry below. Mirrors start over requests (cheap, seconds), while
+    # one browser page load over the proxy takes 60-90s -- in round 3
+    # the browser retry ran first, hung, and the mirrors never ran at
+    # all (#1: 13 files in R2, 0 in R3). The retry below only runs for
+    # what the mirrors did not already cover, and only while its own
+    # budget lasts.
+    # Open Access repository mirror fallback (Unpaywall & OpenAlex)
+    doi_val = (
+        extract_doi(input_target)
+        or extract_doi(final_url)
+        or extract_doi(effective_base)
+        or extract_doi_from_html(html_content)
+    )
+    def fetch_mirror(oa_url):
+        # P1 C: no mirror load starts once the phase deadline has
+        # passed, and the requests timeout is capped at the remaining
+        # phase budget (the old hardcoded 20s could overshoot a
+        # nearly-spent phase on its own).
+        if _phase_expired():
+            return "", 0, oa_url
+        try:
+            response = Fetcher.get(oa_url, stealthy_headers=True,
+                                   timeout=min(20, _phase_remaining()))
+            document = getattr(response, "html_content", None) or response.text
+            if response.status < 400 and document:
+                return str(document), response.status, getattr(response, "url", None) or oa_url
+        except Exception:
+            pass
+        # P1 H-1: the mirror's browser fallback is capped by the same
+        # budget -- a hanging mirror page must not eat the phase either.
+        if browser_budget.exhausted:
+            browser_budget.announce_exhausted()
+            return "", 0, oa_url
+        kwargs = dict(fetch_kwargs)
+        kwargs.pop("wait_selector", None)
+        kwargs.pop("cookies", None)
+        kwargs["timeout"] = browser_budget.attempt_timeout_ms()
+        response = StealthyFetcher.fetch(oa_url, **kwargs)
+        return str(response.html_content), response.status, getattr(response, "url", None) or oa_url
+
+    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
+    if _phase_expired():
+        # P1-CE: the budget died before the mirrors; keep what the
+        # publisher page already yielded instead of discarding it.
+        phase_timed_out = True
+    elif not candidates or diag.is_incomplete or args.oa:
+        known = {c.url for c in candidates}
+        mirror_found = []
+
+        def _on_mirror_candidate(cand):
+            # Stream each mirror candidate as it arrives; the partial
+            # file holds publisher + mirror candidates found so far.
+            if cand.url not in known and all(c.url != cand.url for c in mirror_found):
+                mirror_found.append(cand)
+                _stream(candidates + mirror_found, "oa_mirrors")
+
+        additions = [c for c in mirrors.discover(on_candidate=_on_mirror_candidate) if c.url not in known]
+        candidates = additions + candidates if args.oa else candidates + additions
+    if _phase_expired():
+        # The mirror round itself ran past the budget; the candidates it
+        # found are already streamed, but no further stage may start.
+        phase_timed_out = True
+    if mirrors.info and mirrors.info.title:
+        _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
+
+    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
+    needs_browser_retry = bool(diag.needs_browser) and (not candidates or diag.is_incomplete)
+    if not _phase_expired() and (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill and _browser_allowed():
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
         retry_kwargs["wait_selector"] = SUPP_WAIT_SELECTOR
         retry_kwargs["page_action"] = expand_page_accordions_action
-        retry_kwargs["timeout"] = min(args.timeout, 30000)
+        # P1 H-1: cap the retry goto at the remaining fallback budget
+        # (fetch_kwargs is already capped at the goto timeout).
+        retry_kwargs["timeout"] = min(args.timeout, browser_budget.attempt_timeout_ms())
         try:
             retry_page = StealthyFetcher.fetch(fetch_url, **retry_kwargs)
             retry_html = str(retry_page.html_content)
@@ -673,35 +975,7 @@ def run_download(args, bsk_runtime):
         except Exception:
             pass
 
-    # Open Access repository mirror fallback (Unpaywall & OpenAlex)
-    doi_val = (
-        extract_doi(input_target)
-        or extract_doi(final_url)
-        or extract_doi(effective_base)
-        or extract_doi_from_html(html_content)
-    )
-    def fetch_mirror(oa_url):
-        try:
-            response = Fetcher.get(oa_url, stealthy_headers=True, timeout=20)
-            document = getattr(response, "html_content", None) or response.text
-            if response.status < 400 and document:
-                return str(document), response.status, getattr(response, "url", None) or oa_url
-        except Exception:
-            pass
-        kwargs = dict(fetch_kwargs)
-        kwargs.pop("wait_selector", None)
-        kwargs.pop("cookies", None)
-        response = StealthyFetcher.fetch(oa_url, **kwargs)
-        return str(response.html_content), response.status, getattr(response, "url", None) or oa_url
-
-    mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
-    diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
-    if not candidates or diag.is_incomplete or args.oa:
-        known = {c.url for c in candidates}
-        additions = [c for c in mirrors.discover() if c.url not in known]
-        candidates = additions + candidates if args.oa else candidates + additions
-    if mirrors.info and mirrors.info.title:
-        _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
+    _stream(candidates, "browser_retry")
 
     if not candidates:
         print("  No supplementary data links found.")
@@ -709,6 +983,11 @@ def run_download(args, bsk_runtime):
             print(f"  [Diagnostic] {diag.incomplete_reason}")
         if diag.excluded_links:
             print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
+        if phase_timed_out:
+            _persist(write_partial_candidates, article_dir, candidates, complete=False,
+                     sources_completed=list(_sources_done), timed_out=True)
+            print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached with no candidates; "
+                  f"partial results saved to {os.path.join(article_dir, PARTIAL_CANDIDATES_FILENAME)}")
         print("  Try running with --headful and --no-cloudflare to debug.")
         return
 
@@ -716,18 +995,33 @@ def run_download(args, bsk_runtime):
     diag.candidates = candidates
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 
+    # P1-CE: download in priority order (real supplement files first,
+    # external/repository pages last); the sort is lossless, so the final
+    # list below is the order downloads will be attempted in.
+    discovery_order = list(candidates)
+    candidates = sort_candidates_by_priority(candidates)
+    diag.candidates = candidates
+
     print(f"  Found {len(candidates)} potential supplementary file(s):")
     for i, cand in enumerate(candidates, 1):
-        print(f"    [{i}] {cand.filename}")
-        print(f"        URL:     {cand.url}")
-        if cand.link_text:
-            print(f"        Text:    {cand.link_text}")
-        print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+        _print_candidate(cand, i)
+    if candidates != discovery_order:
+        print("  [Info] Candidates reordered by priority for download "
+              "(real supplement files first, external pages last).")
 
     if evidence.describe():
         print(f"  [Info] {evidence.describe()}")
     if diag.is_incomplete:
         print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
+
+    if phase_timed_out:
+        _persist(write_partial_candidates, article_dir, candidates, complete=False,
+                 sources_completed=list(_sources_done), timed_out=True)
+        print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+              f"partial results saved to {os.path.join(article_dir, PARTIAL_CANDIDATES_FILENAME)}")
+    else:
+        _persist(finalize_candidates, article_dir, candidates,
+                 sources_completed=list(_sources_done))
 
     if args.list_only:
         return
@@ -743,7 +1037,7 @@ def run_download(args, bsk_runtime):
         candidates,
         lambda cand: download_file(cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime,
                                    referer=cand.source_url or final_url),
-        mirrors, expand_repository_candidates, max_retries=1)
+        mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
     incomplete, reason = evidence.check(successful)

@@ -1022,8 +1022,13 @@ class TestSuppFinder(unittest.TestCase):
                 self.assertTrue(res_path.endswith(".html"))
                 self.assertFalse(os.path.exists(os.path.join(tmpdir, "table1.bin")))
 
-    def test_d2_candidate_filename_disambiguation(self):
-        """D2: Distinct URLs with identical filenames disambiguated with _2 suffix."""
+    def test_p1b_same_filename_candidates_merge(self):
+        """P1-B supersedes D2 at candidate level: distinct URLs with an
+        identical filename are the same file served twice (e.g. #46's
+        MOESM via Springer and PMC), so only one candidate is kept.
+        (D2's _2 disambiguation still applies inside download_file for
+        genuinely different content; see
+        test_d2_download_distinct_urls_same_filename_not_skipped.)"""
         html = """
         <div>
             <a href="https://example.com/part1/table_s1.xlsx">Table S1 (Part 1)</a>
@@ -1031,11 +1036,8 @@ class TestSuppFinder(unittest.TestCase):
         </div>
         """
         diag = find_all_candidates(html, base_url="https://example.com/paper")
-        self.assertEqual(len(diag.candidates), 2)
-        fnames = [c.filename for c in diag.candidates]
-        self.assertEqual(len(set(fnames)), 2)
-        self.assertIn("table_s1.xlsx", fnames)
-        self.assertIn("table_s1_2.xlsx", fnames)
+        self.assertEqual(len(diag.candidates), 1)
+        self.assertEqual(diag.candidates[0].filename, "table_s1.xlsx")
 
     def test_d2_download_cd_collision_disambiguation(self):
         """D2: download_file disambiguates Content-Disposition collisions without skipping."""
