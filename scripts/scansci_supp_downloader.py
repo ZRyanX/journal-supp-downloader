@@ -2217,6 +2217,53 @@ def preserved_done_line(count, article_dir):
             f"(page completeness unverified) to {os.path.abspath(article_dir)}")
 
 
+def count_tier_files_on_disk(api_files, cdn_files, article_dir, successful=()):
+    """Count Tier A / Tier 0 files verified on disk (P1-G remainder).
+
+    The candidates-exist path of run_download counts only the
+    candidate loop (plus the extra CDN probe) in its final Done
+    fraction, so Tier A/Tier 0 files downloaded before the loop never
+    entered either side -- round-3 #13 (Tier 0 11/11, candidate loop
+    0) printed "✓ Done: 0/N" and was scored failed despite 11 real
+    files on disk.
+
+    Files are verified on disk by basename under the final article
+    dir, with the same resolution as print_tier_preserved_files (the
+    dir may have migrated since Tier A/Tier 0 ran, so a recorded path
+    can be stale). A file the candidate loop already counted is
+    excluded: the same file reached via both paths (e.g. a same-URL
+    resume, which download_file reports as a loop success) must not
+    be counted twice. Identity follows the P1-B contract --
+    filename_dedup_key, so a _2 collision suffix does not split one
+    file into two; a successful candidate with no usable filename
+    also contributes the filename derived from its URL, so an
+    empty-filename candidate cannot double-count either. Files with
+    no identifying name (key None) are never excluded.
+    """
+    counted_keys = set()
+    for cand in successful or ():
+        for name in (getattr(cand, "filename", "") or "",
+                     extract_filename_from_url(cand.url or "")):
+            key = filename_dedup_key(name)
+            if key is not None:
+                counted_keys.add(key)
+    seen = set()
+    on_disk = 0
+    for files in (api_files or [], cdn_files or []):
+        for path in files:
+            name = os.path.basename(path)
+            if name in seen:
+                continue
+            seen.add(name)
+            key = filename_dedup_key(name)
+            if key is not None and key in counted_keys:
+                continue
+            resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
+            if os.path.exists(resolved):
+                on_disk += 1
+    return on_disk
+
+
 # ── P1-E2: Phase B seeds from the Phase A candidate list ──────────────────
 
 SEED_CANDIDATES_FILENAMES = (
@@ -2908,7 +2955,24 @@ def run_download(args, bsk_runtime):
     except Exception:
         pass
 
-    total_target = attempted + len(extra_cdn_files)
+    # P1-G remainder: Tier A / Tier 0 files downloaded before the
+    # candidate loop never entered success_count / total_target, so a
+    # run that got everything via Tier 0 (round-3 #13: 11/11) still
+    # printed "✓ Done: 0/N" once any candidate existed. Fold the
+    # on-disk-verified tier files into both sides -- the same
+    # convention as extra_cdn_files above: a file the tool obtained
+    # counts once as a target, too. Files the candidate loop already
+    # counted are excluded by count_tier_files_on_disk, so nothing is
+    # counted twice. The denominator stays honest: it counts distinct
+    # files pursued (candidates attempted + tier files obtained), never
+    # an invented page-completeness total.
+    tier_count = count_tier_files_on_disk(api_files, cdn_files, article_dir, successful)
+    if tier_count:
+        success_count += tier_count
+        print(f"  [Info] {tier_count} Tier A/CDN file(s) downloaded earlier "
+              f"count toward the Done total.")
+
+    total_target = attempted + len(extra_cdn_files) + tier_count
     print(f"\n✓ Done: {success_count}/{total_target} files downloaded to {os.path.abspath(article_dir)}")
 
     # Step 5: Optional MarkItDown conversion
