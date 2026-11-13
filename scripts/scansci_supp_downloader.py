@@ -26,6 +26,7 @@ if hasattr(sys.stderr, 'reconfigure'):
     sys.stderr.reconfigure(encoding='utf-8')
 
 import json
+import threading
 import time
 import subprocess
 import urllib3
@@ -177,6 +178,195 @@ def load_saved_cookies_standalone():
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+# P1-D (50-paper test, Cause D): the scansci browser layer had no --proxy
+# and every StealthyFetcher.fetch / StealthySession call ran with
+# proxy=None, so in a proxy-only environment every browser attempt died
+# with ERR_TUNNEL_CONNECTION_FAILED -- 521/584 FAILs in the P1 retest --
+# and each candidate burned its own retries until the time budget ran out.
+# The proxy value uses the same syntax as journal_downloader.py
+# (--proxy http://[user:pass@]host:port) and is plumbed unchanged to
+# StealthyFetcher.fetch and, as a Playwright proxy dict, to StealthySession
+# (which builds the launch_persistent_context underneath).
+# CDP / BrowserSkill paths attach to a live browser that was launched
+# elsewhere, so no per-request proxy can be injected there; they are
+# intentionally untouched.
+
+TUNNEL_ERROR_MARKER = "ERR_TUNNEL_CONNECTION_FAILED"
+DEFAULT_TUNNEL_FAILURE_THRESHOLD = 3
+# Log line printed when a host is abandoned early (kept verbatim: tests
+# and the P1 report grep for this phrase).
+TUNNEL_FAST_FAIL_MESSAGE = "隧道连续失败、提前放弃该站点"
+
+
+def is_tunnel_error(error):
+    """True when an exception/message is a browser tunnel failure, i.e. the
+    browser could not reach the site at all (proxy missing / proxy down),
+    as opposed to an HTTP error or a blocked page."""
+    return TUNNEL_ERROR_MARKER in str(error or "")
+
+
+def _tunnel_host_key(url_or_host):
+    """Normalize a URL (or bare host) to the per-host breaker key."""
+    text = str(url_or_host or "").strip().lower()
+    if not text:
+        return ""
+    if "://" not in text:
+        return text.split("/")[0].split(":")[0]
+    try:
+        return urlparse(text).hostname or text
+    except Exception:
+        return text
+
+
+def tunnel_failure_host(url):
+    """Public alias: host (lowercased) a URL belongs to for tunnel accounting."""
+    return _tunnel_host_key(url)
+
+
+def redact_proxy_url(proxy):
+    """Proxy URL with any password masked, for safe log lines."""
+    if not proxy:
+        return ""
+    text = str(proxy)
+    try:
+        parsed = urlparse(text)
+        if parsed.password:
+            return text.replace(f":{parsed.password}@", ":****@", 1)
+    except Exception:
+        pass
+    return text
+
+
+def playwright_proxy_config(proxy):
+    """Convert a --proxy value to the Playwright proxy dict scrapling
+    passes to launch_persistent_context: {"server", "username", "password"}.
+    Accepts the same ``http://[user:pass@]host:port`` string as
+    journal_downloader.py (or an already-built dict, returned as-is).
+    Returns None for an empty value; raises ValueError for a value with
+    no host so a typo'd proxy fails fast instead of silently going direct.
+    """
+    if not proxy:
+        return None
+    if isinstance(proxy, dict):
+        return dict(proxy)
+    parsed = urlparse(str(proxy))
+    try:
+        port = parsed.port
+    except ValueError:
+        raise ValueError(
+            f"Invalid proxy URL (expected http://[user:pass@]host:port): {redact_proxy_url(proxy)!r}"
+        ) from None
+    if not parsed.hostname:
+        raise ValueError(
+            f"Invalid proxy URL (expected http://[user:pass@]host:port): {redact_proxy_url(proxy)!r}"
+        )
+    server = f"{parsed.scheme or 'http'}://{parsed.hostname}"
+    if port:
+        server += f":{port}"
+    config = {"server": server}
+    if parsed.username:
+        config["username"] = parsed.username
+    if parsed.password:
+        config["password"] = parsed.password
+    return config
+
+
+class TunnelFailureTracker:
+    """Per-host circuit breaker for browser tunnel failures.
+
+    Counts *consecutive* ERR_TUNNEL_CONNECTION_FAILED failures per host:
+    any non-tunnel failure is ignored and any browser success resets the
+    count, so a transient blip does not trip the breaker and a recovered
+    host is usable again. Once the count reaches ``threshold`` the host is
+    tripped: callers must skip further browser attempts for it instead of
+    retrying every candidate. Thread-safe; one instance is shared by all
+    browser attempts within a run.
+    """
+
+    def __init__(self, threshold=DEFAULT_TUNNEL_FAILURE_THRESHOLD):
+        self.threshold = max(1, int(threshold))
+        self._counts = {}
+        self._tripped = set()
+        self._skip_announced = set()
+        self._lock = threading.Lock()
+
+    def consecutive_failures(self, url_or_host):
+        """Consecutive tunnel failures recorded for this host (0 if none)."""
+        with self._lock:
+            return self._counts.get(_tunnel_host_key(url_or_host), 0)
+
+    def is_tripped(self, url_or_host):
+        """True once this host reached the failure threshold."""
+        return self.consecutive_failures(url_or_host) >= self.threshold
+
+    def record_failure(self, url_or_host, error):
+        """Record one failure. Only tunnel errors count. Returns True when
+        this failure *newly* trips the threshold (the caller should log
+        the fast-fail line exactly then); False otherwise."""
+        if not is_tunnel_error(error):
+            return False
+        host = _tunnel_host_key(url_or_host)
+        if not host:
+            return False
+        with self._lock:
+            count = self._counts.get(host, 0) + 1
+            self._counts[host] = count
+            if count < self.threshold:
+                return False
+            newly = host not in self._tripped
+            self._tripped.add(host)
+            return newly
+
+    def record_success(self, url_or_host):
+        """A browser success for this host clears its failure count."""
+        host = _tunnel_host_key(url_or_host)
+        if not host:
+            return
+        with self._lock:
+            self._counts.pop(host, None)
+            self._tripped.discard(host)
+            self._skip_announced.discard(host)
+
+    def take_skip_notice(self, url_or_host):
+        """True only the first time a tripped host's skip is noticed, so
+        the 'skipping browser' line is logged once per host per run
+        instead of once per candidate."""
+        host = _tunnel_host_key(url_or_host)
+        with self._lock:
+            if host in self._skip_announced:
+                return False
+            self._skip_announced.add(host)
+            return True
+
+    def reset(self, host=None):
+        """Clear counts (one host, or all hosts when host is None)."""
+        with self._lock:
+            if host is None:
+                self._counts.clear()
+                self._tripped.clear()
+                self._skip_announced.clear()
+            else:
+                key = _tunnel_host_key(host)
+                self._counts.pop(key, None)
+                self._tripped.discard(key)
+                self._skip_announced.discard(key)
+
+
+# Shared breaker for one run; run_download() resets it and applies the
+# CLI threshold. Callers may pass their own tracker (tests do) instead.
+_TUNNEL_TRACKER = TunnelFailureTracker()
+
+
+def get_tunnel_tracker():
+    """The run-shared tunnel failure tracker."""
+    return _TUNNEL_TRACKER
+
+
+def reset_tunnel_failure_tracker():
+    """Clear the run-shared tracker (fresh run / test isolation)."""
+    _TUNNEL_TRACKER.reset()
+
 
 def resolve_doi_url(doi_or_url):
     """
@@ -1048,8 +1238,15 @@ def is_html_file(filepath):
 MMC_NUM_REGEX = re.compile(r"(?:^|[^a-z0-9])(?:es)?mmc[-_\s]?([1-9]\d{0,2})(?=$|[^0-9])", re.IGNORECASE)
 
 
-def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None):
-    """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session."""
+def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None):
+    """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session.
+
+    P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
+    journal_downloader.py --proxy) is passed to the browser download path
+    (Method 3, StealthySession) as a Playwright proxy dict; ``tunnel_tracker``
+    (default: the run-shared tracker) fast-fails the browser path for a
+    host whose tunnel failures reached the threshold.
+    """
     if isinstance(cand_or_url, Candidate):
         url = cand_or_url.url
         suggested_fname = cand_or_url.filename
@@ -1071,6 +1268,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     else:
         url = cand_or_url
         suggested_fname = ""
+
+    # P1-D: resolve the tunnel breaker (explicit tracker wins, else the
+    # run-shared one) before any browser attempt is made.
+    tracker = tunnel_tracker if tunnel_tracker is not None else _TUNNEL_TRACKER
 
     # Table ids the candidate is known to cover (H6), for the manifest record.
     cand_table_ids = sorted(getattr(cand_or_url, "covered_table_ids", ()) or ()) if isinstance(cand_or_url, Candidate) else []
@@ -1233,16 +1434,31 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # Method 3: Scrapling StealthySession + Playwright sync download fallback
     # H9: the browser download lands in a temp file, is validated, then
     # committed with os.replace; a failure only discards the temp file.
-    if HAS_SCRAPLING:
+    # P1-D: skip the browser entirely once this host's tunnel failures
+    # tripped the breaker -- launching another StealthySession per
+    # candidate would burn the time budget on a dead tunnel. The curl
+    # fallback below still runs (it may use a working env proxy).
+    if HAS_SCRAPLING and tracker.is_tripped(url):
+        if tracker.take_skip_notice(url):
+            print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                  f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器下载尝试。")
+        last_error = f"browser: tunnel failure fast-fail for {tunnel_failure_host(url)}"
+    elif HAS_SCRAPLING:
         tmp_path = None
         try:
             from scrapling.fetchers import StealthySession
-            session_stealth = StealthySession(
-                headless=True,
-                solve_cloudflare=True,
-                network_idle=True,
-                timeout=60000
-            )
+            # P1-D: Playwright proxy dict (same --proxy syntax as
+            # journal_downloader.py); omitted entirely when no proxy.
+            _stealth_kwargs = {
+                "headless": True,
+                "solve_cloudflare": True,
+                "network_idle": True,
+                "timeout": 60000,
+            }
+            _proxy_cfg = playwright_proxy_config(proxy)
+            if _proxy_cfg is not None:
+                _stealth_kwargs["proxy"] = _proxy_cfg
+            session_stealth = StealthySession(**_stealth_kwargs)
             session_stealth.start()
             context = session_stealth.context
             if cookies:
@@ -1310,9 +1526,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 size_kb = os.path.getsize(filepath) / 1024
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
+                tracker.record_success(url)
                 return filepath
         except Exception as e:
             last_error = f"browser: {e}"
+            # P1-D: a tunnel failure counts toward the per-host breaker;
+            # log the fast-fail line exactly when the threshold is reached.
+            if tracker.record_failure(url, e):
+                print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                      f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
             try:
                 session_stealth.close()
             except Exception:
@@ -1385,13 +1607,25 @@ def fetch_page_html(
     bsk_session=None,
     bsk_tab=None,
     bsk_runtime=None,
+    proxy=None,
+    tunnel_tracker=None,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
     Returns (html_content, status, final_url) for accurate base URL resolution.
+
+    P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
+    journal_downloader.py --proxy) is passed to StealthyFetcher.fetch;
+    ``tunnel_tracker`` (default: the run-shared tracker) fast-fails the
+    browser attempt for a host whose tunnel failures reached the threshold.
+    CDP / BrowserSkill paths attach to a live browser and cannot take a
+    per-request proxy, so they are unchanged.
     """
     html_content = ""
     final_url = url
+    # P1-D: resolve the tunnel breaker (explicit tracker wins, else the
+    # run-shared one).
+    tracker = tunnel_tracker if tunnel_tracker is not None else _TUNNEL_TRACKER
 
     # Primary BrowserSkill Method: Fetch via Tencent BrowserSkill session
     if use_bsk:
@@ -1463,6 +1697,14 @@ def fetch_page_html(
             pass
 
     # Method 2: Scrapling StealthyFetcher (bypasses Cloudflare)
+    # P1-D: skip the browser entirely once this host's tunnel failures
+    # tripped the breaker -- the requests path above already had its
+    # chance, and another browser launch would only burn the budget.
+    if HAS_SCRAPLING and tracker.is_tripped(url):
+        if tracker.take_skip_notice(url):
+            print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                  f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器抓取。")
+        return "", 0, url
     if HAS_SCRAPLING:
         sc_args = {
             "headless": not headful,
@@ -1471,6 +1713,10 @@ def fetch_page_html(
             "timeout": 60000,
             "page_action": expand_page_accordions_action,
         }
+        # P1-D: same --proxy syntax as journal_downloader.py; omitted
+        # entirely when no proxy so unset behaviour is unchanged.
+        if proxy:
+            sc_args["proxy"] = proxy
         if cdp_url:
             sc_args["cdp_url"] = cdp_url
             print(f"    (Connecting over CDP to live browser: {cdp_url})")
@@ -1490,10 +1736,16 @@ def fetch_page_html(
                     return "", 0, final_url
                 # Retry without CDP via the handler below.
                 raise RuntimeError("StealthyFetcher returned a blocked page")
+            tracker.record_success(url)
             return html_content, page.status, final_url
         except Exception as e:
             print(f"    StealthyFetcher error: {e}")
-            if cdp_url:
+            # P1-D: a tunnel failure counts toward the per-host breaker;
+            # log the fast-fail line exactly when the threshold is reached.
+            if tracker.record_failure(url, e):
+                print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                      f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
+            if cdp_url and not tracker.is_tripped(url):
                 print("    (Retrying without CDP using standalone stealth browser...)")
                 try:
                     sc_nocdp = dict(sc_args)
@@ -1504,9 +1756,13 @@ def fetch_page_html(
                     if page_fetch_is_failure(html_content, page.status):
                         print("    StealthyFetcher standalone page is blocked or an error page.")
                         return "", 0, final_url
+                    tracker.record_success(url)
                     return html_content, page.status, final_url
                 except Exception as e2:
                     print(f"    StealthyFetcher standalone error: {e2}")
+                    if tracker.record_failure(url, e2):
+                        print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                              f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
 
     return html_content, 0, final_url
 
@@ -1583,6 +1839,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
     """
     try:
         cdp_target = getattr(args, "cdp_url", None)
+        # P1-D: proxy / tunnel breaker for this run's browser attempts.
+        _scrape_proxy = getattr(args, "proxy", None)
         session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
         html_content, status, final_url = fetch_page_html(
@@ -1592,6 +1850,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             args.headful,
             use_bsk=bool(bsk_runtime and getattr(args, "browserskill", False)),
             bsk_runtime=bsk_runtime,
+            proxy=_scrape_proxy,
+            tunnel_tracker=_TUNNEL_TRACKER,
         )
 
         url_to_use = final_url or url
@@ -1620,6 +1880,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 force_browser=True,
                 use_bsk=bool(bsk_runtime and bsk_runtime.enabled),
                 bsk_runtime=bsk_runtime,
+                proxy=_scrape_proxy,
+                tunnel_tracker=_TUNNEL_TRACKER,
             )
             if html_content_b:
                 html_content = html_content_b
@@ -1692,6 +1954,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                     play_cookies,
                     bsk_runtime=bsk_runtime,
                     referer=url_to_use,
+                    proxy=_scrape_proxy,
+                    tunnel_tracker=_TUNNEL_TRACKER,
                 )
         else:
             print("    No additional supplements found beyond CDN files.")
@@ -1751,6 +2015,12 @@ def main():
     parser.add_argument("--skip-cdn", action="store_true", help="Skip CDN brute-force (Tier 0)")
     parser.add_argument("--max-mmc", type=int, default=25, help="Max mmc number to scan in CDN brute-force (default: 25)")
     parser.add_argument("--max-misses", type=int, default=4, help="Max consecutive misses before stopping CDN probe (default: 4)")
+    # P1-D: same --proxy syntax as journal_downloader.py; plumbed to the
+    # StealthyFetcher / StealthySession browser layer.
+    parser.add_argument("--proxy", default=None, help="Proxy URL (e.g. http://user:pass@host:port)")
+    parser.add_argument("--tunnel-fail-threshold", type=int, default=DEFAULT_TUNNEL_FAILURE_THRESHOLD,
+                        help="Consecutive ERR_TUNNEL_CONNECTION_FAILED failures per host before fast-failing "
+                             "that host's browser attempts (default: 3)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
@@ -1759,6 +2029,15 @@ def main():
     add_browserskill_arguments(parser)
     parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
+
+    # P1-D: fail fast on a malformed --proxy instead of silently going
+    # direct (run_download re-validates for direct callers).
+    if args.proxy:
+        try:
+            playwright_proxy_config(args.proxy)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
     with runtime_from_args(args, parser) as bsk_runtime:
         try:
@@ -1769,6 +2048,21 @@ def main():
 
 
 def run_download(args, bsk_runtime):
+
+    # P1-D: validate the proxy up front (fail fast on a typo'd value
+    # instead of silently going direct) and arm the per-host tunnel
+    # breaker for this run with the CLI threshold.
+    proxy = getattr(args, "proxy", None)
+    if proxy:
+        playwright_proxy_config(proxy)
+        print(f"  Proxy: {redact_proxy_url(proxy)}")
+    try:
+        _TUNNEL_TRACKER.threshold = max(
+            1, int(getattr(args, "tunnel_fail_threshold", DEFAULT_TUNNEL_FAILURE_THRESHOLD)
+                   or DEFAULT_TUNNEL_FAILURE_THRESHOLD))
+    except (TypeError, ValueError):
+        _TUNNEL_TRACKER.threshold = DEFAULT_TUNNEL_FAILURE_THRESHOLD
+    _TUNNEL_TRACKER.reset()
 
     config = load_config() if HAS_SCANSCI else {}
     if os.environ.get("ELSEVIER_API_KEY"):
@@ -1864,6 +2158,8 @@ def run_download(args, bsk_runtime):
         bsk_browser=getattr(args, "bsk_browser", None),
         bsk_runtime=bsk_runtime,
         bsk_tab=getattr(args, "bsk_tab", None),
+        proxy=proxy,
+        tunnel_tracker=_TUNNEL_TRACKER,
     )
     if (not html_content or (status is not None and status >= 400)) and bsk_runtime.enabled and not args.browserskill:
         try:
@@ -1931,7 +2227,8 @@ def run_download(args, bsk_runtime):
     if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill:
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
-            url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url
+            url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url,
+            proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
         )
         if html_content_browser:
             url = final_url_browser or url
@@ -1970,7 +2267,8 @@ def run_download(args, bsk_runtime):
                 pass
 
             cdp_html, cdp_status, cdp_final = fetch_page_html(
-                url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0]
+                url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0],
+                proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
             )
             if cdp_html:
                 cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
@@ -2035,7 +2333,8 @@ def run_download(args, bsk_runtime):
         or config.get("_last_api_doi")
     )
     def fetch_mirror(oa_url):
-        return fetch_page_html(oa_url, session, play_cookies, args.headful)
+        return fetch_page_html(oa_url, session, play_cookies, args.headful,
+                               proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER)
 
     mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
     if not candidates or is_inc or args.oa:
@@ -2112,7 +2411,8 @@ def run_download(args, bsk_runtime):
     successful, attempted = download_with_recovery(
         candidates,
         lambda cand: download_file(cand, article_dir, session, play_cookies,
-                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url),
+                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url,
+                                   proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER),
         mirrors, expand_repository_candidates, max_retries=1)
     success_count = len(successful)
     incomplete, reason = evidence.check(successful)
