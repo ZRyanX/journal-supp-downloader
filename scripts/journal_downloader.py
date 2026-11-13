@@ -21,6 +21,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -63,6 +64,10 @@ from supp_finder import (
     commit_temp_file,
     discard_temp_file,
     write_bytes_chunked,
+    # P1-CE: shared phase budget + download priority order.
+    DEFAULT_PHASE_TIMEOUT_SECONDS,
+    resolve_phase_timeout,
+    sort_candidates_by_priority,
 )
 
 
@@ -306,6 +311,85 @@ def guess_filename_from_url(url):
     return extract_filename_from_url(url)
 
 
+# ── P1-CE: Phase A streaming partial results ────────────────────────────────
+# 50-paper retest (sec. 4 item 3): Phase A timed out on 49/50 papers and
+# the candidate list was discarded with the timeout, because the list was
+# only printed after every mirror had been probed. Candidates are now
+# streamed: each newly discovered batch is printed immediately and written
+# to the partial-results file below, so a timeout (or Ctrl-C / kill) leaves
+# the already-found candidates readable on disk. The partial file is
+# replaced by the final list only once discovery completes.
+
+PARTIAL_CANDIDATES_FILENAME = "supplementary_candidates.partial.json"
+FINAL_CANDIDATES_FILENAME = "supplementary_candidates.json"
+
+
+def _candidates_payload(candidates, *, complete, sources_completed, timed_out):
+    return {
+        "complete": bool(complete),
+        "partial": not complete,
+        "timed_out": bool(timed_out),
+        "candidate_count": len(candidates),
+        "sources_completed": list(sources_completed),
+        "candidates": [c.to_dict() for c in candidates],
+    }
+
+
+def _write_candidates_json(output_dir, filename, candidates, *, complete,
+                           sources_completed, timed_out):
+    os.makedirs(output_dir, exist_ok=True)
+    final_path = os.path.join(output_dir, filename)
+    tmp_path = temp_path_for(final_path)
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(_candidates_payload(
+                candidates, complete=complete,
+                sources_completed=sources_completed, timed_out=timed_out),
+                f, ensure_ascii=False, indent=2, default=str)
+        commit_temp_file(tmp_path, final_path)
+    except Exception:
+        discard_temp_file(tmp_path)
+        raise
+    return final_path
+
+
+def write_partial_candidates(output_dir, candidates, *, complete=False,
+                             sources_completed=(), timed_out=False):
+    """Atomically (re)write the partial candidate list (P1-CE).
+
+    The file always says it is incomplete (``complete: false``) while
+    discovery is still running; call :func:`finalize_candidates` once
+    every source has been probed. Safe to call after every batch: the
+    write goes through a same-directory temp file + os.replace, so a
+    kill mid-write never leaves a torn file.
+    """
+    return _write_candidates_json(
+        output_dir, PARTIAL_CANDIDATES_FILENAME, candidates,
+        complete=complete, sources_completed=sources_completed,
+        timed_out=timed_out)
+
+
+def finalize_candidates(output_dir, candidates, *, sources_completed=(),
+                        timed_out=False):
+    """Publish the complete candidate list and retire the partial file."""
+    final_path = _write_candidates_json(
+        output_dir, FINAL_CANDIDATES_FILENAME, candidates, complete=True,
+        sources_completed=sources_completed, timed_out=timed_out)
+    try:
+        os.remove(os.path.join(output_dir, PARTIAL_CANDIDATES_FILENAME))
+    except OSError:
+        pass
+    return final_path
+
+
+def _print_candidate(cand, index):
+    print(f"    [{index}] {cand.filename}")
+    print(f"        URL:     {cand.url}")
+    if cand.link_text:
+        print(f"        Text:    {cand.link_text}")
+    print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download supplementary data from journal articles (Elsevier, Springer, etc.)",
@@ -334,6 +418,13 @@ def main():
     parser.add_argument(
         "--timeout", type=int, default=60000,
         help="Page load timeout in ms (default: 60000)"
+    )
+    parser.add_argument(
+        "--phase-timeout", type=float, default=DEFAULT_PHASE_TIMEOUT_SECONDS,
+        help="Overall budget in seconds for this phase (discovery + "
+             "download). On expiry, already-discovered candidates are kept "
+             "in the partial results file and downloading stops instead of "
+             "being killed mid-list (default: 150)"
     )
     parser.add_argument(
         "--solve-cloudflare", action="store_true", default=True,
@@ -390,6 +481,17 @@ def run_download(args, bsk_runtime):
 
     os.makedirs(args.output_dir, exist_ok=True)
     solve_cf = not args.no_cloudflare and args.solve_cloudflare
+
+    # P1-CE: the phase budget (default 150s, --phase-timeout). The clock
+    # starts here so the publisher fetch, retries, mirrors, and downloads
+    # all share one budget instead of each stage assuming it has 150s.
+    phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
+    phase_deadline = time.monotonic() + phase_timeout
+
+    def _phase_expired():
+        return time.monotonic() >= phase_deadline
+
+    print(f"Phase timeout: {phase_timeout:g}s")
 
     # Normalize DOI input if needed
     input_target = args.url.strip()
@@ -607,10 +709,45 @@ def run_download(args, bsk_runtime):
 
     # --- Step 2: Find supplementary links ---
     print("\n[2/3] Scanning for supplementary data links...")
+    # P1-CE streaming state: candidates already printed + persisted, and
+    # whether the phase budget has run out.
+    _streamed_urls = set()
+    _sources_done = []
+    phase_timed_out = False
+
+    def _persist(fn, *args, **kwargs):
+        # The candidate-list files are best-effort diagnostics: a
+        # failure to write them (e.g. a read-only / EPERM sandbox
+        # episode) must never abort the run itself.
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            print(f"  [Warning] Could not write candidate list file: {exc}")
+            return None
+
+    def _stream(current, source):
+        """Print + persist every candidate not streamed yet (P1-CE)."""
+        if source not in _sources_done:
+            _sources_done.append(source)
+        fresh = [c for c in current if c.url not in _streamed_urls]
+        for cand in fresh:
+            _streamed_urls.add(cand.url)
+            _print_candidate(cand, len(_streamed_urls))
+        if fresh:
+            _persist(
+                write_partial_candidates,
+                article_dir, list(current), complete=False,
+                sources_completed=list(_sources_done),
+                timed_out=_phase_expired())
+        return fresh
+
     diag = find_all_candidates(html_content, effective_base, original_url=args.url)
     candidates = diag.candidates
     evidence = DiscoveryEvidence()
     evidence.observe("publisher", html_content, effective_base)
+    # P1-CE: stream the publisher candidates now -- do not wait for the
+    # retries / mirrors below, which may never finish inside the budget.
+    _stream(candidates, "publisher")
 
     # H3: force a browser render when the static page shows dynamic
     # signals (diag.needs_browser) but the candidate set is empty or the
@@ -621,7 +758,7 @@ def run_download(args, bsk_runtime):
     # count). When the supplements are already complete, do not force.
     _ev_inc, _ = evidence.check(candidates)
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or _ev_inc)
-    if (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector:
+    if not _phase_expired() and (not candidates or diag.is_incomplete or needs_browser_retry) and bsk_runtime.enabled and not args.wait_selector:
         try:
             retry_html, _, retry_url = fetch_page_via_browserskill(
                 fetch_url, timeout=args.timeout / 1000.0, runtime=bsk_runtime,
@@ -641,11 +778,12 @@ def run_download(args, bsk_runtime):
                 raise
             print(f"  [Recovery] BrowserSkill: {exc}")
 
+    _stream(candidates, "browserskill_retry")
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
     # H3 (recomputed after any BSK retry above): diag.is_incomplete is
     # the evidence verdict here, so the flag again follows the task rule.
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or diag.is_incomplete)
-    if (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill:
+    if not _phase_expired() and (diag.is_incomplete or needs_browser_retry) and not args.wait_selector and not args.browserskill:
         print(f"  [Diagnostic] {diag.incomplete_reason}")
         print("  Attempting browser retry with supplementary container wait...")
         retry_kwargs = dict(fetch_kwargs)
@@ -673,6 +811,8 @@ def run_download(args, bsk_runtime):
         except Exception:
             pass
 
+    _stream(candidates, "browser_retry")
+
     # Open Access repository mirror fallback (Unpaywall & OpenAlex)
     doi_val = (
         extract_doi(input_target)
@@ -696,10 +836,27 @@ def run_download(args, bsk_runtime):
 
     mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
-    if not candidates or diag.is_incomplete or args.oa:
+    if _phase_expired():
+        # P1-CE: the budget died before the mirrors; keep what the
+        # publisher page already yielded instead of discarding it.
+        phase_timed_out = True
+    elif not candidates or diag.is_incomplete or args.oa:
         known = {c.url for c in candidates}
-        additions = [c for c in mirrors.discover() if c.url not in known]
+        mirror_found = []
+
+        def _on_mirror_candidate(cand):
+            # Stream each mirror candidate as it arrives; the partial
+            # file holds publisher + mirror candidates found so far.
+            if cand.url not in known and all(c.url != cand.url for c in mirror_found):
+                mirror_found.append(cand)
+                _stream(candidates + mirror_found, "oa_mirrors")
+
+        additions = [c for c in mirrors.discover(on_candidate=_on_mirror_candidate) if c.url not in known]
         candidates = additions + candidates if args.oa else candidates + additions
+    if _phase_expired():
+        # The mirror round itself ran past the budget; the candidates it
+        # found are already streamed, but no further stage may start.
+        phase_timed_out = True
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
 
@@ -709,6 +866,11 @@ def run_download(args, bsk_runtime):
             print(f"  [Diagnostic] {diag.incomplete_reason}")
         if diag.excluded_links:
             print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
+        if phase_timed_out:
+            _persist(write_partial_candidates, article_dir, candidates, complete=False,
+                     sources_completed=list(_sources_done), timed_out=True)
+            print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached with no candidates; "
+                  f"partial results saved to {os.path.join(article_dir, PARTIAL_CANDIDATES_FILENAME)}")
         print("  Try running with --headful and --no-cloudflare to debug.")
         return
 
@@ -716,18 +878,33 @@ def run_download(args, bsk_runtime):
     diag.candidates = candidates
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 
+    # P1-CE: download in priority order (real supplement files first,
+    # external/repository pages last); the sort is lossless, so the final
+    # list below is the order downloads will be attempted in.
+    discovery_order = list(candidates)
+    candidates = sort_candidates_by_priority(candidates)
+    diag.candidates = candidates
+
     print(f"  Found {len(candidates)} potential supplementary file(s):")
     for i, cand in enumerate(candidates, 1):
-        print(f"    [{i}] {cand.filename}")
-        print(f"        URL:     {cand.url}")
-        if cand.link_text:
-            print(f"        Text:    {cand.link_text}")
-        print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+        _print_candidate(cand, i)
+    if candidates != discovery_order:
+        print("  [Info] Candidates reordered by priority for download "
+              "(real supplement files first, external pages last).")
 
     if evidence.describe():
         print(f"  [Info] {evidence.describe()}")
     if diag.is_incomplete:
         print(f"  [Warning] Result may be incomplete: {diag.incomplete_reason}")
+
+    if phase_timed_out:
+        _persist(write_partial_candidates, article_dir, candidates, complete=False,
+                 sources_completed=list(_sources_done), timed_out=True)
+        print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+              f"partial results saved to {os.path.join(article_dir, PARTIAL_CANDIDATES_FILENAME)}")
+    else:
+        _persist(finalize_candidates, article_dir, candidates,
+                 sources_completed=list(_sources_done))
 
     if args.list_only:
         return
@@ -743,7 +920,7 @@ def run_download(args, bsk_runtime):
         candidates,
         lambda cand: download_file(cand, article_dir, cookies=cookies, bsk_runtime=bsk_runtime,
                                    referer=cand.source_url or final_url),
-        mirrors, expand_repository_candidates, max_retries=1)
+        mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
     incomplete, reason = evidence.check(successful)

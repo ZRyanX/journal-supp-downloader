@@ -1675,6 +1675,85 @@ def _merge_duplicate_candidate(existing: "Candidate", cand: "Candidate") -> None
         existing.filename = cand.filename
 
 
+# ── P1-CE: phase budget + candidate priority ────────────────────────────────
+# 50-paper retest (~/workspace/jsd-50-paper-test-p1-report.md, sec. 4 item 3):
+# Phase A timed out on 49/50 papers and Phase B on 41/50 against a 150s
+# budget that only existed in the test runner, so nothing in the tools
+# knew about it. The budget below is that same 150s, now a real,
+# configurable parameter shared by both entry points.
+
+DEFAULT_PHASE_TIMEOUT_SECONDS = 150
+
+
+def resolve_phase_timeout(value, default=DEFAULT_PHASE_TIMEOUT_SECONDS):
+    """Normalize a --phase-timeout value to seconds (float).
+
+    Accepts numbers and numeric strings; anything missing, non-numeric,
+    or <= 0 falls back to *default* (150s) instead of failing the run or
+    silently disabling the budget.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if seconds <= 0 or seconds != seconds:  # <= 0 or NaN
+        return float(default)
+    return seconds
+
+
+# A .pdf candidate is a real supplement file here (candidates are already
+# supplementary-filtered); .pdf is not in DATA_EXTENSIONS because that set
+# is also used to reject bare article PDFs during extraction.
+_PRIORITY_DATA_EXTENSIONS = frozenset(DATA_EXTENSIONS) | {".pdf"}
+
+
+def candidate_priority(cand: "Candidate") -> int:
+    """Priority tier for download order (P1-CE; lower runs first).
+
+    0 -- a real supplement file: the URL/filename ends in a data
+         extension (.xlsx/.xls/.csv/.tsv/.docx/.pdf/.zip/...).
+    1 -- explicitly supplementary-marked but no data extension (a
+         supplementary landing page, a .html supplement table, a
+         repository record labelled as supplementary, or a candidate
+         known to cover table ids).
+    2 -- everything else (external / repository / other pages).
+
+    Nothing is ever dropped by priority; tier 2 only runs last, so a
+    150s budget is spent on real files before junk/external candidates.
+    """
+    for source in (getattr(cand, "url", "") or "", getattr(cand, "filename", "") or ""):
+        ext = check_data_extension(source) if source else None
+        if ext and ext in _PRIORITY_DATA_EXTENSIONS:
+            return 0
+        path = urllib.parse.urlparse(source).path.lower()
+        if path.endswith(".pdf"):
+            return 0
+    label = " ".join(
+        str(v) for v in (
+            getattr(cand, "link_text", ""),
+            getattr(cand, "section", ""),
+            getattr(cand, "match_rule", ""),
+        ) if v
+    )
+    if (
+        getattr(cand, "covered_table_ids", None)
+        or getattr(cand, "section", "") == "supplementary_section"
+        or is_explicit_supp_table(getattr(cand, "link_text", "") or "")
+        or SUPP_KEYWORD_PATTERN.search(label)
+    ):
+        return 1
+    return 2
+
+
+def sort_candidates_by_priority(candidates):
+    """Return candidates in download order: tier 0, then 1, then 2.
+
+    Stable within a tier (discovery order is kept) and lossless -- the
+    result is a permutation of the input, never a filter.
+    """
+    return sorted(candidates, key=candidate_priority)
+
+
 def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
     """Table ids named by a candidate's own label, filename, or attributes (H6)."""
     ids: Set[str] = set()

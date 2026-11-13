@@ -93,6 +93,10 @@ from supp_finder import (
     commit_temp_file,
     discard_temp_file,
     write_bytes_chunked,
+    # P1-CE: shared phase budget + download priority order.
+    DEFAULT_PHASE_TIMEOUT_SECONDS,
+    resolve_phase_timeout,
+    sort_candidates_by_priority,
 )
 
 try:
@@ -2049,6 +2053,13 @@ def main():
     parser.add_argument("--tunnel-fail-threshold", type=int, default=DEFAULT_TUNNEL_FAILURE_THRESHOLD,
                         help="Consecutive ERR_TUNNEL_CONNECTION_FAILED failures per host before fast-failing "
                              "that host's browser attempts (default: 3)")
+    # P1-CE: same single-phase budget as journal_downloader.py (default
+    # 150s); the download loop stops cleanly at the deadline instead of
+    # being killed mid-list.
+    parser.add_argument("--phase-timeout", type=float, default=DEFAULT_PHASE_TIMEOUT_SECONDS,
+                        help="Overall budget in seconds for this phase (discovery + download). "
+                             "On expiry, downloading stops and already-downloaded files are kept "
+                             "(default: 150)")
     parser.add_argument("--list-only", action="store_true", help="Only list found links with diagnostic evidence, don't download")
     parser.add_argument("--oa", action="store_true", help="Prioritize / prefer Open Access repository mirrors (PMC, Europe PMC, etc.) via Unpaywall & OpenAlex")
     parser.add_argument("--no-oa", action="store_true", help="Disable automatic Open Access repository mirror query and penetration")
@@ -2076,6 +2087,12 @@ def main():
 
 
 def run_download(args, bsk_runtime):
+
+    # P1-CE: the phase budget (default 150s, --phase-timeout), shared by
+    # discovery and the download loop below.
+    phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
+    phase_deadline = time.monotonic() + phase_timeout
+    print(f"  Phase timeout: {phase_timeout:g}s")
 
     # P1-D: validate the proxy up front (fail fast on a typo'd value
     # instead of silently going direct) and arm the per-host tunnel
@@ -2411,6 +2428,11 @@ def run_download(args, bsk_runtime):
     # P1-B: tiers / mirrors can re-discover the same file under another URL
     # (Springer vs PMC, :443 vs plain); download it once.
     candidates = dedupe_candidates(candidates)
+    # P1-CE: download in priority order (real supplement files first,
+    # external/repository pages last); the sort is lossless, so the list
+    # below is the order downloads will be attempted in.
+    discovery_order = list(candidates)
+    candidates = sort_candidates_by_priority(candidates)
     diag.candidates = candidates
     diag.is_incomplete, diag.incomplete_reason = evidence.check(candidates)
 
@@ -2421,6 +2443,9 @@ def run_download(args, bsk_runtime):
         if cand.link_text:
             print(f"        Text:    {cand.link_text}")
         print(f"        Section: {cand.section} | Rule: {cand.match_rule}")
+    if candidates != discovery_order:
+        print("  [Info] Candidates reordered by priority for download "
+              "(real supplement files first, external pages last).")
 
     if evidence.describe():
         print(f"  [Info] {evidence.describe()}")
@@ -2444,7 +2469,7 @@ def run_download(args, bsk_runtime):
         lambda cand: download_file(cand, article_dir, session, play_cookies,
                                    bsk_runtime=bsk_runtime, referer=cand.source_url or url,
                                    proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER),
-        mirrors, expand_repository_candidates, max_retries=1)
+        mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
     success_count = len(successful)
     incomplete, reason = evidence.check(successful)
     if incomplete:
@@ -2452,7 +2477,12 @@ def run_download(args, bsk_runtime):
 
     # Check if page text references additional MMCs not in candidate URLs
     extra_cdn_files = []
-    if pii and not args.skip_cdn and not args.list_only:
+    # P1-CE: the extra CDN probe is a new stage, not part of the download
+    # loop; skip it once the phase budget is gone.
+    if time.monotonic() >= phase_deadline:
+        print(f"  [Warning] Phase timeout ({phase_timeout:g}s budget) reached; "
+              f"skipping extra CDN probe.")
+    elif pii and not args.skip_cdn and not args.list_only:
         page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
         downloaded_mmcs = set()
         manifest = load_download_manifest(article_dir)
