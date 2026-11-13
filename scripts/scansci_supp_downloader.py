@@ -2225,37 +2225,92 @@ SEED_CANDIDATES_FILENAMES = (
 )
 
 
+def _seed_search_dirs(article_dir):
+    """Directories to search for a Phase A seed list, in order.
+
+    article_dir itself first, then each immediate subdirectory of
+    its parent (the -o output dir), sorted by name for determinism.
+    Phase A writes the list into <output>/<Phase A title>/ while
+    Phase B's article_dir can be a different sibling --
+    <output>/supplements, or a title extracted from a different page
+    source (publisher HTML vs OA mirror title, or a failed fetch
+    leaving the placeholder) -- and run_download only ever
+    migrates/merges <output>/supplements, never a sibling title dir,
+    so the file is often one directory over.
+
+    Only one level down: the seed payload carries no DOI/title to
+    attribute a file with, so a recursive walk could pick up another
+    article's list when -o is shared across papers. With the usual
+    per-article -o (one output dir per paper, as the test runner
+    uses), every sibling here is a title variant of the same article.
+    """
+    root = os.path.abspath(article_dir)
+    dirs = [root]
+    parent = os.path.dirname(root)
+    if parent and parent != root:
+        try:
+            entries = sorted(os.scandir(parent), key=lambda e: e.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir and os.path.abspath(entry.path) != root:
+                dirs.append(os.path.abspath(entry.path))
+    return dirs
+
+
 def load_seed_candidates(article_dir):
-    """Load the Phase A candidate list from article_dir (P1-E2).
+    """Load the Phase A candidate list for this article (P1-E2).
 
     Phase A (journal_downloader.py) streams every discovered candidate
     to supplementary_candidates(.partial).json in the article directory
     so a timeout leaves them readable on disk. Phase B used to
     re-discover from scratch and never read that file: round 3
     preserved 348 candidates across 15 papers that nobody downloaded
-    from. The final list wins over the partial one; a corrupt file
-    falls through to the next instead of aborting the run; entries
-    without a URL are skipped.
+    from.
 
-    Returns (candidates, source_filename) -- ([], None) when nothing
-    usable is on disk.
+    The list is searched for in article_dir itself first, then in
+    each immediate subdirectory of the output dir (see
+    _seed_search_dirs): Phase A and Phase B can resolve different
+    titles for the same article, so the file often sits in a sibling
+    title directory. The final list wins over the partial one across
+    locations; within one filename kind, article_dir wins, then
+    siblings in name order. A corrupt file falls through to the next
+    candidate location instead of aborting the run; a parseable file
+    -- even one with zero candidates -- is authoritative and stops
+    the search, as before. Entries without a URL are skipped.
+
+    Returns (candidates, source) -- ([], None) when nothing usable
+    is on disk. source is the bare filename for a file in article_dir
+    itself, otherwise "<subdir>/<filename>" so the log line shows
+    which title directory the seed came from.
     """
+    search_dirs = _seed_search_dirs(article_dir)
+    root_abs = os.path.abspath(article_dir)
     for name in SEED_CANDIDATES_FILENAMES:
-        path = os.path.join(article_dir, name)
-        if not os.path.exists(path):
-            continue
-        try:
-            with open(path, encoding="utf-8") as f:
-                payload = json.load(f)
-        except Exception:
-            continue
-        entries = payload.get("candidates", []) if isinstance(payload, dict) else []
-        cands = []
-        for entry in entries:
-            cand = Candidate.from_dict(entry)
-            if cand is not None:
-                cands.append(cand)
-        return cands, name
+        for directory in search_dirs:
+            path = os.path.join(directory, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    payload = json.load(f)
+            except Exception:
+                continue
+            entries = payload.get("candidates", []) if isinstance(payload, dict) else []
+            cands = []
+            for entry in entries:
+                cand = Candidate.from_dict(entry)
+                if cand is not None:
+                    cands.append(cand)
+            if os.path.abspath(directory) == root_abs:
+                source = name
+            else:
+                source = os.path.join(os.path.basename(directory), name)
+            return cands, source
     return [], None
 
 
@@ -2591,6 +2646,11 @@ def run_download(args, bsk_runtime):
     # directory (separate Phase A process, same -o). Without this, a
     # Phase A timeout preserved candidates on disk that Phase B never
     # downloaded from (round 3: 348 candidates across 15 papers).
+    # P1-E remainder: the loader also checks the sibling title
+    # directories under the same output dir -- Phase A and Phase B can
+    # resolve different titles, so the list often sits one directory
+    # over from article_dir (final still wins over partial, corrupt
+    # files still fall through to the next location).
     seed_candidates, seed_source = load_seed_candidates(article_dir)
     if seed_candidates:
         candidates, seeds_added = merge_seed_candidates(candidates, seed_candidates)

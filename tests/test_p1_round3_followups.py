@@ -85,49 +85,58 @@ def test_candidate_from_dict_rejects_urless_entries():
 # ── E: load_seed_candidates ───────────────────────────────────────────────
 
 def test_load_seed_candidates_missing_files(tmp_path):
-    cands, source = ssd.load_seed_candidates(str(tmp_path))
+    # article_dir is a child of the per-article output dir (as in
+    # run_download: <output>/supplements or <output>/<title>); its
+    # parent tmp_path holds no sibling seed files.
+    cands, source = ssd.load_seed_candidates(str(tmp_path / "supplements"))
     assert cands == []
     assert source is None
 
 
 def test_load_seed_candidates_reads_partial(tmp_path):
+    article_dir = tmp_path / "supplements"
     _write_seed_file(
-        tmp_path, "supplementary_candidates.partial.json",
+        article_dir, "supplementary_candidates.partial.json",
         [_cand("https://example.com/S1.xlsx"),
          _cand("https://example.com/S2.csv", "S2.csv")])
-    cands, source = ssd.load_seed_candidates(str(tmp_path))
+    cands, source = ssd.load_seed_candidates(str(article_dir))
     assert source == "supplementary_candidates.partial.json"
     assert [c.url for c in cands] == [
         "https://example.com/S1.xlsx", "https://example.com/S2.csv"]
 
 
 def test_load_seed_candidates_prefers_final_over_partial(tmp_path):
-    _write_seed_file(tmp_path, "supplementary_candidates.partial.json",
+    article_dir = tmp_path / "supplements"
+    _write_seed_file(article_dir, "supplementary_candidates.partial.json",
                      [_cand("https://example.com/old.xlsx", "old.xlsx")])
-    _write_seed_file(tmp_path, "supplementary_candidates.json",
+    _write_seed_file(article_dir, "supplementary_candidates.json",
                      [_cand("https://example.com/new.xlsx", "new.xlsx")],
                      complete=True)
-    cands, source = ssd.load_seed_candidates(str(tmp_path))
+    cands, source = ssd.load_seed_candidates(str(article_dir))
     assert source == "supplementary_candidates.json"
     assert [c.url for c in cands] == ["https://example.com/new.xlsx"]
 
 
 def test_load_seed_candidates_corrupt_final_falls_back_to_partial(tmp_path):
-    (tmp_path / "supplementary_candidates.json").write_text(
+    article_dir = tmp_path / "supplements"
+    article_dir.mkdir(parents=True, exist_ok=True)
+    (article_dir / "supplementary_candidates.json").write_text(
         "{not json", encoding="utf-8")
-    _write_seed_file(tmp_path, "supplementary_candidates.partial.json",
+    _write_seed_file(article_dir, "supplementary_candidates.partial.json",
                      [_cand("https://example.com/S1.xlsx")])
-    cands, source = ssd.load_seed_candidates(str(tmp_path))
+    cands, source = ssd.load_seed_candidates(str(article_dir))
     assert source == "supplementary_candidates.partial.json"
     assert len(cands) == 1
 
 
 def test_load_seed_candidates_all_corrupt_returns_empty(tmp_path):
-    (tmp_path / "supplementary_candidates.json").write_text(
+    article_dir = tmp_path / "supplements"
+    article_dir.mkdir(parents=True, exist_ok=True)
+    (article_dir / "supplementary_candidates.json").write_text(
         "{not json", encoding="utf-8")
-    (tmp_path / "supplementary_candidates.partial.json").write_text(
+    (article_dir / "supplementary_candidates.partial.json").write_text(
         "[also not json", encoding="utf-8")
-    cands, source = ssd.load_seed_candidates(str(tmp_path))
+    cands, source = ssd.load_seed_candidates(str(article_dir))
     assert cands == []
     assert source is None
 
@@ -164,6 +173,127 @@ def test_merge_seed_candidates_empty_seeds():
     merged, added = ssd.merge_seed_candidates(existing, [])
     assert added == 0
     assert merged == existing
+
+
+# ── E remainder: cross-directory seed search ────────────────────────────
+# Round-3 report sec. 4 item 4, remainder: load_seed_candidates only
+# looked in article_dir itself, but Phase A writes the list into
+# <output>/<Phase A title>/ while Phase B's article_dir can be a
+# different sibling -- <output>/supplements, or a title extracted from
+# a different page source (publisher HTML vs OA mirror title, or a
+# failed fetch leaving the placeholder). run_download only ever
+# migrates/merges <output>/supplements into its own title dir
+# (scansci_supp_downloader.py, ~2515/2534), never a sibling title
+# dir, and the seed load runs after that migration -- so the file sat
+# one directory over and was missed. These tests pin the miss first.
+
+def test_load_seed_candidates_finds_partial_in_sibling_title_dir(tmp_path):
+    """Repro: partial lives in the Phase A title dir, article_dir is
+    the Phase B dir (supplements) -- the old implementation returned []."""
+    title_dir = tmp_path / "Real Article Title"
+    _write_seed_file(
+        title_dir, "supplementary_candidates.partial.json",
+        [_cand("https://example.com/S1.xlsx"),
+         _cand("https://example.com/S2.csv", "S2.csv")])
+    article_dir = tmp_path / "supplements"
+    article_dir.mkdir()
+    cands, source = ssd.load_seed_candidates(str(article_dir))
+    assert source == (
+        "Real Article Title/supplementary_candidates.partial.json")
+    assert [c.url for c in cands] == [
+        "https://example.com/S1.xlsx", "https://example.com/S2.csv"]
+
+
+def test_load_seed_candidates_finds_seed_when_article_dir_missing(tmp_path):
+    """Phase B's target title dir may not exist on disk at all (its
+    fetch failed, Tier 0 wrote nothing): the sibling is still found."""
+    title_dir = tmp_path / "Real Article Title"
+    _write_seed_file(
+        title_dir, "supplementary_candidates.partial.json",
+        [_cand("https://example.com/S1.xlsx")])
+    cands, source = ssd.load_seed_candidates(
+        str(tmp_path / "Other Title"))
+    assert source == (
+        "Real Article Title/supplementary_candidates.partial.json")
+    assert [c.url for c in cands] == ["https://example.com/S1.xlsx"]
+
+
+def test_load_seed_candidates_sibling_final_beats_root_partial(tmp_path):
+    """final-over-partial holds across locations: a complete Phase A
+    run's list in a sibling title dir beats a stale partial in
+    article_dir itself."""
+    article_dir = tmp_path / "supplements"
+    _write_seed_file(article_dir, "supplementary_candidates.partial.json",
+                     [_cand("https://example.com/old.xlsx", "old.xlsx")])
+    title_dir = tmp_path / "Real Article Title"
+    _write_seed_file(title_dir, "supplementary_candidates.json",
+                     [_cand("https://example.com/new.xlsx", "new.xlsx")],
+                     complete=True)
+    cands, source = ssd.load_seed_candidates(str(article_dir))
+    assert source == "Real Article Title/supplementary_candidates.json"
+    assert [c.url for c in cands] == ["https://example.com/new.xlsx"]
+
+
+def test_load_seed_candidates_root_final_beats_sibling_final(tmp_path):
+    """Within one filename kind, article_dir itself wins over a
+    sibling, and siblings are tried in name order (deterministic)."""
+    article_dir = tmp_path / "supplements"
+    _write_seed_file(article_dir, "supplementary_candidates.json",
+                     [_cand("https://example.com/root.xlsx", "root.xlsx")],
+                     complete=True)
+    _write_seed_file(tmp_path / "A Title", "supplementary_candidates.json",
+                     [_cand("https://example.com/a.xlsx", "a.xlsx")],
+                     complete=True)
+    _write_seed_file(tmp_path / "Z Title", "supplementary_candidates.json",
+                     [_cand("https://example.com/z.xlsx", "z.xlsx")],
+                     complete=True)
+    cands, source = ssd.load_seed_candidates(str(article_dir))
+    assert source == "supplementary_candidates.json"
+    assert [c.url for c in cands] == ["https://example.com/root.xlsx"]
+
+
+def test_load_seed_candidates_corrupt_final_falls_through_across_dirs(tmp_path):
+    """A corrupt final in article_dir falls through to the good
+    partial in the sibling title dir (and vice versa: corrupt sibling
+    final falls through to the sibling partial)."""
+    article_dir = tmp_path / "supplements"
+    article_dir.mkdir(parents=True, exist_ok=True)
+    (article_dir / "supplementary_candidates.json").write_text(
+        "{not json", encoding="utf-8")
+    title_dir = tmp_path / "Real Article Title"
+    _write_seed_file(
+        title_dir, "supplementary_candidates.partial.json",
+        [_cand("https://example.com/S1.xlsx")])
+    cands, source = ssd.load_seed_candidates(str(article_dir))
+    assert source == (
+        "Real Article Title/supplementary_candidates.partial.json")
+    assert [c.url for c in cands] == ["https://example.com/S1.xlsx"]
+
+    (article_dir / "supplementary_candidates.json").unlink()
+    (title_dir / "supplementary_candidates.json").write_text(
+        "{not json", encoding="utf-8")
+    cands, source = ssd.load_seed_candidates(str(article_dir))
+    assert source == (
+        "Real Article Title/supplementary_candidates.partial.json")
+    assert [c.url for c in cands] == ["https://example.com/S1.xlsx"]
+
+
+def test_load_seed_candidates_ignores_nested_and_misnamed_files(tmp_path):
+    """Only immediate subdirectories of the output dir and only the
+    two exact filenames count: a list nested two levels down, a
+    misnamed backup, and a stray file in the output root must not be
+    mistaken for a seed."""
+    nested = tmp_path / "Real Article Title" / "nested"
+    _write_seed_file(
+        nested, "supplementary_candidates.partial.json",
+        [_cand("https://example.com/nested.xlsx", "nested.xlsx")])
+    (tmp_path / "Real Article Title" / "supplementary_candidates.json.bak"
+     ).write_text('{"candidates": []}', encoding="utf-8")
+    (tmp_path / "supplementary_candidates.json").write_text(
+        "{not json", encoding="utf-8")
+    cands, source = ssd.load_seed_candidates(str(tmp_path / "supplements"))
+    assert cands == []
+    assert source is None
 
 
 # ── G: preserved Tier A/Tier 0 files get a countable Done line ───────────
