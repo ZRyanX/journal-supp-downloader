@@ -2440,6 +2440,40 @@ def _extract_plos_candidates(soup: BeautifulSoup, base_url: str, add_func):
         ))
 
 
+def _is_plausible_feat_suppl_link(url: str, link_text: str, filename: str) -> bool:
+    """True when a PMC ``click_feat_suppl`` link actually points at
+    supplementary content (P1 round-3 minor (b)).
+
+    PMC puts ``data-ga-action="click_feat_suppl"`` on *every* external
+    link (``usa-link--external``) -- verified live on PMC12434933
+    (round-3 #50, a Heliyon corrigendum with no supplements): the
+    article's own DOI link *and* the Twingate blog glossary reference
+    link both carry it, so the bare attribute is not a supplement
+    signal at all. A link only counts when its URL, link text or
+    filename carries supplementary signal: a PMC /bin/ attachment, a
+    data extension, a supplementary keyword / table filename / MMC id,
+    or a repository/component DOI. Anything else -- a blog page, a DOI
+    link, a glossary entry -- is dropped by the caller.
+    """
+    parsed = urllib.parse.urlparse(url or "")
+    path = (parsed.path or "").lower()
+    if "/bin/" in path:
+        return True
+    if check_data_extension(url or "") or check_data_extension(filename or ""):
+        return True
+    for value in (url or "", link_text or "", filename or ""):
+        if not value:
+            continue
+        if (
+            SUPP_KEYWORD_PATTERN.search(value)
+            or TABLE_FILENAME_PATTERN.search(value)
+            or MMC_PATTERN.search(value)
+            or REPO_OR_COMPONENT_DOI_PATTERN.search(value)
+        ):
+            return True
+    return False
+
+
 def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=None):
     """PMC (PubMed Central) and Europe PMC supplementary material extraction."""
     # 1. Links inside PMC supplementary sections
@@ -2494,6 +2528,13 @@ def _extract_pmc_candidates(soup: BeautifulSoup, base_url: str, add_func, diag=N
             if is_excluded_url(full_url, base_url=base_url, text=link_text, diag=diag) or is_article_figure_url(full_url, text=link_text):
                 continue
             fname = a.get("download") or extract_filename_from_url(full_url, default_name=link_text)
+            # P1 round-3 minor (b): PMC stamps click_feat_suppl on every
+            # external link (DOI links, reference links, blog pages), so
+            # the attribute alone mints false candidates (#50 Twingate).
+            # Only links that actually point at supplementary content
+            # become candidates; the rest are skipped, not excluded.
+            if not _is_plausible_feat_suppl_link(full_url, link_text, fname):
+                continue
             add_func(Candidate(
                 url=full_url,
                 filename=sanitize_filename(fname),
