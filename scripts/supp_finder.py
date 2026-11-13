@@ -3118,6 +3118,112 @@ def page_fetch_is_failure(html: Optional[str], status: Optional[int] = None) -> 
     return bool(html) and is_blocked_page(html)
 
 
+def single_line(text, max_len: int = 1000) -> str:
+    """Collapse multi-line exception / reason text to a single line.
+
+    P1-F: Playwright exceptions span several lines (``... at <url>\\nCall
+    log:\\n  - navigating to ...\\n)``), so a ``FAIL (...)`` line printed
+    verbatim has its closing paren 2-3 lines later and a single-line
+    regex misreads it as a bare FAIL. Only the formatting changes; the
+    reason content is preserved (truncated at *max_len* with an ellipsis
+    when absurdly long).
+    """
+    flat = re.sub(r"\s+", " ", str(text)).strip()
+    if len(flat) > max_len:
+        flat = flat[:max_len].rstrip() + " \u2026"
+    return flat
+
+
+def remove_invalid_existing_download(filepath: str, manifest=None, reason: str = "") -> bool:
+    """Delete a previously landed file that fails validation (P1-F).
+
+    The H9 download paths validate a temp file before committing, so
+    garbage normally never lands; this is the cleanup for files an
+    earlier run already left on disk. The file is removed from disk and
+    its manifest entry is dropped, so it is not [SKIP]-counted as a
+    success and does not enter completeness statistics. Returns True
+    when a file was removed.
+    """
+    name = os.path.basename(filepath)
+    try:
+        os.remove(filepath)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if manifest is not None and name in manifest:
+        manifest.pop(name, None)
+        try:
+            save_download_manifest(os.path.dirname(filepath) or ".", manifest)
+        except Exception:
+            pass
+    print(f"  [Removed] {name} (invalid existing download: {reason})")
+    return True
+
+
+# ── P1-F: downloaded-file authenticity ──────────────────────────────────────
+# A bare "Table N.html" / "Appendix N.html" filename is an in-article
+# table rendered as a web page, never a supplement -- even when the page
+# contains a genuine data table (BMC #43/#44, eLife #34/#36/#37; #36
+# landed 18 copies of Appendix 7.html). "Table S1.html" and
+# "Supplementary Table S1.html" do NOT match: the S / Supplementary
+# marker is what makes a table a supplement.
+_NAV_PAGE_FILENAME_RE = re.compile(
+    r"^(?:table|appendix)[\s_\-]+\d+(?:_\d+)?\.html?$", re.IGNORECASE
+)
+# NOTE on the separator above: the evidenced navigation pages are
+# "Table 1.html" / "Appendix 7.html" (word, separator, number). A bare
+# "table1.html" with no separator is NOT flagged: that is the D1
+# rename path, where a .bin download that turns out to be an HTML
+# table attachment is legitimately renamed to .html
+# (test_d1_download_html_table_rename).
+
+# Challenge / anti-bot markers that never occur in genuine supplement
+# data, so they reject even without any HTML context (a challenge wall
+# served as .csv / .bin is still a wall).
+_CHALLENGE_CONTENT_MARKERS = (
+    b"client challenge",
+    b"challenge-platform",
+    b"cf-browser-verification",
+    b"checking your browser",
+    b"verify you are human",
+    b"please verify you are human",
+    b"human verification",
+)
+
+
+def _download_basename(filepath: str) -> str:
+    """The intended download name for *filepath*, undoing the H9 temp
+    naming (``.<stem>.<random><ext>``) so a staged ``Table 1.html``
+    is still recognised as ``Table 1.html``."""
+    base = os.path.basename(filepath)
+    stem, ext = os.path.splitext(base)
+    if stem.startswith("."):
+        inner = stem[1:]
+        stem = inner.rsplit(".", 1)[0] if "." in inner else inner
+        base = stem + ext
+    return base
+
+
+def _has_genuine_data_table(sample_lower: bytes) -> bool:
+    """True when *sample_lower* holds a real multi-row data table
+    (at least two rows with cells), as opposed to a one-row layout
+    table on a licence / navigation page."""
+    return sample_lower.count(b"<tr") >= 2 and (
+        sample_lower.count(b"<td") + sample_lower.count(b"<th") >= 2
+    )
+
+
+def _looks_like_license_page(sample_lower: bytes) -> bool:
+    """True when the page presents itself as a Creative Commons licence
+    deed (title or licences link), rather than merely mentioning a
+    licence in passing."""
+    title_match = re.search(rb"<title[^>]*>(.*?)</title>", sample_lower, re.S)
+    if title_match and b"creative commons" in title_match.group(1):
+        return True
+    return b"creativecommons.org/licenses" in sample_lower
+
+
 def validate_downloaded_file(
     filepath: str,
     content_bytes: Optional[bytes] = None,
@@ -3136,6 +3242,15 @@ def validate_downloaded_file(
     file_size = os.path.getsize(filepath)
     if file_size == 0:
         return False, "Downloaded file is empty (0 bytes)"
+
+    # P1-F: a bare "Table N.html" / "Appendix N.html" name is a
+    # navigation page, not a supplement -- whatever its content is.
+    _nav_name = _download_basename(filepath)
+    if _NAV_PAGE_FILENAME_RE.match(_nav_name):
+        return False, (
+            f"Navigation-page filename {_nav_name!r}: an in-article "
+            "Table/Appendix page, not a supplement file"
+        )
 
     if response_status >= 400:
         return False, f"Server returned HTTP error status {response_status}"
@@ -3215,6 +3330,26 @@ def validate_downloaded_file(
     if header_bytes.startswith(b"\x93NUMPY"):
         return True, f"Valid NumPy array signature ({file_size} bytes)"
 
+    # P1-F: a challenge / anti-bot wall is garbage even when it carries
+    # a table or arrives under a data extension. These markers never
+    # occur in genuine supplement data, so no HTML context is required.
+    # (Binary signatures above already returned, so this only sees
+    # text / HTML-ish content.)
+    _sample = content_bytes[:65536] if content_bytes is not None else None
+    if _sample is None:
+        try:
+            with open(filepath, "rb") as _f:
+                _sample = _f.read(65536)
+        except Exception:
+            _sample = header_bytes
+    _sample_lower = _sample.lower()
+    for _marker in _CHALLENGE_CONTENT_MARKERS:
+        if _marker in _sample_lower:
+            return False, (
+                "Challenge/anti-bot page detected: "
+                f"{_marker.decode('latin1')}"
+            )
+
     # 2. Check for HTML content (either via HTML tags or text/html Content-Type)
     header_lower = header_bytes.lower()
     is_html_tag = any(tag in header_lower for tag in [b"<!doctype html", b"<html", b"<head", b"<body", b"<table"])
@@ -3223,6 +3358,12 @@ def validate_downloaded_file(
     hard_error_indicators = [
         b"challenge-platform",
         b"cf-browser-verification",
+        b"client challenge",
+        b"checking your browser",
+        b"verify you are human",
+        b"attention required",
+        b"turnstile",
+        b"human verification",
         b"just a moment",
         b"access denied",
         b"403 forbidden",
@@ -3265,6 +3406,13 @@ def validate_downloaded_file(
         for indicator in hard_error_indicators:
             if indicator in header_lower or indicator in sample_lower:
                 return False, f"HTML error/challenge/login page detected: {indicator.decode('latin1')}"
+
+        # P1-F: a Creative Commons licence deed is not a supplement. A
+        # one-row layout table must not rescue it; a genuine multi-row
+        # data table (e.g. a real HTML supplement that links its
+        # licence) still passes.
+        if _looks_like_license_page(sample_lower) and not _has_genuine_data_table(sample_lower):
+            return False, "Creative Commons licence page detected"
 
         # Check if it contains a genuine data table structure (D1)
         has_table_structure = (

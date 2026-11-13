@@ -35,6 +35,8 @@ from supp_finder import (
     find_all_candidates,
     is_result_obviously_incomplete,
     validate_downloaded_file,
+    single_line,
+    remove_invalid_existing_download,
     sanitize_filename,
     extract_filename_from_url,
     extract_filename_from_content_disposition,
@@ -193,10 +195,13 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
 
     # Check if already exists and is valid for this exact URL
     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-        is_val, _ = validate_downloaded_file(filepath)
+        is_val, reason = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
             return filepath
+        # P1-F: garbage landed by an earlier run is removed, not
+        # [SKIP]-counted as a success; the download below retries it.
+        remove_invalid_existing_download(filepath, manifest, reason)
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     # H9: the body is written in bounded chunks to a same-directory temp
@@ -249,10 +254,11 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
             fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
             filepath = os.path.join(output_dir, fname)
             if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                is_val, _ = validate_downloaded_file(filepath)
+                is_val, reason = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"[SKIP] {fname} (already exists)")
                     return filepath
+                remove_invalid_existing_download(filepath, manifest, reason)
 
         # Infer extension if filename has none or is generic .bin
         if "." not in fname or fname.endswith(".bin"):
@@ -302,7 +308,7 @@ def download_file(cand_or_url, output_dir, cookies=None, bsk_session=None, refer
                 filepath = ensure_inferred_extension_on_disk(filepath, output_dir, url, manifest=manifest)
                 print(f"OK (via BrowserSkill, {os.path.getsize(filepath) / 1024:.1f} KB)")
                 return filepath
-        print(f"FAIL: {exc}")
+        print(f"FAIL: {single_line(exc)}")
         return None
 
 

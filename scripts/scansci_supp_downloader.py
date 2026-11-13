@@ -51,6 +51,8 @@ import requests
 from supp_finder import (
     find_all_candidates,
     validate_downloaded_file,
+    single_line,
+    remove_invalid_existing_download,
     sanitize_filename,
     extract_filename_from_url,
     extract_filename_from_content_disposition,
@@ -924,11 +926,14 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         filepath = os.path.join(output_dir, fname)
 
         if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-            is_val, _ = validate_downloaded_file(filepath)
+            is_val, reason = validate_downloaded_file(filepath)
             if is_val:
                 print(f"  [SKIP] {fname} (already exists)")
                 found_files.append(filepath)
                 continue
+            # P1-F: garbage landed by an earlier run is removed, not
+            # [SKIP]-counted; the download below then retries it.
+            remove_invalid_existing_download(filepath, manifest, reason)
 
         print(f"  [API→CDN] {fname} ...", end=" ", flush=True)
         tmp_path = None
@@ -942,11 +947,12 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             found_files.append(filepath)
                             continue
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 # H9: stream to a same-directory temp file, validate it,
                 # then commit with os.replace; the final path never holds
@@ -972,11 +978,11 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
                     save_download_manifest(output_dir, manifest)
                     found_files.append(filepath)
                 else:
-                    print(f"FAIL ({reason})")
+                    print(f"FAIL ({single_line(reason)})")
             else:
                 print(f"FAIL (HTTP {dl_resp.status_code})")
         except Exception as e:
-            print(f"FAIL ({e})")
+            print(f"FAIL ({single_line(e)})")
         finally:
             discard_temp_file(tmp_path)
 
@@ -1111,12 +1117,15 @@ def try_elsevier_cdn_brute_force(
             filepath = os.path.join(output_dir, fname)
 
             if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                is_val, _ = validate_downloaded_file(filepath)
+                is_val, reason = validate_downloaded_file(filepath)
                 if is_val:
                     print(f"  [SKIP] {fname} (already exists)")
                     found_files.append(filepath)
                     found_any = True
                     continue
+                # P1-F: garbage landed by an earlier run is removed, not
+                # [SKIP]-counted; the download below then retries it.
+                remove_invalid_existing_download(filepath, manifest, reason)
 
             # Download the file (H9: temp file -> validate -> os.replace)
             print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
@@ -1131,12 +1140,13 @@ def try_elsevier_cdn_brute_force(
                         fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                         filepath = os.path.join(output_dir, fname)
                         if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                            is_val, _ = validate_downloaded_file(filepath)
+                            is_val, reason = validate_downloaded_file(filepath)
                             if is_val:
                                 print(f"[SKIP] {fname} (already exists)")
                                 found_files.append(filepath)
                                 found_any = True
                                 continue
+                            remove_invalid_existing_download(filepath, manifest, reason)
 
                     os.makedirs(output_dir, exist_ok=True)
                     tmp_path = temp_path_for(filepath)
@@ -1160,11 +1170,11 @@ def try_elsevier_cdn_brute_force(
                         found_files.append(filepath)
                         found_any = True
                     else:
-                        print(f"FAIL ({reason})")
+                        print(f"FAIL ({single_line(reason)})")
                 else:
                     print(f"FAIL (HTTP {dl_resp.status_code})")
             except Exception as e:
-                print(f"FAIL ({e})")
+                print(f"FAIL ({single_line(e)})")
             finally:
                 discard_temp_file(tmp_path)
         # A HEAD hit means the file exists even if the follow-up GET
@@ -1228,7 +1238,34 @@ def try_elsevier_cdn_brute_force(
     total_probed = len(probed_mmcs)
     print(f"  [Tier 0 Diagnostic] Probed mmc1..mmc{scanned_count} ({total_probed} total, limit: {max_mmc}). Hits: {len(found_files)}. Stopped: {stop_reason}.")
     if found_files:
-        print(f"  [Tier 0] Found {len(found_files)} file(s) via CDN.")
+        # P1-F: confirm every Tier 0 hit on its own line -- file name,
+        # size and validation result -- so a Tier 0 success is visible
+        # instead of only a bare count (#47's 3 mmc files were
+        # invisible). A file that no longer validates is dropped and
+        # deleted, never counted as a success.
+        confirmed = []
+        for _path in found_files:
+            _name = os.path.basename(_path)
+            try:
+                _size_kb = os.path.getsize(_path) / 1024
+            except OSError:
+                _size_kb = None
+            _is_val, _val_reason = validate_downloaded_file(_path)
+            if not _is_val:
+                print(f"  [Tier 0] \u2717 {_name} failed re-validation ({single_line(_val_reason)}); discarding.")
+                try:
+                    os.remove(_path)
+                except OSError:
+                    pass
+                continue
+            _size_txt = f"{_size_kb:.1f} KB" if _size_kb is not None else "size unknown"
+            print(f"  [Tier 0] \u2713 {_name} ({_size_txt}, validated: {single_line(_val_reason)})")
+            confirmed.append(_path)
+        found_files = confirmed
+        if found_files:
+            print(f"  [Tier 0] Downloaded {len(found_files)} file(s) via CDN (validated).")
+        else:
+            print(f"  [Tier 0] No files found on CDN.")
     else:
         print(f"  [Tier 0] No files found on CDN.")
     return found_files
@@ -1290,10 +1327,13 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     filepath = os.path.join(output_dir, fname)
 
     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-        is_val, _ = validate_downloaded_file(filepath)
+        is_val, reason = validate_downloaded_file(filepath)
         if is_val:
             print(f"  [SKIP] {fname} (already exists)")
             return filepath
+        # P1-F: garbage landed by an earlier run is removed, not
+        # [SKIP]-counted as a success; the download below retries it.
+        remove_invalid_existing_download(filepath, manifest, reason)
 
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     last_error = ""  # P1 (50-paper test, Cause G): keep the last failure reason for the final FAIL line
@@ -1315,10 +1355,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 first_chunk = b""
                 tmp_path = temp_path_for(filepath)
@@ -1360,6 +1401,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = os.path.getsize(filepath) / 1024
                     print(f"OK ({size_kb:.1f} KB - {reason})")
                     return filepath
+                else:
+                    # P1-F: a validation rejection is a failure reason,
+                    # not a silent fall-through -- otherwise the final
+                    # FAIL line comes out bare with the reason lost.
+                    last_error = f"validation: {reason}"
         except Exception as e:
             last_error = f"requests: {e}"
         finally:
@@ -1383,10 +1429,11 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     fname = disambiguate_target_filename(output_dir, target_fname, url, manifest)
                     filepath = os.path.join(output_dir, fname)
                     if os.path.exists(filepath) and manifest_entry_url(manifest.get(fname)) == url:
-                        is_val, _ = validate_downloaded_file(filepath)
+                        is_val, reason = validate_downloaded_file(filepath)
                         if is_val:
                             print(f"[SKIP] {fname} (already exists)")
                             return filepath
+                        remove_invalid_existing_download(filepath, manifest, reason)
 
                 if "." not in fname or fname.endswith(".bin"):
                     inferred = infer_file_extension(resp.body, hdr.get("content-type", ""))
@@ -1417,6 +1464,9 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     size_kb = len(resp.body) / 1024
                     print(f"OK (via Scrapling, {size_kb:.1f} KB - {reason})")
                     return filepath
+                else:
+                    # P1-F: keep the validation reason for the final FAIL line.
+                    last_error = f"validation: {reason}"
         except Exception as e:
             last_error = f"scrapling: {e}"
         finally:
@@ -1534,6 +1584,9 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 print(f"OK (via StealthySession, {size_kb:.1f} KB - {reason})")
                 tracker.record_success(url)
                 return filepath
+            else:
+                # P1-F: keep the validation reason for the final FAIL line.
+                last_error = f"validation: {reason}"
         except Exception as e:
             last_error = f"browser: {e}"
             # P1-D: a tunnel failure counts toward the per-host breaker;
@@ -1592,12 +1645,15 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 save_download_manifest(output_dir, manifest)
                 print(f"OK (via {curl_cmd}, {size_kb:.1f} KB - {reason})")
                 return filepath
+            else:
+                # P1-F: keep the validation reason for the final FAIL line.
+                last_error = f"validation: {reason}"
     except Exception as e:
         last_error = f"curl: {e}"
     finally:
         discard_temp_file(tmp_path)
 
-    print(f"FAIL ({last_error})" if last_error else "FAIL")
+    print(f"FAIL ({single_line(last_error)})" if last_error else "FAIL")
     return None
 
 
@@ -2036,6 +2092,34 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
 
 # ── Main Logic ───────────────────────────────────────────────────────────────
 
+def print_tier_preserved_files(api_files, cdn_files, article_dir):
+    """Confirm Tier A / Tier 0 files by name (P1-F).
+
+    Used when no candidate list was found: the old line (``Preserved N
+    API/CDN file(s); page completeness remains unverified``) hid which
+    files those were -- #47's 3 mmc files were only visible by counting
+    files on disk. Each file is listed with its size; a path that no
+    longer resolves on disk (e.g. the folder was renamed after the
+    download) is reported as such instead of being silently counted.
+    """
+    seen = set()
+    for tier, files in (("Tier A", api_files or []), ("Tier 0", cdn_files or [])):
+        for path in files:
+            name = os.path.basename(path)
+            if name in seen:
+                continue
+            seen.add(name)
+            resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
+            if os.path.exists(resolved):
+                size_kb = os.path.getsize(resolved) / 1024
+                print(f"  [{tier}] \u2713 {name} ({size_kb:.1f} KB, downloaded via {tier}, validated on download)")
+            else:
+                print(f"  [{tier}] ? {name} (listed as downloaded but not found on disk)")
+    total = len(seen)
+    print(f"  [Info] {total} API/CDN file(s) preserved; no candidate list was found, "
+          f"so page completeness cannot be verified from the page.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="ScanSci Integrated Supplementary Downloader v3")
     parser.add_argument("url_or_doi", help="DOI or landing page URL of the paper")
@@ -2412,7 +2496,9 @@ def run_download(args, bsk_runtime):
                     return
 
         if api_files or cdn_files:
-            print(f"  Preserved {len(set(api_files + cdn_files))} API/CDN file(s); page completeness remains unverified.")
+            # P1-F: confirm each Tier A / Tier 0 file by name instead
+            # of the vague "Preserved ..." line.
+            print_tier_preserved_files(api_files, cdn_files, article_dir)
             if args.convert_markdown:
                 convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
