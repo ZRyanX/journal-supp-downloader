@@ -1755,16 +1755,21 @@ def sort_candidates_by_priority(candidates):
 
 
 def _infer_candidate_table_ids(link_text: str, filename: str, attrs: Optional[Dict[str, Any]] = None) -> Set[str]:
-    """Table ids named by a candidate's own label, filename, or attributes (H6)."""
+    """Table ids named by a candidate's own label, filename, or attributes (H6).
+
+    The label/filename itself is supplementary context (P1-A), so bare
+    lists there still resolve; the word-boundary rule in
+    supplementary_table_ids still applies.
+    """
     ids: Set[str] = set()
     for value in (link_text, filename):
-        ids |= supplementary_table_ids(value)
+        ids |= supplementary_table_ids(value, in_supplementary_context=True)
     for value in (attrs or {}).values():
         if isinstance(value, str):
-            ids |= supplementary_table_ids(value)
+            ids |= supplementary_table_ids(value, in_supplementary_context=True)
         elif isinstance(value, list):
             for item in value:
-                ids |= supplementary_table_ids(str(item))
+                ids |= supplementary_table_ids(str(item), in_supplementary_context=True)
     return ids
 
 
@@ -1802,7 +1807,9 @@ def _parent_direct_table_ids(tag) -> Set[str]:
         return set()
     if not direct_text:
         return set()
-    return supplementary_table_ids(direct_text)
+    # The parent row holds a single download control, so its own text is
+    # supplementary context (P1-A).
+    return supplementary_table_ids(direct_text, in_supplementary_context=True)
 
 
 # Inline JSON payloads whose URLs static parsing may miss (H3).
@@ -1953,7 +1960,8 @@ def find_all_candidates(
                     link_text=control_label, section="supplementary_section",
                     source_url=base_url, extra_info={"browser_selector": selector},
                     match_rule="browser_download_control",
-                    covered_table_ids=supplementary_table_ids(control_label)))
+                    covered_table_ids=supplementary_table_ids(
+                        control_label, in_supplementary_context=True)))
             continue
 
         link_text = tag.get("value", "") if tag.name == "input" else tag.get_text(separator=" ", strip=True)
@@ -2481,18 +2489,24 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
     Table identifiers and table ranges ('Tables S1-S3', 'Supplementary Table S10',
     '5 个附表') are deliberately NOT counted here; see detect_declared_table_range.
     Returns None when no file-count statement is present.
+
+    P1-A: when a page carries several file-count statements that disagree,
+    the FIRST statement in document order wins -- it is the article's own
+    declaration. Taking the largest (the old max()) let a restatement or a
+    sidebar count inflate the declaration, and mixed the file-count reading
+    with the table-range reading; the two readings are counted independently.
     """
     if not html_content:
         return None
     cleaned = _clean_text_for_declarations(html_content)
-    found_counts: List[int] = []
+    found_counts: List[tuple] = []  # (position, value), earliest wins
 
     # Pattern 1: 'N Supplementary Files' / 'N Supplementary Materials' (never 'N Supplementary Tables')
     for m in re.finditer(r'\b(\d{1,2})\s+(?:supplementary|supplemental|supporting|additional)\s+(?:files?|datasets?|materials?|items?)\b', cleaned, re.IGNORECASE):
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2501,7 +2515,7 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
         try:
             val = int(m.group(1) or m.group(2))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2516,7 +2530,7 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
         try:
             val = int(m.group(1))
             if 1 <= val <= 99:
-                found_counts.append(val)
+                found_counts.append((m.start(), val))
         except ValueError:
             pass
 
@@ -2530,9 +2544,9 @@ def detect_declared_file_count(html_content: str) -> Optional[int]:
     ):
         c_num = _parse_declared_numeral(m.group(1) or m.group(2))
         if c_num is not None and 1 <= c_num <= 99:
-            found_counts.append(c_num)
+            found_counts.append((m.start(), c_num))
 
-    return max(found_counts) if found_counts else None
+    return min(found_counts)[1] if found_counts else None
 
 
 def detect_declared_table_range(html_content: str) -> Set[str]:
@@ -2708,7 +2722,58 @@ def _expand_table_range(start: str, end: str) -> Optional[List[str]]:
     return None
 
 
-def supplementary_table_ids(text):
+# A supplementary signal word near a bare table-id mention (P1-A). The
+# context gate in supplementary_table_ids() accepts a multi-token group
+# without any explicit table word only when such a signal sits within a
+# short window around it. Deliberately narrow: bare "table" / "data" /
+# "file" / "material" alone are NOT signals -- "Table 5 lists samples
+# S1, S2 ..." and "the data were 10-100" would otherwise bless sample
+# ids and measurement ranges. An explicit prefix/trailing table word on
+# the token itself ("Table S1", "S1 Table") still counts, as before.
+_SUPP_CONTEXT_RE = re.compile(
+    r"supplementar(?:y|ies)|supplemental"
+    r"|supporting\s+(?:information|material|materials?|data|files?|info)"
+    r"|additional\s+(?:files?|materials?|data|information)"
+    r"|appendix|appendices|extended\s+data|suppl\.?"
+    r"|supporting-info|supporting_info|additional-file|additional_file"
+    r"|extended-data|extended_data"
+    r"|附表|附录|补充|附加|支撑材料|扩展数据",
+    re.IGNORECASE,
+)
+_SUPP_CONTEXT_WINDOW = 120
+
+
+def _group_has_supp_signal(text: str, start: int, end: int) -> bool:
+    """True when a supplementary signal word sits within a short window
+    around text[start:end] (P1-A context gate for bare id mentions)."""
+    lo = max(0, start - _SUPP_CONTEXT_WINDOW)
+    hi = min(len(text), end + _SUPP_CONTEXT_WINDOW)
+    return _SUPP_CONTEXT_RE.search(text[lo:hi]) is not None
+
+
+def _group_is_anchored(resolved, text: str) -> bool:
+    """True when a resolved token group is a table declaration (P1-A).
+
+    Anchored by an explicit table/supplementary word on some member
+    ("Table S1", "Supplementary Tables 2-5"), by an attached-letter range
+    ("S1-S3", "Figures S1-S3" -- a compact range is itself an id mention),
+    or by a supplementary signal word near the group. A bare list of
+    lettered ids with none of these (sample ids, reference numbers) is
+    not anchored and must not mint table ids.
+    """
+    if any(tok["context"] for tok, _sep in resolved):
+        return True
+    for idx in range(1, len(resolved)):
+        tok, sep = resolved[idx]
+        prev_tok = resolved[idx - 1][0]
+        if (sep == "range" and prev_tok["ns"] == tok["ns"]
+                and prev_tok.get("attached") and not prev_tok.get("bare")):
+            return True
+    return _group_has_supp_signal(
+        text, resolved[0][0]["start"], resolved[-1][0]["end"])
+
+
+def supplementary_table_ids(text, in_supplementary_context=False):
     """Return namespaced table identities (S1, S1.1, A1, E1), never bare ordinal counts.
 
     Hierarchical numbers keep their suffix ('Table S1.1' -> 'S1.1', not 'S1').
@@ -2716,6 +2781,19 @@ def supplementary_table_ids(text):
     'Extended Data Tables 1-3' all enumerate every member. Lists ('S1, S2 and S3')
     enumerate their members. A bare 'S1' with no table context or range/list
     neighbour is ignored, as is a bare main-text 'Table 1'.
+
+    P1-A context gate: a table mention must carry supplementary context.
+    A namespace letter must start a word of its own -- the final letter of
+    an ordinary word glued to a following number ("were 10-100" -> E10..E100,
+    "data 1-60" -> A1..A60, "was 113" -> S113 in the 50-paper retest) is
+    never a namespace. A multi-token group with no explicit table word is
+    accepted only as an attached-letter range, when a supplementary signal
+    sits within a short window around it, or when the caller passes
+    in_supplementary_context=True (a candidate's link text / filename /
+    attributes, a single download row, or a supplementary section -- the
+    link or section itself is the supplementary context). When in doubt
+    the extractor under-extracts rather than minting ids: a lone 'S1' and
+    a bare list such as 'Samples S1, S2 and S3' stay unextracted.
     """
     result = set()
     text = str(text or "")
@@ -2728,6 +2806,17 @@ def supplementary_table_ids(text):
         pw = m.group("pw")
         letter = m.group("letter")
         post = m.group("post")
+        # P1-A: the letter must start a word of its own. The letter group
+        # also matches the final letter of an ordinary word followed by a
+        # space, which minted whole fake ranges out of measurement ranges
+        # ("were 10" -> E10, "data 1" -> A1, "was 113" -> S113). The only
+        # exception is a letter glued to its own prefix word ("附表S1",
+        # where the prefix ends exactly where the letter starts).
+        if letter:
+            letter_start = m.start("letter")
+            if not (pw and m.end("pw") == letter_start):
+                if letter_start > 0 and text[letter_start - 1].isalpha():
+                    continue
         num = _parse_table_number(m.group("num"))
         if num is None:
             continue
@@ -2748,17 +2837,22 @@ def supplementary_table_ids(text):
             id_start = m.start("num")
             if id_start == m.end("pw"):
                 continue
+        # Whether the namespace letter is attached to its number ('S1',
+        # 'S-1', 'S.1' -- but not 'S 1'): only an attached letter can
+        # anchor a bare range, so a spaced-out letter never does.
+        attached = letter is None or not any(
+            ch.isspace() for ch in text[m.end("letter"):m.start("num")])
         # A bare number with neither a prefix word, a letter, nor a trailing
         # table word is not a table id on its own; kept as a weak token so it
         # can still inherit the namespace of a range/list neighbour
         # ('Supplementary Tables 2-5' -> S2..S5).
         if not pw and not letter and not post:
-            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "start": m.start(), "end": m.end()})
+            tokens.append({"ns": None, "num": num, "context": False, "bare": True, "attached": attached, "start": m.start(), "end": m.end()})
             continue
         ns = _table_token_namespace(pw, letter, post)
         if ns is None:
             continue
-        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "start": m.start(), "end": m.end()})
+        tokens.append({"ns": ns, "num": num, "context": bool(pw or post), "bare": False, "attached": attached, "start": m.start(), "end": m.end()})
 
     # Group consecutive tokens joined only by a range/list separator.
     groups = []  # each: [(token, sep_from_previous)] with sep None for the first
@@ -2791,7 +2885,13 @@ def supplementary_table_ids(text):
             if ns is None:
                 continue
             last_ns = ns
-            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False)}, sep))
+            resolved.append(({"ns": ns, "num": tok["num"], "context": tok["context"], "bare": tok.get("bare", False), "attached": tok.get("attached", False), "start": tok["start"], "end": tok["end"]}, sep))
+        if not resolved:
+            continue
+        # P1-A: a multi-token group with no anchor is not a declaration
+        # (bare list of lettered ids, e.g. sample ids or reference numbers).
+        if not in_supplementary_context and not _group_is_anchored(resolved, text):
+            continue
         expanded: Set[str] = set()
         for idx, (tok, sep) in enumerate(resolved):
             if sep == "range" and idx > 0:
@@ -2811,15 +2911,22 @@ def supplementary_table_ids(text):
 
 
 def declared_file_count(text):
-    """Only explicit file counts; table ranges are a different constraint."""
+    """Only explicit file counts; table ranges are a different constraint.
+
+    P1-A: when several file-count statements disagree, the FIRST statement
+    in document order wins; the old max() let a larger restatement inflate
+    the declaration. The file-count and table-range readings are counted
+    independently -- a table range never feeds this number.
+    """
     patterns = [
         r'\b(\d+)\s+(?:supplementary|supplemental|supporting|additional)\s+files?\b',
         r'(?:supplementary|supplemental|supporting|additional)\s+files?\s*\(\s*(\d+)\s*\)',
         r'(?:supplementary|supporting)\s+(?:information|material)\s*\(\s*(\d+)\s+files?\s*\)',
         r'(\d+)\s*个?\s*(?:补充文件|补充附件|附加文件)',
     ]
-    values = [int(m[1]) for pattern in patterns for m in re.finditer(pattern, text, re.I)]
-    return max(values, default=0)
+    values = [(m.start(), int(m.group(1))) for pattern in patterns
+              for m in re.finditer(pattern, text, re.I)]
+    return min(values)[1] if values else 0
 
 
 def candidate_evidence(candidates):
@@ -2848,7 +2955,8 @@ def covered_table_ids(candidates):
             covered.update(str(t) for t in explicit)
             continue
         for value in (item.get('link_text'), item.get('filename'), item.get('extra_info', {}).get('attributes', {})):
-            covered.update(supplementary_table_ids(value))
+            # A candidate's own label/filename is supplementary context (P1-A).
+            covered.update(supplementary_table_ids(value, in_supplementary_context=True))
     return covered
 
 
@@ -2882,7 +2990,10 @@ def is_result_obviously_incomplete(candidates, html_content, declared_count=None
             for item in evidence)
         if not matched and not meta_satisfies:
             # A named section can be fulfilled by corresponding files on a mirror.
-            section_tables = supplementary_table_ids(section.get_text(' ', strip=True))
+            # The section itself was selected for its supplementary markers,
+            # so its own text is supplementary context (P1-A).
+            section_tables = supplementary_table_ids(
+                section.get_text(' ', strip=True), in_supplementary_context=True)
             if not section_tables or not section_tables <= covered_table_ids(candidates):
                 return True, 'Supplementary container found in HTML but 0 candidates extracted from it (unresolved section)'
     if missing:
