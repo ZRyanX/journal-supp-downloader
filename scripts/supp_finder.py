@@ -301,6 +301,28 @@ class Candidate:
             "covered_table_ids": sorted(self.covered_table_ids),
         }
 
+    @classmethod
+    def from_dict(cls, data):
+        """Rebuild a Candidate from a to_dict() payload (P1-E2).
+
+        Used to seed Phase B downloads from the Phase A candidate list
+        file. Returns None for entries without a URL so one bad entry
+        never poisons the whole seed list.
+        """
+        if not isinstance(data, dict) or not data.get("url"):
+            return None
+        return cls(
+            url=data["url"],
+            filename=data.get("filename", "") or "",
+            link_text=data.get("link_text", "") or "",
+            section=data.get("section", "") or "",
+            match_rule=data.get("match_rule", "") or "",
+            source_tag=data.get("source_tag", "") or "a",
+            extra_info=data.get("extra_info", {}) or {},
+            source_url=data.get("source_url", "") or "",
+            covered_table_ids=set(data.get("covered_table_ids", []) or []),
+        )
+
 
 @dataclass
 class FindingDiagnostics:

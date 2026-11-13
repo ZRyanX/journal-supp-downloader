@@ -2101,8 +2101,11 @@ def print_tier_preserved_files(api_files, cdn_files, article_dir):
     files on disk. Each file is listed with its size; a path that no
     longer resolves on disk (e.g. the folder was renamed after the
     download) is reported as such instead of being silently counted.
+
+    Returns the number of listed files verified on disk (P1-G2).
     """
     seen = set()
+    on_disk = 0
     for tier, files in (("Tier A", api_files or []), ("Tier 0", cdn_files or [])):
         for path in files:
             name = os.path.basename(path)
@@ -2111,6 +2114,7 @@ def print_tier_preserved_files(api_files, cdn_files, article_dir):
             seen.add(name)
             resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
             if os.path.exists(resolved):
+                on_disk += 1
                 size_kb = os.path.getsize(resolved) / 1024
                 print(f"  [{tier}] \u2713 {name} ({size_kb:.1f} KB, downloaded via {tier}, validated on download)")
             else:
@@ -2118,6 +2122,75 @@ def print_tier_preserved_files(api_files, cdn_files, article_dir):
     total = len(seen)
     print(f"  [Info] {total} API/CDN file(s) preserved; no candidate list was found, "
           f"so page completeness cannot be verified from the page.")
+    return on_disk
+
+
+def preserved_done_line(count, article_dir):
+    """Countable Done line for the preserved-files path (P1-G2).
+
+    Round-3 #13 (11/11) and #47 (3/3) downloaded via Tier 0 yet were
+    scored failed-timeout downstream because this path printed no
+    "✓ Done:" line at all. The count is real (files verified on disk)
+    but there is no honest denominator -- page completeness is
+    unverified -- so the line deliberately carries no N/M fraction.
+    """
+    return (f"\u2713 Done: {count} file(s) downloaded via Tier A/CDN "
+            f"(page completeness unverified) to {os.path.abspath(article_dir)}")
+
+
+# ── P1-E2: Phase B seeds from the Phase A candidate list ──────────────────
+
+SEED_CANDIDATES_FILENAMES = (
+    "supplementary_candidates.json",
+    "supplementary_candidates.partial.json",
+)
+
+
+def load_seed_candidates(article_dir):
+    """Load the Phase A candidate list from article_dir (P1-E2).
+
+    Phase A (journal_downloader.py) streams every discovered candidate
+    to supplementary_candidates(.partial).json in the article directory
+    so a timeout leaves them readable on disk. Phase B used to
+    re-discover from scratch and never read that file: round 3
+    preserved 348 candidates across 15 papers that nobody downloaded
+    from. The final list wins over the partial one; a corrupt file
+    falls through to the next instead of aborting the run; entries
+    without a URL are skipped.
+
+    Returns (candidates, source_filename) -- ([], None) when nothing
+    usable is on disk.
+    """
+    for name in SEED_CANDIDATES_FILENAMES:
+        path = os.path.join(article_dir, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception:
+            continue
+        entries = payload.get("candidates", []) if isinstance(payload, dict) else []
+        cands = []
+        for entry in entries:
+            cand = Candidate.from_dict(entry)
+            if cand is not None:
+                cands.append(cand)
+        return cands, name
+    return [], None
+
+
+def merge_seed_candidates(candidates, seeds):
+    """Append seed candidates whose URL is new; return (merged, added).
+
+    Lossless and input-preserving: existing candidates keep their
+    order, seeds follow in file order, duplicates by URL are skipped
+    (the later dedupe_candidates pass still handles filename-level
+    duplicates across tiers).
+    """
+    known = {c.url for c in candidates}
+    added = [c for c in seeds if c.url not in known]
+    return list(candidates) + added, len(added)
 
 
 def main():
@@ -2473,6 +2546,17 @@ def run_download(args, bsk_runtime):
     if mirrors.info and mirrors.info.title and is_placeholder_or_blocked_title(article_dirname):
         _refresh_dir_from_html_or_title(raw_title=mirrors.info.title)
 
+    # P1-E2: seed from the Phase A candidate list left in this article
+    # directory (separate Phase A process, same -o). Without this, a
+    # Phase A timeout preserved candidates on disk that Phase B never
+    # downloaded from (round 3: 348 candidates across 15 papers).
+    seed_candidates, seed_source = load_seed_candidates(article_dir)
+    if seed_candidates:
+        candidates, seeds_added = merge_seed_candidates(candidates, seed_candidates)
+        if seeds_added:
+            print(f"  [Info] Seeded {seeds_added} candidate(s) from Phase A "
+                  f"candidate list ({seed_source}).")
+
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
             page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
@@ -2498,7 +2582,12 @@ def run_download(args, bsk_runtime):
         if api_files or cdn_files:
             # P1-F: confirm each Tier A / Tier 0 file by name instead
             # of the vague "Preserved ..." line.
-            print_tier_preserved_files(api_files, cdn_files, article_dir)
+            preserved_count = print_tier_preserved_files(api_files, cdn_files, article_dir)
+            # P1-G2: countable Done line so downstream status parsing
+            # sees the download (round-3 #13/#47 scored failed-timeout
+            # with dl_done empty despite 11/11 and 3/3 on disk).
+            if preserved_count:
+                print(preserved_done_line(preserved_count, article_dir))
             if args.convert_markdown:
                 convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
