@@ -20,7 +20,7 @@ python scripts/browserskill_adapter.py status --json
 
 | 参数 | 行为 |
 |---|---|
-| 无 BrowserSkill 参数 | 不调用 BrowserSkill；原有 HTTP/Scrapling/CDP 策略独立运行 |
+| 无 BrowserSkill 参数 | 常规路径先独立运行；仅在 `Tier 3-Auto` 触发且检测到已连接的 `bsk` daemon 时自动兜底，不自动启动未运行的服务 |
 | `--bsk` / `--browserskill` | 页面抓取优先使用 BrowserSkill；高级版仍先尝试 API/CDN |
 | `--bsk-auto` | 普通路径失败或附件候选不完整时按需使用 |
 | `--no-bsk` | 显式禁用，与其他模式和浏览器选择参数互斥 |
