@@ -22,4 +22,12 @@ downloads/
 
 # Cookies & sensitive user configs
 *cookies.txt
+*cookies.json
 .cnki_cookies.txt
+.zotero_crawl4ai_cookies.json
+.env
+.env.*
+!.env.example
+config.json
+config.local.json
+

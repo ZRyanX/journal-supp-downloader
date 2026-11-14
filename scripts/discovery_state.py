@@ -5,9 +5,17 @@ from supp_finder import (BeautifulSoup, DEFAULT_PARSER, supplementary_table_ids,
                          declared_file_count, covered_table_ids,
                          detect_declared_supplement_count,
                          detect_declared_table_range,
+                         extract_article_declaration_text,
                          filename_dedup_key,
+                         has_opaque_bundle_candidate,
                          is_result_obviously_incomplete,
                          page_fetch_is_failure)
+
+
+def _norm_page_url(url: str) -> str:
+    if not url:
+        return ""
+    return url.split("#", 1)[0].rstrip("/")
 
 
 class DiscoveryEvidence:
@@ -32,17 +40,31 @@ class DiscoveryEvidence:
         self.files = 0
         self.files_by_source = {}
         self._observe_counts = {}
+        self._parsed_cache = {}
 
-    def observe(self, key, html, base_url, source=None):
+    def observe(self, key, html, base_url, source=None, soup=None, article_text=None):
         if not html:
             return
         n = self._observe_counts.get(key, 0) + 1
         self._observe_counts[key] = n
         label = source or f'{key}#{n}'
         self.pages.setdefault(key, []).append((label, html, base_url))
-        text = BeautifulSoup(html, DEFAULT_PARSER).get_text(' ', strip=True)
-        self.tables.update(supplementary_table_ids(text))
-        count = declared_file_count(text)
+        if not isinstance(soup, BeautifulSoup):
+            soup = html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, DEFAULT_PARSER)
+        if not isinstance(article_text, str):
+            article_text = extract_article_declaration_text(soup)
+        table_ids = supplementary_table_ids(article_text)
+        expected = table_ids | detect_declared_table_range(article_text)
+        count = declared_file_count(article_text)
+        declared_supp_count = detect_declared_supplement_count(article_text)
+        self._parsed_cache[label] = {
+            "soup": soup,
+            "article_text": article_text,
+            "expected": expected,
+            "file_count": count,
+            "declared_supp_count": declared_supp_count,
+        }
+        self.tables.update(table_ids)
         self.files_by_source[label] = count
         self.files = max(self.files_by_source.values(), default=0)
 
@@ -51,20 +73,38 @@ class DiscoveryEvidence:
         for entries in self.pages.values():
             yield from entries
 
+    def _get_cached(self, label, html):
+        cached = self._parsed_cache.get(label)
+        if cached is not None:
+            return cached
+        soup = html if isinstance(html, BeautifulSoup) else BeautifulSoup(html, DEFAULT_PARSER)
+        article_text = extract_article_declaration_text(soup)
+        expected = supplementary_table_ids(article_text) | detect_declared_table_range(article_text)
+        cached = {
+            "soup": soup,
+            "article_text": article_text,
+            "expected": expected,
+            "file_count": declared_file_count(article_text),
+            "declared_supp_count": detect_declared_supplement_count(article_text),
+        }
+        self._parsed_cache[label] = cached
+        return cached
+
     def check(self, candidates):
         covered = covered_table_ids(candidates)
         unique_urls = {c.url for c in candidates}
+        opaque_bundle = bool(candidates) and has_opaque_bundle_candidate(candidates)
         reasons = []
 
         # Missing tables: the union over *all* retained pages, with each
         # page's contribution attributed to its source.
         missing_by_source = {}
-        for label, html, _base in self._observations():
-            text = BeautifulSoup(html, DEFAULT_PARSER).get_text(' ', strip=True)
-            expected = supplementary_table_ids(text) | detect_declared_table_range(html)
-            missing = expected - covered
-            if missing:
-                missing_by_source.setdefault(label, set()).update(missing)
+        if not opaque_bundle:
+            for label, html, _base in self._observations():
+                cached = self._get_cached(label, html)
+                missing = cached["expected"] - covered
+                if missing:
+                    missing_by_source.setdefault(label, set()).update(missing)
         if missing_by_source:
             parts = ['{} (from {})'.format(', '.join(sorted(ids)), label)
                      for label, ids in sorted(missing_by_source.items())]
@@ -84,15 +124,38 @@ class DiscoveryEvidence:
         # The missing-table and file-count verdicts of
         # is_result_obviously_incomplete are skipped here because the
         # aggregated, source-annotated versions above already state them.
-        for label, html, _base in self._observations():
-            incomplete, reason = is_result_obviously_incomplete(
-                candidates, html, detect_declared_supplement_count(html))
-            if incomplete and not (
-                    reason.startswith('Missing supplementary tables')
-                    or reason.startswith('File count')):
-                annotated = f'{reason} (from {label})'
-                if annotated not in reasons:
-                    reasons.append(annotated)
+        for _source_key, entries in self.pages.items():
+            verdicts = []
+            for label, html, _base in entries:
+                cached = self._get_cached(label, html)
+                incomplete, reason = is_result_obviously_incomplete(
+                    candidates,
+                    cached["soup"],
+                    cached["declared_supp_count"],
+                    article_text=cached["article_text"],
+                )
+                verdicts.append((label, incomplete, reason))
+            for idx, (label, incomplete, reason) in enumerate(verdicts):
+                if incomplete and not (
+                        reason.startswith('Missing supplementary tables')
+                        or reason.startswith('File count')):
+                    # If an earlier observation of the SAME source key (e.g. publisher#1 pre-hydration
+                    # SSR shell) flagged an unresolved container and a later observation of that same
+                    # key (e.g. publisher#2 after JS hydration) resolved it, suppress the stale warning.
+                    if reason.startswith('Supplementary container found in HTML'):
+                        if any(
+                            (not l_inc)
+                            or not l_reason.startswith((
+                                'Supplementary container found in HTML',
+                                'Zero supplementary candidates found',
+                                'Empty page content',
+                            ))
+                            for _, l_inc, l_reason in verdicts[idx + 1:]
+                        ):
+                            continue
+                    annotated = f'{reason} (from {label})'
+                    if annotated not in reasons:
+                        reasons.append(annotated)
 
         if reasons:
             return True, '; '.join(reasons)
@@ -114,7 +177,7 @@ class DiscoveryEvidence:
 
 class MirrorDiscovery:
     """Memoize one bounded OA discovery round, reusable after transfer failures."""
-    def __init__(self, doi, enabled, resolve, fetch, evidence):
+    def __init__(self, doi, enabled, resolve, fetch, evidence, initial_urls=None):
         self.doi, self.enabled = doi, enabled
         self.resolve, self.fetch, self.evidence = resolve, fetch, evidence
         self.info = None
@@ -123,6 +186,13 @@ class MirrorDiscovery:
         # H8: every probed mirror URL and why it failed, for diagnosis.
         # Entries are removed when a later probe of the same URL succeeds.
         self.failures = {}
+        self._seeded_urls = {_norm_page_url(u) for u in (initial_urls or ()) if _norm_page_url(u)}
+
+    def seed_seen_pages(self, urls):
+        for u in (urls or ()):
+            nu = _norm_page_url(u)
+            if nu:
+                self._seeded_urls.add(nu)
 
     def discover(self, force=False, on_candidate=None):
         """Probe OA mirrors; *on_candidate* (P1-CE) is called with each
@@ -140,14 +210,17 @@ class MirrorDiscovery:
         from supp_finder import find_all_candidates, extract_effective_base_url
         info = self.resolve(self.doi)
         self.info = info
-        seen_pages, seen_files = set(), set()
+        seen_pages, seen_files = set(self._seeded_urls), set()
         for url in (info.oa_landing_urls if info else []):
-            if url in seen_pages:
+            norm_url = _norm_page_url(url)
+            if norm_url in seen_pages:
                 continue
-            seen_pages.add(url)
+            seen_pages.add(norm_url)
             print(f'  [OA Mirror] Probing: {url}')
             try:
                 html, status, final = self.fetch(url)
+                if final:
+                    seen_pages.add(_norm_page_url(final))
                 if not html:
                     self.failures[url] = 'empty response'
                     continue
@@ -161,8 +234,15 @@ class MirrorDiscovery:
                     continue
                 self.failures.pop(url, None)
                 base = extract_effective_base_url(html, final or url)
-                self.evidence.observe(url, html, base)
-                for candidate in find_all_candidates(html, base, original_url=url).candidates:
+                mirror_diag = find_all_candidates(html, base, original_url=url)
+                self.evidence.observe(
+                    url,
+                    html,
+                    base,
+                    soup=getattr(mirror_diag, "_soup", None),
+                    article_text=getattr(mirror_diag, "_article_text", None),
+                )
+                for candidate in mirror_diag.candidates:
                     if candidate.url not in seen_files:
                         self.candidates.append(candidate)
                         seen_files.add(candidate.url)

@@ -37,13 +37,20 @@ from urllib.parse import urljoin, urlparse
 # Suppress SSL warnings for expired WebVPN certs
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Ensure scripts directory and scansci_pdf are in path
+import importlib.util
+
+# Ensure scripts directory and scansci_pdf are in path (prefer installed package if available)
 scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if scripts_dir not in sys.path:
     sys.path.insert(0, scripts_dir)
 
-sys.path.append(str(Path(__file__).resolve().parents[1] / "scansci-pdf" / "src"))
-sys.path.append(str(Path(__file__).resolve().parents[2] / "scansci-pdf" / "src"))
+if importlib.util.find_spec("scansci_pdf") is None:
+    for _scansci_candidate in (
+        Path(__file__).resolve().parents[1] / "scansci-pdf" / "src",
+        Path(__file__).resolve().parents[2] / "scansci-pdf" / "src",
+    ):
+        if _scansci_candidate.is_dir() and str(_scansci_candidate) not in sys.path:
+            sys.path.append(str(_scansci_candidate))
 
 import requests
 
@@ -66,6 +73,9 @@ from supp_finder import (
     DATA_EXTENSIONS,
     MMC_PATTERN,
     SUPP_KEYWORD_PATTERN,
+    fetch_sciengine_api_candidates,
+    load_local_skill_config,
+    configure_session_direct,
     TABLE_FILENAME_PATTERN,
     TABLE_LABEL_PATTERN,
     EXCLUDE_URL_PATTERNS,
@@ -74,6 +84,7 @@ from supp_finder import (
     is_article_figure_url,
     check_data_extension,
     filename_dedup_key,
+    _normalize_url_for_dedup,
     dedupe_candidates,
     is_explicit_supp_table,
     is_table_text_or_attribute,
@@ -91,6 +102,7 @@ from supp_finder import (
     migrate_or_merge_article_dir,
     is_blocked_page,
     page_fetch_is_failure,
+    strip_nonvisible_html,
     temp_path_for,
     commit_temp_file,
     discard_temp_file,
@@ -106,7 +118,14 @@ from supp_finder import (
     DEFAULT_BROWSER_GOTO_TIMEOUT_SECONDS,
     DEFAULT_BROWSER_FALLBACK_BUDGET_SECONDS,
     BrowserFallbackBudget,
+    RepoBrowserSession,
     browser_budget_from_args,
+    ensure_phase_browser_budget,
+    stealthy_fetch_bounded,
+    has_system_chrome,
+    has_gui_display,
+    add_auto_browser_arguments,
+    run_auto_browser_recovery,
 )
 
 try:
@@ -117,6 +136,7 @@ try:
         extract_cdp_cookies,
         merge_cookies,
         fetch_page_via_cdp,
+        download_via_playwright_request,
     )
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
@@ -124,10 +144,12 @@ except ImportError:
     resolve_cdp_ws_url = lambda ep, timeout=1.0: None
     extract_cdp_cookies = lambda ep, timeout=4.0: []
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
+    download_via_playwright_request = lambda *a, **k: (False, "playwright_utils unavailable")
 from browserskill_adapter import (
     BrowserSkillError,
     BrowserSkillRuntime,
     add_browserskill_arguments,
+    check_browserskill_status,
     runtime_from_args,
     fetch_page_via_browserskill,
     download_file_via_browserskill,
@@ -135,8 +157,26 @@ from browserskill_adapter import (
 
 
 from discovery_state import DiscoveryEvidence, MirrorDiscovery, download_with_recovery
-from repository_resolver import expand_repository_candidates
-from oa_resolver import resolve_oa_info, is_doi, extract_doi, extract_doi_from_html
+from repository_resolver import (
+    clone_candidate_with_url,
+    discover_diva_candidates,
+    discover_figshare_by_doi,
+    discover_gsa_figshare_candidates,
+    expand_repository_candidates,
+    extract_crossref_chooser_urls,
+    get_alternate_chooser_urls,
+    is_crossref_chooser_url,
+    is_diva_target,
+    is_gsa_or_gsw_target,
+    iter_download_fallback_routes,
+)
+from oa_resolver import (
+    DEFAULT_UNPAYWALL_EMAIL,
+    resolve_oa_info,
+    is_doi,
+    extract_doi,
+    extract_doi_from_html,
+)
 from markitdown_converter import convert_directory_supplements, is_markitdown_available
 
 # Try importing scrapling
@@ -149,7 +189,7 @@ except ImportError:
 # Try importing scansci_pdf components
 try:
     import scansci_pdf
-    from scansci_pdf.config import load_config
+    from scansci_pdf.config import load_config as _scansci_load_config
     from scansci_pdf.browser_cookies import inject_cookies, load_saved_cookies
     from scansci_pdf.sources.vpnsci import (
         convert_url,
@@ -160,28 +200,87 @@ try:
     )
     HAS_SCANSCI = True
 except ImportError as e:
+    _scansci_load_config = None
     HAS_SCANSCI = False
     print(f"Warning: scansci_pdf not found. Running in standalone mode. Error: {e}")
 
 
+def load_config():
+    """Load scansci-pdf config merged with local skill .env / config.local.json overrides."""
+    cfg = _scansci_load_config() if (HAS_SCANSCI and _scansci_load_config is not None) else {}
+    local_cfg = load_local_skill_config()
+    for key, val in local_cfg.items():
+        if key == "is_campus_network":
+            if val or key not in cfg:
+                cfg[key] = val
+        elif val not in (None, "") and not cfg.get(key):
+            cfg[key] = val
+    return cfg
+
+
+def _parse_cookie_file_items_standalone(cookie_file: str):
+    """Load cookie items from JSON list/dict or Netscape cookies.txt."""
+    with open(cookie_file, "r", encoding="utf-8") as f:
+        raw = f.read()
+    if not raw.strip():
+        return []
+    try:
+        cdata = json.loads(raw)
+        if isinstance(cdata, list):
+            return cdata
+        if isinstance(cdata, dict):
+            if isinstance(cdata.get("cookies"), list):
+                return cdata["cookies"]
+            return [
+                {"name": k, "value": str(v), "path": "/"}
+                for k, v in cdata.items()
+                if isinstance(v, (str, int, float, bool))
+            ]
+    except Exception:
+        pass
+    items = []
+    for raw_line in raw.splitlines():
+        line = raw_line.rstrip("\r\n")
+        if not line.strip():
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#") and not stripped.startswith("#HttpOnly_"):
+            continue
+        if stripped.startswith("#HttpOnly_"):
+            line = stripped[len("#HttpOnly_"):]
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            domain, _flag, path, secure, expires, name, value = parts[:7]
+            if name:
+                c = {
+                    "domain": domain,
+                    "path": path or "/",
+                    "secure": secure.upper() == "TRUE",
+                    "name": name,
+                    "value": value,
+                }
+                if re.match(r"^\d+(?:\.\d+)?$", expires.strip()):
+                    exp_val = int(float(expires.strip()))
+                    if exp_val > 0:
+                        c["expires"] = exp_val
+                items.append(c)
+    return items
+
+
 def load_saved_cookies_standalone():
-    """Load cookies in standalone mode from local cookies.json and login wizard profile."""
+    """Load cookies in standalone mode from local cookies.json, login wizard profile, and Zotero/CNKI stores."""
     paths = [
         os.path.abspath("cookies.json"),
         os.path.expanduser("~/.journal_supp_downloader_profile/cookies.json"),
+        os.path.expanduser("~/.zotero_crawl4ai_cookies.json"),
+        os.path.expanduser("~/cnki_cookies.txt"),
     ]
     all_cookies = []
     seen_keys = set()
     for p in paths:
         if os.path.exists(p):
             try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cdata = json.load(f)
-                items = []
-                if isinstance(cdata, list):
-                    items = cdata
-                elif isinstance(cdata, dict):
-                    items = [{"name": k, "value": v, "path": "/"} for k, v in cdata.items()]
+                items = _parse_cookie_file_items_standalone(p)
                 for c in items:
                     if isinstance(c, dict) and c.get("name"):
                         k = (c.get("domain", ""), c.get("name", ""), c.get("path", "/"))
@@ -407,13 +506,37 @@ def resolve_doi_url(doi_or_url):
 
     print(f"Resolving DOI: {doi} via doi.org ...")
 
+    def _unwrap_resolved(resolved_url: str, html_hint: str = "") -> str:
+        if not resolved_url or not resolved_url.startswith("http") or "doi.org" in resolved_url:
+            return ""
+        if is_crossref_chooser_url(resolved_url):
+            if not html_hint:
+                try:
+                    c_resp = requests.get(
+                        resolved_url,
+                        timeout=15,
+                        verify=False,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                    )
+                    if c_resp.status_code < 400:
+                        html_hint = c_resp.text or ""
+                except Exception:
+                    pass
+            chooser_urls = extract_crossref_chooser_urls(html_str=html_hint, doi=doi)
+            if chooser_urls:
+                print(f"  [chooser] Unwrapped Crossref chooser -> {chooser_urls[0]}")
+                return chooser_urls[0]
+            return ""
+        return resolved_url
+
     # Method 1: Requests (HEAD)
     try:
         resp = requests.head(url, allow_redirects=True, timeout=15, verify=False,
                              headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
-        if resp.url and resp.url.startswith("http") and "doi.org" not in resp.url:
-            print(f"  [requests] Resolved to: {resp.url}")
-            return resp.url
+        resolved = _unwrap_resolved(resp.url)
+        if resolved:
+            print(f"  [requests] Resolved to: {resolved}")
+            return resolved
     except Exception:
         pass
 
@@ -421,10 +544,17 @@ def resolve_doi_url(doi_or_url):
     try:
         resp = requests.get(url, allow_redirects=True, timeout=15, stream=True, verify=False,
                             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+        html_snip = ""
+        if is_crossref_chooser_url(resp.url or ""):
+            try:
+                html_snip = resp.text or ""
+            except Exception:
+                html_snip = ""
         resp.close()
-        if resp.url and resp.url.startswith("http") and "doi.org" not in resp.url:
-            print(f"  [requests] Resolved to: {resp.url}")
-            return resp.url
+        resolved = _unwrap_resolved(resp.url, html_hint=html_snip)
+        if resolved:
+            print(f"  [requests] Resolved to: {resolved}")
+            return resolved
     except Exception:
         pass
 
@@ -432,12 +562,13 @@ def resolve_doi_url(doi_or_url):
     try:
         curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
         null_dev = "NUL" if sys.platform.startswith("win") else "/dev/null"
-        cmd = [curl_cmd, "-w", "%{url_effective}", "-o", null_dev, "-s", "-L", url]
+        cmd = [curl_cmd, "--noproxy", "*", "-w", "%{url_effective}", "-o", null_dev, "-s", "-L", url]
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         out = res.stdout.strip()
-        if out.startswith("http") and "doi.org" not in out:
-            print(f"  [{curl_cmd}] Resolved to: {out}")
-            return out
+        resolved = _unwrap_resolved(out)
+        if resolved:
+            print(f"  [{curl_cmd}] Resolved to: {resolved}")
+            return resolved
     except Exception:
         pass
 
@@ -446,9 +577,10 @@ def resolve_doi_url(doi_or_url):
         try:
             from scrapling import Fetcher
             r = Fetcher.get(url, stealthy_headers=True, timeout=15)
-            if r.url and r.url.startswith("http") and "doi.org" not in r.url:
-                print(f"  [scrapling] Resolved to: {r.url}")
-                return r.url
+            resolved = _unwrap_resolved(getattr(r, "url", "") or "", html_hint=getattr(r, "text", "") or "")
+            if resolved:
+                print(f"  [scrapling] Resolved to: {resolved}")
+                return resolved
         except Exception:
             pass
 
@@ -623,7 +755,7 @@ def _setup_authenticated_session_and_cookies(config, args, cdp_target=None):
     2. standalone local cookies.json / ~/.journal_supp_downloader_profile/cookies.json
     3. live CDP browser cookies (when cdp_target is provided)
     """
-    session = requests.Session()
+    session = configure_session_direct(requests.Session(), proxy=getattr(args, "proxy", None))
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -923,7 +1055,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     # Download from CDN
     found_files = []
     cdn_base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
-    dl_session = requests.Session()
+    dl_session = configure_session_direct(requests.Session())
     dl_session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
     manifest = load_download_manifest(output_dir)
 
@@ -1011,6 +1143,7 @@ def try_elsevier_cdn_brute_force(
     max_consecutive_misses=4,
     known_mmcs=None,
     max_head_retries=2,
+    deadline=None,
 ):
     """
     Elsevier hosts supplement files on a public CDN at:
@@ -1049,7 +1182,14 @@ def try_elsevier_cdn_brute_force(
     valid_known = {int(m) for m in known_set if isinstance(m, (int, str)) and str(m).isdigit() and 1 <= int(m) <= 999}
 
     print(f"\n[Tier 0] Scanning Elsevier CDN for PII={pii} (max={max_mmc}, max_misses={max_consecutive_misses}) ...")
-    session = requests.Session()
+    session = configure_session_direct(requests.Session())
+    try:
+        from requests.adapters import HTTPAdapter
+        _adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+        session.mount("https://", _adapter)
+        session.mount("http://", _adapter)
+    except Exception:
+        pass
     session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
 
     def _retry_delay(headers, attempt):
@@ -1078,8 +1218,13 @@ def try_elsevier_cdn_brute_force(
         url = f"{base}-mmc{mmc_num}.{ext}"
         headers = {}
         for attempt in range(max_head_retries + 1):
+            if deadline is not None and time.monotonic() >= deadline:
+                return ext, url, None, "transient"
+            head_timeout = 5.0
+            if deadline is not None:
+                head_timeout = max(0.5, min(5.0, deadline - time.monotonic()))
             try:
-                resp = session.head(url, timeout=10, allow_redirects=True)
+                resp = session.head(url, timeout=head_timeout, allow_redirects=True)
             except Exception:
                 outcome = "transient"
             else:
@@ -1095,7 +1240,13 @@ def try_elsevier_cdn_brute_force(
                 else:
                     return ext, url, None, "miss"
             if attempt < max_head_retries:
-                time.sleep(_retry_delay(headers, attempt + 1))
+                delay = _retry_delay(headers, attempt + 1)
+                if deadline is not None:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        return ext, url, None, "transient"
+                    delay = min(delay, rem)
+                time.sleep(delay)
         return ext, url, None, "transient"
 
     def _probe_single_mmc(i: int) -> str:
@@ -1107,7 +1258,7 @@ def try_elsevier_cdn_brute_force(
         found_any = False
 
         # Probe all candidate extensions concurrently
-        with ThreadPoolExecutor(max_workers=min(len(exts), 8)) as executor:
+        with ThreadPoolExecutor(max_workers=min(len(exts), 16)) as executor:
             future_to_ext = {executor.submit(_check_ext, ext, i): ext for ext in exts}
             results = []
             for future in as_completed(future_to_ext):
@@ -1139,7 +1290,8 @@ def try_elsevier_cdn_brute_force(
             print(f"  [CDN]  mmc{i}.{ext} ({size / 1024:.1f} KB) ...", end=" ", flush=True)
             tmp_path = None
             try:
-                dl_resp = session.get(url, timeout=30, stream=True)
+                dl_timeout = 30.0 if deadline is None else max(1.0, min(30.0, deadline - time.monotonic()))
+                dl_resp = session.get(url, timeout=dl_timeout, stream=True)
                 if dl_resp.status_code == 200:
                     cd = dl_resp.headers.get("content-disposition", "")
                     cd_name = extract_filename_from_content_disposition(cd)
@@ -1201,6 +1353,9 @@ def try_elsevier_cdn_brute_force(
     stop_reason = ""
 
     for i in range(1, max_mmc + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            stop_reason = "deadline reached"
+            break
         scanned_count = i
         outcome = _probe_single_mmc(i)
         if outcome == "hit":
@@ -1217,6 +1372,8 @@ def try_elsevier_cdn_brute_force(
     # Phase 2: Probe any known MMCs that weren't reached or were skipped
     remaining_known = sorted(k for k in valid_known if k not in probed_mmcs)
     for k in remaining_known:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if k in probed_mmcs:
             continue
         print(f"  [Tier 0] Probing known MMC mmc{k} ...")
@@ -1226,6 +1383,8 @@ def try_elsevier_cdn_brute_force(
             follow_unknowns = 0
             cur = k + 1
             while follow_misses < max_consecutive_misses and cur <= 999:
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 if cur in probed_mmcs:
                     break
                 follow_outcome = _probe_single_mmc(cur)
@@ -1289,7 +1448,7 @@ def is_html_file(filepath):
 MMC_NUM_REGEX = re.compile(r"(?:^|[^a-z0-9])(?:es)?mmc[-_\s]?([1-9]\d{0,2})(?=$|[^0-9])", re.IGNORECASE)
 
 
-def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None):
+def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None, stealth_session_holder=None, deadline=None, error_out=None, headful: bool = False, real_chrome: bool = False):
     """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session.
 
     P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
@@ -1305,7 +1464,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         selector = cand_or_url.extra_info.get("browser_selector")
         if selector:
             if bsk_session is None and not (bsk_runtime and bsk_runtime.enabled):
-                print(f"  [Unresolved] Browser session required: {cand_or_url.link_text}")
+                msg = f"Browser session required: {cand_or_url.link_text}"
+                if error_out is not None:
+                    error_out["reason"] = msg
+                print(f"  [Unresolved] {msg}")
                 return None
             manifest = load_download_manifest(output_dir)
             name = disambiguate_target_filename(output_dir, suggested_fname, url, manifest)
@@ -1315,6 +1477,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 record_manifest_entry(manifest, name, url, source_url=referer or "", table_ids=sorted(cand_or_url.covered_table_ids))
                 save_download_manifest(output_dir, manifest)
                 return ensure_inferred_extension_on_disk(path, output_dir, url, manifest=manifest)
+            if error_out is not None:
+                error_out["reason"] = f"BrowserSkill download failed for selector: {selector}"
             return None
     else:
         url = cand_or_url
@@ -1343,6 +1507,20 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         # [SKIP]-counted as a success; the download below retries it.
         remove_invalid_existing_download(filepath, manifest, reason)
 
+    norm_target_url = _normalize_url_for_dedup(url.split("#")[0].strip()) if url else ""
+    if norm_target_url:
+        for m_fname, m_entry in list(manifest.items()):
+            m_url = manifest_entry_url(m_entry)
+            if not m_url or _normalize_url_for_dedup(m_url.split("#")[0].strip()) != norm_target_url:
+                continue
+            m_path = os.path.join(output_dir, m_fname)
+            if os.path.exists(m_path):
+                is_val, reason = validate_downloaded_file(m_path)
+                if is_val:
+                    print(f"  [SKIP] {m_fname} (already exists)")
+                    return m_path
+                remove_invalid_existing_download(m_path, manifest, reason)
+
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     last_error = ""  # P1 (50-paper test, Cause G): keep the last failure reason for the final FAIL line
 
@@ -1350,10 +1528,28 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # H9: stream to a same-directory temp file, validate it, then commit
     # with os.replace; the final path never holds a partial file, and a
     # failure only ever discards the temp file.
-    if session:
+    if session or (isinstance(cand_or_url, Candidate) and cand_or_url.extra_info.get("http_method") == "POST"):
         tmp_path = None
         try:
-            resp = session.get(url, timeout=30, stream=True, verify=False, headers={"Referer": referer} if referer else {})
+            sess_obj = session or configure_session_direct(requests.Session(), proxy=proxy)
+            req_headers = {"Referer": referer} if referer else {}
+            if not session:
+                req_headers["User-Agent"] = (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                )
+            if isinstance(cand_or_url, Candidate) and cand_or_url.extra_info.get("http_method") == "POST":
+                post_url = cand_or_url.extra_info.get("post_url") or url
+                post_data = cand_or_url.extra_info.get("post_data") or {}
+                check_url = cand_or_url.extra_info.get("check_url")
+                if check_url:
+                    try:
+                        sess_obj.post(check_url, timeout=15, verify=False, headers=req_headers)
+                    except Exception:
+                        pass
+                resp = sess_obj.post(post_url, data=post_data, timeout=30, stream=True, verify=False, headers=req_headers)
+            else:
+                resp = sess_obj.get(url, timeout=30, stream=True, verify=False, headers=req_headers)
             if resp.status_code < 400:
                 hdr = {k.lower(): v for k, v in resp.headers.items()}
                 cd = hdr.get("content-disposition", "")
@@ -1501,24 +1697,35 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     # P1-D: skip the browser entirely once this host's tunnel failures
     # tripped the breaker -- launching another StealthySession per
     # candidate would burn the time budget on a dead tunnel. The curl
-    # fallback below still runs (it may use a working env proxy).
+    # fallback below still runs directly (unless --proxy is specified).
     if HAS_SCRAPLING and tracker.is_tripped(url):
         if tracker.take_skip_notice(url):
             print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
                   f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器下载尝试。")
         last_error = f"browser: tunnel failure fast-fail for {tunnel_failure_host(url)}"
-    elif HAS_SCRAPLING:
+    elif HAS_SCRAPLING and (deadline is None or time.monotonic() < deadline):
         tmp_path = None
+        owns_session = stealth_session_holder is None
+        session_stealth = None
+        page = None
         try:
             from scrapling.fetchers import StealthySession
             # P1-D: Playwright proxy dict (same --proxy syntax as
             # journal_downloader.py); omitted entirely when no proxy.
+            timeout_ms = 30000
+            if deadline is not None:
+                rem_ms = int((deadline - time.monotonic()) * 1000)
+                if rem_ms <= 0:
+                    raise TimeoutError("Phase deadline reached before browser download")
+                timeout_ms = max(1000, min(30000, rem_ms))
             _stealth_kwargs = {
-                "headless": True,
+                "headless": not headful,
                 "solve_cloudflare": True,
-                "network_idle": True,
-                "timeout": 60000,
+                "network_idle": False,
+                "timeout": timeout_ms,
             }
+            if real_chrome:
+                _stealth_kwargs["real_chrome"] = True
             _proxy_cfg = playwright_proxy_config(proxy)
             if _proxy_cfg is not None:
                 _stealth_kwargs["proxy"] = _proxy_cfg
@@ -1526,39 +1733,92 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             # every fresh StealthySession context, not just the first
             # fetch -- proxy mode only; no proxy means no trust keys.
             _stealth_kwargs.update(proxy_browser_trust_kwargs(proxy))
-            session_stealth = StealthySession(**_stealth_kwargs)
-            session_stealth.start()
-            context = session_stealth.context
-            if cookies:
-                normalized_c = normalize_playwright_cookies(cookies, default_url=url)
-                if normalized_c:
-                    try:
-                        context.add_cookies(normalized_c)
-                    except Exception:
-                        pass
+            if not owns_session and stealth_session_holder.get("session") is not None:
+                session_stealth = stealth_session_holder["session"]
+                context = session_stealth.context
+            else:
+                session_stealth = StealthySession(**_stealth_kwargs)
+                session_stealth.start()
+                context = session_stealth.context
+                if cookies:
+                    normalized_c = normalize_playwright_cookies(cookies, default_url=url)
+                    if normalized_c:
+                        try:
+                            context.add_cookies(normalized_c)
+                        except Exception:
+                            pass
+                if not owns_session:
+                    stealth_session_holder["session"] = session_stealth
             page = context.new_page()
-
-            parsed = urlparse(url)
-            base_url = f"{parsed.scheme}://{parsed.netloc}/"
             try:
-                page.goto(base_url, wait_until="commit")
+                page.set_default_timeout(timeout_ms)
             except Exception:
                 pass
 
-            with page.expect_download(timeout=10000) as download_info:
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}/"
+            if owns_session or not stealth_session_holder.get("visited_origins") or base_url not in stealth_session_holder["visited_origins"]:
                 try:
-                    page.goto(url, wait_until="commit")
-                except Exception as e:
-                    if "Download is starting" not in str(e):
-                        raise
-            download = download_info.value
-            if hasattr(download, "suggested_filename") and download.suggested_filename:
-                real_name = sanitize_filename(download.suggested_filename)
-                fname = disambiguate_target_filename(output_dir, real_name, url, manifest)
-                filepath = os.path.join(output_dir, fname)
-            tmp_path = temp_path_for(filepath)
-            download.save_as(tmp_path)
-            session_stealth.close()
+                    page.goto(base_url, wait_until="commit", timeout=min(10000, timeout_ms))
+                    if not owns_session:
+                        stealth_session_holder.setdefault("visited_origins", set()).add(base_url)
+                except Exception:
+                    pass
+
+            dl_timeout_ms = min(15000, timeout_ms)
+            if deadline is not None:
+                rem_ms = int((deadline - time.monotonic()) * 1000)
+                if rem_ms <= 0:
+                    raise TimeoutError("Phase deadline reached before browser request")
+                dl_timeout_ms = min(dl_timeout_ms, max(500, rem_ms))
+            pw_req_ok = False
+            _pw_ct = ""
+            if getattr(context, "request", None) is not None:
+                tmp_path = temp_path_for(filepath)
+                pw_req_ok, _pw_ct = download_via_playwright_request(
+                    context,
+                    url,
+                    tmp_path,
+                    headers={"Referer": referer} if referer else None,
+                    timeout_ms=dl_timeout_ms,
+                )
+                if pw_req_ok and os.path.exists(tmp_path):
+                    _pw_valid, _ = validate_downloaded_file(
+                        tmp_path, headers={"content-type": _pw_ct} if _pw_ct else None
+                    )
+                    if not _pw_valid:
+                        discard_temp_file(tmp_path)
+                        tmp_path = None
+                        pw_req_ok = False
+
+            if not pw_req_ok:
+                if deadline is not None:
+                    rem_ms = int((deadline - time.monotonic()) * 1000)
+                    if rem_ms <= 0:
+                        raise TimeoutError("Phase deadline reached before browser download")
+                    timeout_ms = min(timeout_ms, rem_ms)
+                with page.expect_download(timeout=10000 if deadline is None else min(10000, timeout_ms)) as download_info:
+                    try:
+                        page.goto(url, wait_until="commit", timeout=timeout_ms)
+                    except Exception as e:
+                        if "Download is starting" not in str(e):
+                            raise
+                download = download_info.value
+                if hasattr(download, "suggested_filename") and download.suggested_filename:
+                    real_name = sanitize_filename(download.suggested_filename)
+                    fname = disambiguate_target_filename(output_dir, real_name, url, manifest)
+                    filepath = os.path.join(output_dir, fname)
+                tmp_path = temp_path_for(filepath)
+                download.save_as(tmp_path)
+            if owns_session:
+                session_stealth.close()
+                session_stealth = None
+            else:
+                try:
+                    page.close()
+                except Exception:
+                    pass
+                page = None
 
             # Re-home under the inferred extension (if any) so validation
             # sees the real extension, as in Method 1.
@@ -1574,7 +1834,10 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                     os.replace(tmp_path, _new_tmp)
                     tmp_path = _new_tmp
 
-            is_val, reason = validate_downloaded_file(tmp_path)
+            is_val, reason = validate_downloaded_file(
+                tmp_path,
+                headers={"content-type": _pw_ct} if (pw_req_ok and _pw_ct) else None,
+            )
             if is_val:
                 commit_temp_file(tmp_path, filepath)
                 tmp_path = None
@@ -1606,22 +1869,47 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             if tracker.record_failure(url, e):
                 print(f"  [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
                       f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
-            try:
-                session_stealth.close()
-            except Exception:
-                pass
+            if owns_session and session_stealth is not None:
+                try:
+                    session_stealth.close()
+                except Exception:
+                    pass
+            elif not owns_session and stealth_session_holder is not None and session_stealth is not None:
+                # Reset broken shared session so next candidate can reopen cleanly if needed
+                try:
+                    session_stealth.close()
+                except Exception:
+                    pass
+                stealth_session_holder["session"] = None
         finally:
+            if page is not None:
+                try:
+                    page.close()
+                except Exception:
+                    pass
             discard_temp_file(tmp_path)
 
     # Method 4: curl (cross-platform fallback)
+    if deadline is not None and time.monotonic() >= deadline:
+        reason_msg = last_error or "phase deadline reached"
+        if error_out is not None:
+            error_out["reason"] = reason_msg
+        print(f"FAIL ({reason_msg})")
+        return None
     # H9: curl writes to a temp file, which is validated and then committed
     # with os.replace; a failure only discards the temp file.
     tmp_path = None
     try:
         curl_cmd = "curl.exe" if sys.platform.startswith("win") else "curl"
         tmp_path = temp_path_for(filepath)
-        cmd = [curl_cmd, "--fail", "--max-time", "120", "-s", "-L", "-o", tmp_path, url]
-        res = subprocess.run(cmd, timeout=120)
+        curl_timeout = 120 if deadline is None else max(5, min(120, int(deadline - time.monotonic())))
+        cmd = [curl_cmd, "--fail", "--max-time", str(curl_timeout), "-s", "-L"]
+        if proxy:
+            cmd.extend(["--proxy", proxy])
+        else:
+            cmd.extend(["--noproxy", "*"])
+        cmd.extend(["-o", tmp_path, url])
+        res = subprocess.run(cmd, timeout=curl_timeout + 5)
         if res.returncode == 0 and os.path.exists(tmp_path):
             # Re-home under the inferred extension (if any) so validation
             # sees the real extension, as in Method 1.
@@ -1665,6 +1953,8 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     finally:
         discard_temp_file(tmp_path)
 
+    if error_out is not None and last_error:
+        error_out["reason"] = single_line(last_error)
     print(f"FAIL ({single_line(last_error)})" if last_error else "FAIL")
     return None
 
@@ -1686,6 +1976,7 @@ def fetch_page_html(
     browser_budget=None,
     browser_goto_timeout=None,
     deadline=None,
+    real_chrome: bool = False,
 ):
     """
     Fetch article page HTML, trying requests then Scrapling StealthyFetcher.
@@ -1799,27 +2090,40 @@ def fetch_page_html(
             # P1 C: the requests timeout is a real interrupt, but the
             # old hardcoded 30s could overshoot the phase on its own --
             # clamp it to the remaining phase budget when one is set.
-            req_timeout = 30
+            req_timeout = 15.0
             if deadline is not None:
-                req_timeout = min(30.0, deadline - time.monotonic())
+                req_timeout = min(15.0, max(1.0, deadline - time.monotonic()))
             resp = session.get(url, timeout=req_timeout, verify=False)
-            if resp.status_code < 400:
+            if resp.status_code < 400 and resp.status_code != 202:
+                enc = getattr(resp, "encoding", None)
+                if isinstance(enc, str) and enc.lower() in ("iso-8859-1", "latin-1", "latin1"):
+                    app_enc = getattr(resp, "apparent_encoding", None)
+                    if isinstance(app_enc, str) and app_enc:
+                        resp.encoding = app_enc
                 final_url = resp.url or url
-                text = resp.text
-                # H1: shared blocked-page check (challenge / login wall),
-                # not just the old Cloudflare substring list.
-                is_challenge = is_blocked_page(text)
-                if HAS_SCANSCI:
-                    try:
-                        from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
-                        if _is_challenge_page(text) or _is_elsevier_crasolve(final_url, text):
-                            is_challenge = True
-                    except Exception:
-                        pass
-                if not is_challenge:
-                    return text, resp.status_code, final_url
+                text = resp.text or ""
+                if not text.strip():
+                    print("    (Empty response body, falling through to browser...)")
                 else:
-                    print("    (Cloudflare / anti-bot challenge detected, falling through to browser...)")
+                    # H1: shared blocked-page check (challenge / login wall),
+                    # not just the old Cloudflare substring list.
+                    is_challenge = is_blocked_page(text) or (
+                        "/verify/" in final_url.lower() and "cnki.net" in final_url.lower()
+                    )
+                    if HAS_SCANSCI:
+                        try:
+                            from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
+                            visible_for_scan = strip_nonvisible_html(text)
+                            if _is_challenge_page(visible_for_scan) or _is_elsevier_crasolve(final_url, visible_for_scan):
+                                is_challenge = True
+                        except Exception:
+                            pass
+                    if not is_challenge:
+                        return text, resp.status_code, final_url
+                    else:
+                        print("    (Cloudflare / anti-bot challenge detected, falling through to browser...)")
+            elif resp.status_code == 202:
+                print("    (HTTP 202 WAF challenge shell, falling through to browser...)")
         except Exception:
             pass
 
@@ -1838,13 +2142,20 @@ def fetch_page_html(
                   f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过浏览器抓取。")
         return "", 0, url
     if HAS_SCRAPLING:
+        _attempt_ms = budget.attempt_timeout_ms()
+        if _attempt_ms <= 0:
+            budget.announce_exhausted()
+            return "", 0, url
         sc_args = {
             "headless": not headful,
             "solve_cloudflare": True,
-            "network_idle": True,
-            "timeout": budget.attempt_timeout_ms(),
+            "network_idle": False,
+            "timeout": _attempt_ms,
+            "retries": 1,
             "page_action": expand_page_accordions_action,
         }
+        if real_chrome and not cdp_url:
+            sc_args["real_chrome"] = True
         # P1-D: same --proxy syntax as journal_downloader.py; omitted
         # entirely when no proxy so unset behaviour is unchanged.
         if proxy:
@@ -1863,7 +2174,7 @@ def fetch_page_html(
             sc_args["cookies"] = normalize_playwright_cookies(play_cookies, default_url=url)
 
         try:
-            page = StealthyFetcher.fetch(url, **sc_args)
+            page = stealthy_fetch_bounded(StealthyFetcher, url, **sc_args)
             html_content = str(page.html_content)
             final_url = getattr(page, "url", None) or url
             if page_fetch_is_failure(html_content, page.status):
@@ -1872,6 +2183,9 @@ def fetch_page_html(
                     return "", 0, final_url
                 # Retry without CDP via the handler below.
                 raise RuntimeError("StealthyFetcher returned a blocked page")
+            _pc = getattr(page, "cookies", None)
+            if isinstance(play_cookies, list) and isinstance(_pc, (list, tuple, dict)) and _pc:
+                play_cookies[:] = merge_cookies(play_cookies, _pc)
             tracker.record_success(url)
             return html_content, page.status, final_url
         except Exception as e:
@@ -1887,60 +2201,33 @@ def fetch_page_html(
             if budget.exhausted:
                 budget.announce_exhausted()
             if cdp_url and not tracker.is_tripped(url) and not budget.exhausted:
-                print("    (Retrying without CDP using standalone stealth browser...)")
-                try:
-                    sc_nocdp = dict(sc_args)
-                    sc_nocdp.pop("cdp_url", None)
-                    # P1 H-1: re-cap the retry at the remaining budget --
-                    # the first attempt already spent goto time.
-                    sc_nocdp["timeout"] = budget.attempt_timeout_ms()
-                    page = StealthyFetcher.fetch(url, **sc_nocdp)
-                    html_content = str(page.html_content)
-                    final_url = getattr(page, "url", None) or url
-                    if page_fetch_is_failure(html_content, page.status):
-                        print("    StealthyFetcher standalone page is blocked or an error page.")
-                        return "", 0, final_url
-                    tracker.record_success(url)
-                    return html_content, page.status, final_url
-                except Exception as e2:
-                    print(f"    StealthyFetcher standalone error: {e2}")
-                    if tracker.record_failure(url, e2):
-                        print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
-                              f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
-                    # P1 H-1: same downgrade point as the first attempt.
-                    if budget.exhausted:
-                        budget.announce_exhausted()
+                _nocdp_ms = budget.attempt_timeout_ms()
+                if _nocdp_ms > 0:
+                    print("    (Retrying without CDP using standalone stealth browser...)")
+                    try:
+                        sc_nocdp = dict(sc_args)
+                        sc_nocdp.pop("cdp_url", None)
+                        # P1 H-1: re-cap the retry at the remaining budget --
+                        # the first attempt already spent goto time.
+                        sc_nocdp["timeout"] = _nocdp_ms
+                        page = stealthy_fetch_bounded(StealthyFetcher, url, **sc_nocdp)
+                        html_content = str(page.html_content)
+                        final_url = getattr(page, "url", None) or url
+                        if page_fetch_is_failure(html_content, page.status):
+                            print("    StealthyFetcher standalone page is blocked or an error page.")
+                            return "", 0, final_url
+                        tracker.record_success(url)
+                        return html_content, page.status, final_url
+                    except Exception as e2:
+                        print(f"    StealthyFetcher standalone error: {e2}")
+                        if tracker.record_failure(url, e2):
+                            print(f"    [Tunnel] {TUNNEL_FAST_FAIL_MESSAGE}: {tunnel_failure_host(url)} "
+                                  f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
+                        # P1 H-1: same downgrade point as the first attempt.
+                        if budget.exhausted:
+                            budget.announce_exhausted()
 
     return html_content, 0, final_url
-
-
-def _finish_success(tier_name, files, article_dir, doi, url, args, config, bsk_runtime=None):
-    """Common success handler: print summary, rename folder, check for extra supplements."""
-    print(f"\n✓ {tier_name} Success: {len(files)} supplementary file(s) downloaded.")
-    print(f"  Output: {os.path.abspath(article_dir)}")
-
-    try:
-        lookup_doi = doi if is_doi(extract_doi(doi) or "") else (config.get("_last_api_doi") or doi)
-        title = _quick_title_lookup(lookup_doi, url) or config.get("_last_api_title")
-        if title:
-            clean_t = sanitize_filename(title)
-            if not is_placeholder_or_blocked_title(clean_t) and clean_t.lower() != "supplements":
-                new_dir = os.path.join(args.output_dir, clean_t)
-                if os.path.abspath(new_dir) != os.path.abspath(article_dir):
-                    article_dir = migrate_or_merge_article_dir(article_dir, new_dir)
-                    print(f"  Renamed to: {os.path.abspath(article_dir)}")
-    except Exception:
-        pass
-
-    print("\n  Checking for additional supplements via page scrape...")
-    scraped_dir = _try_page_scrape_supplements(url, article_dir, config, args, files, bsk_runtime=bsk_runtime)
-    if scraped_dir:
-        article_dir = scraped_dir
-
-    if getattr(args, "convert_markdown", False):
-        print("\n  [Post-Processing] Converting downloaded supplements to Markdown via Microsoft MarkItDown...")
-        converted = convert_directory_supplements(article_dir)
-        print(f"  Converted {len(converted)} file(s) to Markdown sidecars.")
 
 
 def _quick_title_lookup(doi, url, allow_oa=True):
@@ -1959,10 +2246,11 @@ def _quick_title_lookup(doi, url, allow_oa=True):
                 return clean_title
 
             # Fallback to CrossRef API
+            crossref_email = os.environ.get("CROSSREF_EMAIL") or DEFAULT_UNPAYWALL_EMAIL
             resp = requests.get(
                 f"https://api.crossref.org/works/{doi_clean}",
                 timeout=10,
-                headers={"User-Agent": "ScanSci-Supp-Downloader/2.0 (mailto:scansci@example.com)"},
+                headers={"User-Agent": f"ScanSci-Supp-Downloader/2.0 (mailto:{crossref_email})"},
             )
             if resp.status_code == 200:
                 data = resp.json()
@@ -1979,7 +2267,7 @@ def _quick_title_lookup(doi, url, allow_oa=True):
     return None
 
 
-def _try_page_scrape_supplements(url, article_dir, config, args, existing_files, bsk_runtime=None):
+def _try_page_scrape_supplements(url, article_dir, config, args, existing_files, bsk_runtime=None, deadline=None):
     """
     After CDN success, scrape the page for non-CDN supplement links.
     Falls back to browser rendering if raw HTML is blocked or incomplete (Fixing Issue #4).
@@ -1988,9 +2276,8 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
         cdp_target = getattr(args, "cdp_url", None)
         # P1-D: proxy / tunnel breaker for this run's browser attempts.
         _scrape_proxy = getattr(args, "proxy", None)
-        # P1 H-1: same 30s-goto / 60s-total fallback budget as the main
-        # run (fresh here: this scrape is a separate post-success pass).
-        _scrape_budget = browser_budget_from_args(args)
+        # P1 H-1: bind post-success scrape budget to the shared phase deadline when provided.
+        _scrape_budget = browser_budget_from_args(args, phase_deadline=deadline)
         session, play_cookies = _setup_authenticated_session_and_cookies(config, args, cdp_target=cdp_target)
 
         html_content, status, final_url = fetch_page_html(
@@ -2003,6 +2290,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
             proxy=_scrape_proxy,
             tunnel_tracker=_TUNNEL_TRACKER,
             browser_budget=_scrape_budget,
+            deadline=deadline,
         )
 
         url_to_use = final_url or url
@@ -2034,6 +2322,7 @@ def _try_page_scrape_supplements(url, article_dir, config, args, existing_files,
                 proxy=_scrape_proxy,
                 tunnel_tracker=_TUNNEL_TRACKER,
                 browser_budget=_scrape_budget,
+                deadline=deadline,
             )
             if html_content_b:
                 html_content = html_content_b
@@ -2252,12 +2541,17 @@ def count_tier_files_on_disk(api_files, cdn_files, article_dir, successful=()):
     no identifying name (key None) are never excluded.
     """
     counted_keys = set()
+    counted_urls = set()
     for cand in successful or ():
         for name in (getattr(cand, "filename", "") or "",
                      extract_filename_from_url(cand.url or "")):
             key = filename_dedup_key(name)
             if key is not None:
                 counted_keys.add(key)
+        cand_url = (getattr(cand, "url", "") or "").split("#")[0].strip()
+        if cand_url:
+            counted_urls.add(_normalize_url_for_dedup(cand_url))
+    manifest = load_download_manifest(article_dir) if article_dir and os.path.isdir(article_dir) else {}
     seen = set()
     on_disk = 0
     for files in (api_files or [], cdn_files or []):
@@ -2268,6 +2562,9 @@ def count_tier_files_on_disk(api_files, cdn_files, article_dir, successful=()):
             seen.add(name)
             key = filename_dedup_key(name)
             if key is not None and key in counted_keys:
+                continue
+            m_url = manifest_entry_url(manifest.get(name)).split("#")[0].strip()
+            if m_url and _normalize_url_for_dedup(m_url) in counted_urls:
                 continue
             resolved = path if os.path.exists(path) else os.path.join(article_dir, name)
             if os.path.exists(resolved):
@@ -2434,6 +2731,7 @@ def main():
     parser.add_argument("--cdp", action="store_true", help="Connect to running Chromium browser via CDP (inherits live session, cookies, Cloudflare bypass)")
     parser.add_argument("--cdp-url", default=None, help="Custom CDP endpoint URL or port (e.g. http://127.0.0.1:9222, ws://... or 9222)")
     add_browserskill_arguments(parser)
+    add_auto_browser_arguments(parser)
     parser.add_argument("--convert-markdown", "--markitdown", dest="convert_markdown", action="store_true", help="Convert downloaded supplementary documents (.docx, .xlsx, .pdf) to Markdown via Microsoft MarkItDown")
     args = parser.parse_args()
 
@@ -2460,7 +2758,19 @@ def run_download(args, bsk_runtime):
     # discovery and the download loop below.
     phase_timeout = resolve_phase_timeout(getattr(args, "phase_timeout", None))
     phase_deadline = time.monotonic() + phase_timeout
+    download_reserve = min(30.0, phase_timeout * 0.25)
+    discovery_retry_deadline = phase_deadline - download_reserve
     print(f"  Phase timeout: {phase_timeout:g}s")
+
+    def _discovery_retry_allowed(has_candidates: bool) -> bool:
+        """Reserve a download window once candidates are already in hand so
+        secondary discovery stages cannot starve actual file downloads."""
+        now = time.monotonic()
+        if now >= phase_deadline:
+            return False
+        if has_candidates and now >= discovery_retry_deadline:
+            return False
+        return True
 
     # P1 H-1: the browser fallback's own quota (default: one goto 30s,
     # 60s total per phase), shared by every browser attempt below.
@@ -2499,7 +2809,7 @@ def run_download(args, bsk_runtime):
         _TUNNEL_TRACKER.threshold = DEFAULT_TUNNEL_FAILURE_THRESHOLD
     _TUNNEL_TRACKER.reset()
 
-    config = load_config() if HAS_SCANSCI else {}
+    config = load_config() if callable(globals().get("load_config")) else {}
     if os.environ.get("ELSEVIER_API_KEY"):
         config["elsevier_api_key"] = os.environ["ELSEVIER_API_KEY"].strip()
     if os.environ.get("IS_CAMPUS_NETWORK"):
@@ -2507,6 +2817,10 @@ def run_download(args, bsk_runtime):
         config["is_campus_network"] = val in ("1", "true", "yes", "y")
     if os.environ.get("ELSEVIER_INSTTOKEN"):
         config["elsevier_insttoken"] = os.environ["ELSEVIER_INSTTOKEN"].strip()
+    if os.environ.get("CROSSREF_EMAIL"):
+        config["crossref_email"] = os.environ["CROSSREF_EMAIL"].strip()
+    if os.environ.get("UNPAYWALL_EMAIL"):
+        config["unpaywall_email"] = os.environ["UNPAYWALL_EMAIL"].strip()
     os.makedirs(args.output_dir, exist_ok=True)
 
     if getattr(args, "browserskill", False):
@@ -2527,6 +2841,25 @@ def run_download(args, bsk_runtime):
 
     # ── Step 1: Resolve DOI / URL ─────────────────────────────────────────
     doi = args.url_or_doi
+    if HAS_SCANSCI and isinstance(doi, str):
+        try:
+            from scansci_pdf.identifiers import normalize_doi_unicode
+            _doi_stripped = doi.strip()
+            _doi_url_m = re.match(r"^(https?://(?:dx\.)?doi\.org/)(.+)$", _doi_stripped, re.IGNORECASE)
+            if _doi_url_m:
+                _norm_part = normalize_doi_unicode(_doi_url_m.group(2))
+                if _norm_part:
+                    doi = f"{_doi_url_m.group(1)}{_norm_part}"
+            elif _doi_stripped.lower().startswith("doi:"):
+                _norm_part = normalize_doi_unicode(_doi_stripped[4:].strip())
+                if _norm_part:
+                    doi = _norm_part
+            elif not _doi_stripped.lower().startswith(("http://", "https://")):
+                _norm_part = normalize_doi_unicode(_doi_stripped)
+                if _norm_part:
+                    doi = _norm_part
+        except Exception:
+            pass
     url = resolve_doi_url(doi)
     url = normalize_url(url)
     print(f"  Normalized:  {url}")
@@ -2568,14 +2901,21 @@ def run_download(args, bsk_runtime):
                    if (match := MMC_NUM_REGEX.search(os.path.basename(path)))}
     api_missing_mmcs = known_mmcs - api_mmc_ids
     if pii and not args.skip_cdn and not args.list_only and (not api_files or api_missing_mmcs):
+        tier0_budget = min(phase_deadline, time.monotonic() + min(25.0, phase_timeout * 0.25))
         cdn_files = try_elsevier_cdn_brute_force(
             pii, article_dir,
             max_mmc=args.max_mmc,
             max_consecutive_misses=args.max_misses,
             known_mmcs=known_mmcs,
+            deadline=tier0_budget,
         )
 
     # Keep successful artifacts while discovering remaining sources.
+
+    # Start the browser fallback clock when Tier 1/2 actually begins so Tier A/Tier 0
+    # HTTP probing does not pre-consume browser_fallback_budget (phase_deadline still caps it).
+    if not getattr(browser_budget, "_announced", False):
+        browser_budget._started_at = time.monotonic()
 
     # ── Step 4: Tier 1/2 — Page Scrape + Link Download ───────────────────
     print(f"\n[Tier 1/2] Fetching article page for supplement links...")
@@ -2609,11 +2949,50 @@ def run_download(args, bsk_runtime):
             if bsk_runtime.browser or bsk_runtime.tab_id:
                 raise
             print(f"  [BrowserSkill] Recovery failed: {exc}")
+    _chooser_seed_urls = []
+    _tried_chooser_urls = []
+    if is_crossref_chooser_url(final_url or url) and time.monotonic() < phase_deadline:
+        chooser_urls = extract_crossref_chooser_urls(
+            html_str=html_content or "",
+            doi=doi or (args.url_or_doi if is_doi(args.url_or_doi) else ""),
+            proxy=proxy or "",
+            crossref_email=str(config.get("crossref_email") or config.get("unpaywall_email") or ""),
+        )
+        _chooser_seed_urls = list(chooser_urls)
+        for ch_url in chooser_urls[:2]:
+            if time.monotonic() >= phase_deadline:
+                break
+            _tried_chooser_urls.append(ch_url)
+            print(f"  [chooser] Retrying Crossref chooser target: {ch_url}")
+            ch_html, ch_status, ch_final = fetch_page_html(
+                ch_url,
+                session,
+                play_cookies,
+                args.headful,
+                cdp_url=ws_cdp_url,
+                use_bsk=getattr(args, "browserskill", False),
+                bsk_browser=getattr(args, "bsk_browser", None),
+                bsk_runtime=bsk_runtime,
+                bsk_tab=getattr(args, "bsk_tab", None),
+                proxy=proxy,
+                tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=browser_budget,
+                deadline=phase_deadline,
+            )
+            if ch_html and (ch_status is None or ch_status < 400) and not is_blocked_page(ch_html):
+                html_content, status, final_url = ch_html, ch_status, ch_final or ch_url
+                break
+            if ch_html and not html_content:
+                html_content, status, final_url = ch_html, ch_status, ch_final or ch_url
     if not html_content:
         print("  ERROR: Failed to fetch article page.")
         print("  Continuing with OA discovery where a DOI is available.")
         html_content = ""
         final_url = final_url or url
+
+    _initial_page_blocked = (not html_content) or page_fetch_is_failure(html_content, status)
+    effective_headful = bool(getattr(args, "headful", False))
+    effective_real_chrome = False
 
     url = final_url
     effective_base = extract_effective_base_url(html_content, url)
@@ -2633,7 +3012,7 @@ def run_download(args, bsk_runtime):
         nonlocal article_dirname, article_dir
         new_t = ""
         if raw_title and not is_placeholder_or_blocked_title(raw_title):
-            new_t = sanitize_filename(raw_title)
+            new_t = extract_article_title(f"<title>{html.escape(raw_title)}</title>", default="") or sanitize_filename(raw_title)
         elif new_html:
             extracted = extract_article_title(new_html, default="")
             if extracted and not is_placeholder_or_blocked_title(extracted):
@@ -2655,8 +3034,72 @@ def run_download(args, bsk_runtime):
     print("\n  Scanning for supplementary data links...")
     diag = find_all_candidates(html_content, effective_base, original_url=args.url_or_doi)
     candidates = diag.candidates
+    if not candidates or any(c.extra_info.get("sciengine_attachment") for c in candidates):
+        _se_proxies = {"http": proxy, "https": proxy} if proxy else None
+        se_cands, se_title = (
+            fetch_sciengine_api_candidates(args.url_or_doi, source_url=url or effective_base, proxies=_se_proxies)
+            if _se_proxies
+            else fetch_sciengine_api_candidates(args.url_or_doi, source_url=url or effective_base)
+        )
+        if se_title and is_placeholder_or_blocked_title(article_dirname):
+            _refresh_dir_from_html_or_title(raw_title=se_title)
+        if se_cands:
+            non_synth = [c for c in candidates if not c.extra_info.get("sciengine_attachment")]
+            seen_se = {c.url for c in non_synth}
+            candidates = non_synth + [c for c in se_cands if c.url not in seen_se]
+            diag.candidates = candidates
+            diag.needs_browser = False
+            diag.is_incomplete, diag.incomplete_reason = is_result_obviously_incomplete(
+                candidates, html_content, article_text=getattr(diag, "_article_text", None)
+            )
+    if not candidates and (is_diva_target(args.url_or_doi) or is_diva_target(url)):
+        diva_cands, diva_title = discover_diva_candidates(
+            args.url_or_doi if is_diva_target(args.url_or_doi) else url,
+            proxy=proxy or "",
+        )
+        if diva_title and is_placeholder_or_blocked_title(article_dirname):
+            _refresh_dir_from_html_or_title(raw_title=diva_title)
+        if diva_cands:
+            candidates = diva_cands
+            diag.candidates = candidates
+            diag.needs_browser = False
+    if not candidates and (is_gsa_or_gsw_target(args.url_or_doi) or is_gsa_or_gsw_target(url)):
+        gsa_cands, gsa_title = discover_gsa_figshare_candidates(
+            args.url_or_doi if is_gsa_or_gsw_target(args.url_or_doi) else url,
+            proxy=proxy or "",
+            crossref_email=str(config.get("crossref_email") or config.get("unpaywall_email") or ""),
+        )
+        if gsa_title and is_placeholder_or_blocked_title(article_dirname):
+            _refresh_dir_from_html_or_title(raw_title=gsa_title)
+        if gsa_cands:
+            candidates = gsa_cands
+            diag.candidates = candidates
+            diag.needs_browser = False
+    figshare_doi = (
+        extract_doi(doi)
+        or extract_doi(args.url_or_doi)
+        or extract_doi(url)
+        or extract_doi_from_html(html_content or "")
+    )
+    if not candidates and figshare_doi:
+        fig_cands, fig_title = discover_figshare_by_doi(
+            figshare_doi,
+            proxy=proxy or "",
+        )
+        if fig_title and is_placeholder_or_blocked_title(article_dirname):
+            _refresh_dir_from_html_or_title(raw_title=fig_title)
+        if fig_cands:
+            candidates = fig_cands
+            diag.candidates = candidates
+            diag.needs_browser = False
     evidence = DiscoveryEvidence()
-    evidence.observe("publisher", html_content, effective_base)
+    evidence.observe(
+        "publisher",
+        html_content,
+        effective_base,
+        soup=getattr(diag, "_soup", None),
+        article_text=getattr(diag, "_article_text", None),
+    )
 
     # Check completeness: trigger browser rendering on partial hits (Fixing Issue #4)
     # H3: also force a browser render when the static page shows dynamic
@@ -2687,13 +3130,15 @@ def run_download(args, bsk_runtime):
                                deadline=phase_deadline)
 
     mirrors = MirrorDiscovery(doi_val, not args.no_oa, resolve_oa_info, fetch_mirror, evidence)
+    if html_content and hasattr(mirrors, "seed_seen_pages"):
+        mirrors.seed_seen_pages([args.url_or_doi, url, effective_base])
     # P1 C: the mirror round is a page-load round -- it must not start
     # once the phase deadline has passed inside the publisher fetch
     # above (round 3: the phase died in a load and the next rounds
     # still launched loads until the runner killed the process). The
     # candidates found so far still reach the download loop below,
     # where download_with_recovery prints the graceful-stop line.
-    if (not candidates or is_inc or args.oa) and time.monotonic() < phase_deadline:
+    if (args.oa or _discovery_retry_allowed(bool(candidates))) and (not candidates or is_inc or args.oa) and time.monotonic() < phase_deadline:
         known = {c.url for c in candidates}
         additions = [c for c in mirrors.discover() if c.url not in known]
         candidates = additions + candidates if args.oa else candidates + additions
@@ -2718,20 +3163,31 @@ def run_download(args, bsk_runtime):
 
     is_inc, inc_reason = evidence.check(candidates)
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and HAS_SCRAPLING and session and not args.browserskill and _browser_allowed():
+    if _discovery_retry_allowed(bool(candidates)) and (not candidates or is_inc or needs_browser_retry) and not _initial_page_blocked and bool(html_content.strip()) and HAS_SCRAPLING and session and not args.browserskill and _browser_allowed():
         print(f"  Incomplete candidate set ({inc_reason}). Falling back to browser rendering (JS execution)...")
         html_content_browser, status_browser, final_url_browser = fetch_page_html(
             url, session, play_cookies, args.headful, force_browser=True, cdp_url=ws_cdp_url,
             proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
             browser_budget=browser_budget,
+            deadline=phase_deadline,
         )
         if html_content_browser:
             url = final_url_browser or url
             effective_base_b = extract_effective_base_url(html_content_browser, url)
-            evidence.observe("publisher", html_content_browser, effective_base_b)
             diag_b = find_all_candidates(html_content_browser, effective_base_b, original_url=args.url_or_doi)
+            evidence.observe(
+                "publisher",
+                html_content_browser,
+                effective_base_b,
+                soup=getattr(diag_b, "_soup", None),
+                article_text=getattr(diag_b, "_article_text", None),
+            )
             seen_urls = {c.url for c in candidates}
-            new_candidates = [c for c in diag_b.candidates if c.url not in seen_urls]
+            has_se_api = any(c.match_rule == "sciengine_open_api" for c in candidates)
+            new_candidates = [
+                c for c in diag_b.candidates
+                if c.url not in seen_urls and not (has_se_api and c.extra_info.get("sciengine_attachment"))
+            ]
             if new_candidates:
                 candidates.extend(new_candidates)
                 html_content = html_content_browser
@@ -2744,7 +3200,7 @@ def run_download(args, bsk_runtime):
     # Tier 3 (CDP Live Browser Probe): Only when CDP is explicitly requested via --cdp / --cdp-url
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled and _browser_allowed():
+    if _discovery_retry_allowed(bool(candidates)) and (args.cdp or args.cdp_url) and (not candidates or is_inc or needs_browser_retry) and not ws_cdp_url and HAS_SCRAPLING and not bsk_runtime.enabled and _browser_allowed():
         detected = discover_active_cdp_port()
         if detected:
             print(f"\n[Tier 3] Probing via running browser CDP session ({detected[0]})...")
@@ -2765,11 +3221,18 @@ def run_download(args, bsk_runtime):
                 url, session, play_cookies, args.headful, force_browser=True, cdp_url=detected[0],
                 proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER,
                 browser_budget=browser_budget,
+                deadline=phase_deadline,
             )
             if cdp_html:
                 cdp_base = extract_effective_base_url(cdp_html, cdp_final or url)
-                evidence.observe("publisher", cdp_html, cdp_base)
                 cdp_diag = find_all_candidates(cdp_html, cdp_base, original_url=args.url_or_doi)
+                evidence.observe(
+                    "publisher",
+                    cdp_html,
+                    cdp_base,
+                    soup=getattr(cdp_diag, "_soup", None),
+                    article_text=getattr(cdp_diag, "_article_text", None),
+                )
                 if cdp_diag.candidates:
                     print(f"  ✓ Tier 3 CDP success! Found {len(cdp_diag.candidates)} supplementary file(s) via live browser.")
                     seen_urls = {c.url for c in candidates}
@@ -2787,7 +3250,7 @@ def run_download(args, bsk_runtime):
     # Tier 3-BSK (BrowserSkill Probe): If still no candidates/incomplete, probe via Tencent BrowserSkill
     # H3: needs_browser also forces the probe (same rule as above).
     needs_browser_retry = bool(diag.needs_browser) and (not candidates or is_inc)
-    if (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled and _browser_allowed():
+    if _discovery_retry_allowed(bool(candidates)) and (not candidates or is_inc or needs_browser_retry) and bsk_runtime.enabled and _browser_allowed():
         print(f"\n[Tier 3-BSK] Probing via Tencent BrowserSkill (bsk)...")
         try:
             bsk_html, bsk_status, bsk_final = fetch_page_via_browserskill(
@@ -2799,8 +3262,14 @@ def run_download(args, bsk_runtime):
             )
             if bsk_html and not page_fetch_is_failure(bsk_html, bsk_status):
                 bsk_base = extract_effective_base_url(bsk_html, bsk_final or url)
-                evidence.observe("publisher", bsk_html, bsk_base)
                 bsk_diag = find_all_candidates(bsk_html, bsk_base, original_url=args.url_or_doi)
+                evidence.observe(
+                    "publisher",
+                    bsk_html,
+                    bsk_base,
+                    soup=getattr(bsk_diag, "_soup", None),
+                    article_text=getattr(bsk_diag, "_article_text", None),
+                )
                 if bsk_diag.candidates:
                     print(f"  ✓ Tier 3-BSK success! Found {len(bsk_diag.candidates)} supplementary file(s) via BrowserSkill.")
                     seen_urls = {c.url for c in candidates}
@@ -2820,6 +3289,263 @@ def run_download(args, bsk_runtime):
 
     is_inc, inc_reason = evidence.check(candidates)
 
+    _tier_file_count = len(set(api_files or []) | set(cdn_files or []))
+    _tier_already_satisfied = (
+        _tier_file_count > 0
+        and not api_missing_mmcs
+        and not evidence.tables
+        and (not evidence.files or _tier_file_count >= evidence.files)
+    )
+    _need_auto_browser = (not _tier_already_satisfied) and (
+        is_inc
+        or (
+            not candidates
+            and (
+                _initial_page_blocked
+                or not html_content
+                or len(html_content.strip()) < 2500
+                or bool(getattr(diag, "needs_browser", False))
+            )
+        )
+    )
+    if _need_auto_browser and _discovery_retry_allowed(bool(candidates)) and _browser_allowed():
+        def _try_auto_bsk():
+            try:
+                if not check_browserskill_status(timeout=1.5).get("ready"):
+                    return None
+                if hasattr(bsk_runtime, "enabled"):
+                    bsk_runtime.enabled = True
+                print("\n[Tier 3-Auto] Connected BrowserSkill (bsk) detected; retrying via live browser session...")
+                _bh, _bs, _bf = fetch_page_via_browserskill(
+                    url,
+                    timeout=browser_budget.attempt_timeout(),
+                    runtime=bsk_runtime,
+                )
+                return _bh, _bs, _bf, None
+            except Exception as _exc:
+                print(f"  [Tier 3-Auto:BSK] Notice: {_exc}")
+                return None
+
+        def _try_auto_cdp():
+            try:
+                detected = discover_active_cdp_port()
+                if not detected:
+                    return None
+                _cdp_ep = detected[0]
+                print(f"\n[Tier 3-Auto] Active Chrome CDP detected at {_cdp_ep}; retrying via live browser...")
+                _cdp_c = []
+                try:
+                    _cdp_c = extract_cdp_cookies(_cdp_ep) or []
+                    if _cdp_c:
+                        if session:
+                            for _ck in _cdp_c:
+                                session.cookies.set(_ck.get("name"), _ck.get("value"), domain=_ck.get("domain") or None, path=_ck.get("path", "/"))
+                        if isinstance(play_cookies, list):
+                            play_cookies[:] = merge_cookies(play_cookies, _cdp_c)
+                except Exception:
+                    _cdp_c = []
+                _ch, _cs, _cf = fetch_page_html(
+                    url,
+                    session,
+                    play_cookies,
+                    args.headful,
+                    force_browser=True,
+                    cdp_url=detected[1] or _cdp_ep,
+                    proxy=proxy,
+                    tunnel_tracker=_TUNNEL_TRACKER,
+                    browser_budget=browser_budget,
+                    deadline=phase_deadline,
+                )
+                return _ch, _cs, _cf, None
+            except Exception as _exc:
+                print(f"  [Tier 3-Auto:CDP] Notice: {_exc}")
+                return None
+
+        def _try_auto_headful():
+            nonlocal effective_headful, effective_real_chrome
+            _rc = effective_real_chrome or has_system_chrome()
+            print(f"\n[Tier 3-Auto] Launching standalone headful Chrome fallback (real_chrome={_rc}, network_idle=False)...")
+            try:
+                _hh, _hs, _hu = fetch_page_html(
+                    url,
+                    None,
+                    play_cookies,
+                    True,
+                    force_browser=False,
+                    cdp_url=None,
+                    proxy=proxy,
+                    tunnel_tracker=_TUNNEL_TRACKER,
+                    browser_budget=browser_budget,
+                    deadline=phase_deadline,
+                    real_chrome=_rc,
+                )
+            except Exception as _exc:
+                print(f"  [Tier 3-Auto:Headful] Notice: {_exc}")
+                return None
+            if _hh and not page_fetch_is_failure(_hh, _hs):
+                effective_headful = True
+                effective_real_chrome = _rc
+            return _hh, _hs, _hu, None
+
+        def _evaluate_auto_page(cand_html, cand_status, cand_url, extra_cookies, mode_name):
+            nonlocal url, html_content, effective_base, candidates, diag, is_inc, inc_reason
+            if not cand_html or page_fetch_is_failure(cand_html, cand_status):
+                return False, False
+            if extra_cookies and isinstance(play_cookies, list):
+                play_cookies[:] = merge_cookies(play_cookies, extra_cookies)
+            _u = cand_url or url
+            _base = extract_effective_base_url(cand_html, _u)
+            _d = find_all_candidates(cand_html, _base, original_url=args.url_or_doi)
+            if not _d.candidates and (is_gsa_or_gsw_target(args.url_or_doi) or is_gsa_or_gsw_target(_u)):
+                _gsa_c, _gsa_t = discover_gsa_figshare_candidates(
+                    args.url_or_doi if is_gsa_or_gsw_target(args.url_or_doi) else _u,
+                    proxy=proxy or "",
+                    crossref_email=str(config.get("crossref_email") or config.get("unpaywall_email") or ""),
+                )
+                if _gsa_t and is_placeholder_or_blocked_title(article_dirname):
+                    _refresh_dir_from_html_or_title(raw_title=_gsa_t)
+                if _gsa_c:
+                    _d.candidates = _gsa_c
+            _refresh_dir_from_html_or_title(new_html=cand_html)
+            evidence.observe(
+                "publisher",
+                cand_html,
+                _base,
+                soup=getattr(_d, "_soup", None),
+                article_text=getattr(_d, "_article_text", None),
+            )
+            _seen = {c.url for c in candidates}
+            _new = [c for c in _d.candidates if c.url not in _seen]
+            if _new or not candidates:
+                candidates.extend(_new)
+                if not candidates:
+                    candidates = list(_d.candidates)
+                diag = _d
+                diag.candidates = candidates
+                html_content = cand_html
+                effective_base = _base
+                url = _u
+                is_inc, inc_reason = evidence.check(candidates)
+                if _new:
+                    print(f"  ✓ {mode_name} success! Found {len(_new)} supplementary file(s) (total: {len(candidates)}).")
+                return bool(candidates and not is_inc), bool(_new)
+            if not html_content:
+                html_content = cand_html
+                effective_base = _base
+                url = _u
+                return False, True
+            return False, False
+
+        run_auto_browser_recovery(
+            need_recovery=_need_auto_browser,
+            retry_allowed=_discovery_retry_allowed(bool(candidates)) and time.monotonic() < phase_deadline,
+            browser_allowed_fn=_browser_allowed,
+            try_bsk_fn=_try_auto_bsk,
+            try_cdp_fn=_try_auto_cdp,
+            try_headful_fn=_try_auto_headful,
+            evaluate_fn=_evaluate_auto_page,
+            bsk_enabled=(not getattr(args, "no_bsk", False)) and (not getattr(args, "browserskill", False)) and not bsk_runtime.enabled,
+            cdp_enabled=(not getattr(args, "no_cdp", False)) and (not ws_cdp_url),
+            headful_enabled=(not effective_headful) and (not getattr(args, "no_auto_headful", False)) and has_gui_display(),
+        )
+        is_inc, inc_reason = evidence.check(candidates)
+
+    if not candidates and doi_val and _discovery_retry_allowed(False) and time.monotonic() < phase_deadline:
+        alt_chooser_urls = get_alternate_chooser_urls(
+            doi=doi_val,
+            html_str="",
+            exclude_urls=[args.url_or_doi, url, final_url] + _tried_chooser_urls,
+            seed_urls=_chooser_seed_urls,
+            proxy=proxy or "",
+            crossref_email=str(config.get("crossref_email") or config.get("unpaywall_email") or ""),
+        )
+        for alt_url in alt_chooser_urls[:2]:
+            if time.monotonic() >= phase_deadline:
+                break
+            alt_budget = ensure_phase_browser_budget(
+                browser_budget,
+                phase_deadline=phase_deadline,
+                explicit_budget=getattr(args, "browser_fallback_budget", None),
+            )
+            print(f"\n[chooser-alt] Primary publisher yielded 0 candidates; trying alternate DOI host: {alt_url}")
+            alt_html, alt_status, alt_final = fetch_page_html(
+                alt_url,
+                session,
+                play_cookies,
+                args.headful or effective_headful,
+                cdp_url=ws_cdp_url,
+                use_bsk=getattr(args, "browserskill", False),
+                bsk_browser=getattr(args, "bsk_browser", None),
+                bsk_runtime=bsk_runtime,
+                bsk_tab=getattr(args, "bsk_tab", None),
+                proxy=proxy,
+                tunnel_tracker=_TUNNEL_TRACKER,
+                browser_budget=alt_budget,
+                deadline=phase_deadline,
+                real_chrome=effective_real_chrome,
+            )
+            if (not alt_html or page_fetch_is_failure(alt_html, alt_status)) and (not alt_budget.exhausted) and time.monotonic() < phase_deadline:
+                if (not getattr(args, "no_bsk", False)) and check_browserskill_status(timeout=1.5).get("ready"):
+                    try:
+                        alt_html, alt_status, alt_final = fetch_page_via_browserskill(
+                            alt_url,
+                            timeout=alt_budget.attempt_timeout(),
+                            runtime=bsk_runtime,
+                        )
+                    except Exception:
+                        alt_html = ""
+                if (not alt_html or page_fetch_is_failure(alt_html, alt_status)) and (not getattr(args, "no_auto_headful", False)) and has_gui_display() and time.monotonic() < phase_deadline:
+                    _rc_alt = effective_real_chrome or has_system_chrome()
+                    alt_html, alt_status, alt_final = fetch_page_html(
+                        alt_url,
+                        None,
+                        play_cookies,
+                        True,
+                        force_browser=False,
+                        cdp_url=None,
+                        proxy=proxy,
+                        tunnel_tracker=_TUNNEL_TRACKER,
+                        browser_budget=alt_budget,
+                        deadline=phase_deadline,
+                        real_chrome=_rc_alt,
+                    )
+                    if alt_html and not page_fetch_is_failure(alt_html, alt_status):
+                        effective_headful = True
+                        effective_real_chrome = _rc_alt
+            if not alt_html or page_fetch_is_failure(alt_html, alt_status):
+                continue
+            alt_u = alt_final or alt_url
+            alt_base = extract_effective_base_url(alt_html, alt_u)
+            alt_diag = find_all_candidates(alt_html, alt_base, original_url=args.url_or_doi)
+            alt_cands = list(alt_diag.candidates or [])
+            if not alt_cands and (is_gsa_or_gsw_target(alt_u) or is_gsa_or_gsw_target(args.url_or_doi)):
+                _gsa_c, _gsa_t = discover_gsa_figshare_candidates(
+                    alt_u,
+                    proxy=proxy or "",
+                    crossref_email=str(config.get("crossref_email") or config.get("unpaywall_email") or ""),
+                )
+                if _gsa_t and is_placeholder_or_blocked_title(article_dirname):
+                    _refresh_dir_from_html_or_title(raw_title=_gsa_t)
+                if _gsa_c:
+                    alt_cands = _gsa_c
+            if alt_cands:
+                candidates = alt_cands
+                diag = alt_diag
+                diag.candidates = candidates
+                html_content = alt_html
+                effective_base = alt_base
+                url = alt_u
+                _refresh_dir_from_html_or_title(new_html=alt_html)
+                evidence.observe(
+                    "publisher",
+                    alt_html,
+                    alt_base,
+                    soup=getattr(alt_diag, "_soup", None),
+                    article_text=getattr(alt_diag, "_article_text", None),
+                )
+                print(f"  ✓ [chooser-alt] Found {len(candidates)} candidate(s) on {alt_u}")
+                break
+
     if not candidates:
         if pii and not args.skip_cdn and not args.list_only:
             page_mmcs = {int(m.group(1)) for m in MMC_NUM_REGEX.finditer(html_content)}
@@ -2830,6 +3556,7 @@ def run_download(args, bsk_runtime):
                     max_mmc=args.max_mmc,
                     max_consecutive_misses=args.max_misses,
                     known_mmcs=page_mmcs,
+                    deadline=phase_deadline,
                 )
                 if cdn_extras:
                     try:
@@ -2842,17 +3569,11 @@ def run_download(args, bsk_runtime):
                     print(f"\n✓ Done: {len(cdn_extras)} files downloaded via targeted CDN probe to {os.path.abspath(article_dir)}")
                     return
 
+        preserved_count = 0
         if api_files or cdn_files:
             # P1-F: confirm each Tier A / Tier 0 file by name instead
             # of the vague "Preserved ..." line.
             preserved_count = print_tier_preserved_files(api_files, cdn_files, article_dir)
-            # P1-G2: countable Done line so downstream status parsing
-            # sees the download (round-3 #13/#47 scored failed-timeout
-            # with dl_done empty despite 11/11 and 3/3 on disk).
-            if preserved_count:
-                print(preserved_done_line(preserved_count, article_dir))
-            if args.convert_markdown:
-                convert_directory_supplements(article_dir)
         print("  No supplementary links found in HTML.")
         # P1 C: say so explicitly when the phase died inside a page
         # load with nothing found -- otherwise a run killed by the
@@ -2863,16 +3584,89 @@ def run_download(args, bsk_runtime):
                   f"no candidates were found before the budget ran out.")
         if diag.incomplete_reason:
             print(f"  [Diagnostic] {diag.incomplete_reason}")
+        if not (api_files or cdn_files) and html_content and re.search(
+            r"附表|附录表|补充表|supplementary\s+tables?", html_content, re.IGNORECASE
+        ):
+            print("  [Diagnostic] Page mentions supplementary tables without external download links; tables may be embedded in the main article PDF (extract via --pdf).")
         if diag.excluded_links:
             print(f"  [Diagnostic] Evaluated and excluded {len(diag.excluded_links)} links (figures/references/anchors).")
-        if pii and not (api_files or cdn_files):
+        if pii and not args.list_only and not args.skip_cdn and not (api_files or cdn_files):
             print("  (CDN brute-force also found nothing — this paper may have no supplements.)")
+        if preserved_count:
+            # P1-G2: emit countable Done line after all warnings/diagnostics
+            # so downstream parsers see it as the final completion summary.
+            print(preserved_done_line(preserved_count, article_dir))
+        if (api_files or cdn_files) and args.convert_markdown:
+            convert_directory_supplements(article_dir)
         return
 
-    candidates = expand_repository_candidates(candidates)
+    def _repo_bsk_fetch(repo_url: str):
+        if bsk_runtime.enabled or (not getattr(args, "no_bsk", False) and check_browserskill_status(timeout=1.0).get("ready")):
+            return fetch_page_via_browserskill(
+                repo_url,
+                timeout=min(35.0, max(10.0, phase_deadline - time.monotonic())),
+                runtime=bsk_runtime,
+            )
+        return "", None, repo_url
+
+    _repo_browser = RepoBrowserSession(
+        play_cookies=play_cookies,
+        headful=bool(args.headful or effective_headful or (not getattr(args, "no_auto_headful", False) and has_gui_display())),
+        real_chrome=bool(effective_real_chrome or has_system_chrome()),
+        cdp_url=ws_cdp_url,
+        proxy=proxy,
+        budget=browser_budget,
+        phase_deadline=phase_deadline,
+        explicit_budget=getattr(args, "browser_fallback_budget", None),
+        bsk_fetch=_repo_bsk_fetch,
+        allow_auto_headful=bool((not getattr(args, "no_auto_headful", False)) and has_gui_display()),
+    )
+    try:
+        candidates = expand_repository_candidates(candidates, proxy=proxy, browser_fetch=_repo_browser.fetch)
+    finally:
+        _repo_browser.close()
     # P1-B: tiers / mirrors can re-discover the same file under another URL
     # (Springer vs PMC, :443 vs plain); download it once.
     candidates = dedupe_candidates(candidates)
+    # Skip candidates whose filename is already validly downloaded on disk by Tier A/Tier 0
+    # (prevents OA/PMC mirrors from re-downloading mmc1.pdf as mmc1_2.pdf).
+    verified_tier_keys = set()
+    for _tp in list(api_files or []) + list(cdn_files or []):
+        if not _tp:
+            continue
+        _tname = os.path.basename(_tp)
+        _resolved_tp = _tp if os.path.exists(_tp) else os.path.join(article_dir, _tname)
+        if os.path.exists(_resolved_tp):
+            try:
+                _ok, _ = validate_downloaded_file(_resolved_tp)
+            except Exception:
+                _ok = False
+            if _ok:
+                _tk = filename_dedup_key(_tname)
+                if _tk is not None:
+                    verified_tier_keys.add(_tk)
+    if verified_tier_keys:
+        filtered_cands = []
+        skipped_tier = []
+        for _cand in candidates:
+            _ck_list = [
+                filename_dedup_key(getattr(_cand, "filename", "") or ""),
+                filename_dedup_key(extract_filename_from_url(getattr(_cand, "url", "") or "")),
+            ]
+            if any(_ck is not None and _ck in verified_tier_keys for _ck in _ck_list):
+                skipped_tier.append(_cand)
+            else:
+                filtered_cands.append(_cand)
+        if skipped_tier:
+            print(f"  [Info] Skipped {len(skipped_tier)} duplicate candidate(s) already verified by Tier A/CDN.")
+            candidates = filtered_cands
+            if not candidates:
+                preserved_count = print_tier_preserved_files(api_files, cdn_files, article_dir)
+                if preserved_count:
+                    print(preserved_done_line(preserved_count, article_dir))
+                if (api_files or cdn_files) and args.convert_markdown:
+                    convert_directory_supplements(article_dir)
+                return
     # P1-CE: download in priority order (real supplement files first,
     # external/repository pages last); the sort is lossless, so the list
     # below is the order downloads will be attempted in.
@@ -2909,14 +3703,91 @@ def run_download(args, bsk_runtime):
     # retry_download to wire in. A transient failure therefore retries
     # the same download once, with backoff (max_retries=1); a bare
     # None/False with no reason is not retried.
-    successful, attempted = download_with_recovery(
-        candidates,
-        lambda cand: download_file(cand, article_dir, session, play_cookies,
-                                   bsk_runtime=bsk_runtime, referer=cand.source_url or url,
-                                   proxy=proxy, tunnel_tracker=_TUNNEL_TRACKER),
-        mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
+    stealth_session_holder = {"session": None, "visited_origins": set()}
+
+    def _download_candidate_with_reason(cand):
+        err_info = {}
+        res = download_file(
+            cand,
+            article_dir,
+            session,
+            play_cookies,
+            bsk_runtime=bsk_runtime,
+            referer=cand.source_url or url,
+            proxy=proxy,
+            tunnel_tracker=_TUNNEL_TRACKER,
+            stealth_session_holder=stealth_session_holder,
+            deadline=phase_deadline,
+            error_out=err_info,
+            headful=effective_headful,
+            real_chrome=effective_real_chrome,
+        )
+        if res:
+            return res
+        if time.monotonic() < phase_deadline:
+            for route_url, route_px in iter_download_fallback_routes(cand.url, proxy=proxy):
+                alt_res = download_file(
+                    clone_candidate_with_url(cand, route_url),
+                    article_dir,
+                    session,
+                    play_cookies,
+                    bsk_runtime=bsk_runtime,
+                    referer=cand.source_url or url,
+                    proxy=route_px,
+                    tunnel_tracker=_TUNNEL_TRACKER,
+                    stealth_session_holder=stealth_session_holder,
+                    deadline=phase_deadline,
+                    error_out={},
+                    headful=effective_headful,
+                    real_chrome=effective_real_chrome,
+                )
+                if alt_res:
+                    return alt_res
+        return None, err_info.get("reason") or "download failed"
+
+    try:
+        successful, attempted = download_with_recovery(
+            candidates,
+            _download_candidate_with_reason,
+            mirrors, expand_repository_candidates, max_retries=1, deadline=phase_deadline)
+    finally:
+        shared_stealth = stealth_session_holder.get("session")
+        if shared_stealth is not None:
+            try:
+                shared_stealth.close()
+            except Exception:
+                pass
+            stealth_session_holder["session"] = None
+
     success_count = len(successful)
-    incomplete, reason = evidence.check(successful)
+    _seen_success_keys = set()
+    for _sc in successful:
+        for _sn in (getattr(_sc, "filename", "") or "", extract_filename_from_url(getattr(_sc, "url", "") or "")):
+            _sk = filename_dedup_key(_sn)
+            if _sk is not None:
+                _seen_success_keys.add(_sk)
+    tier_cands = []
+    _seen_tier_names = set()
+    for _tp in list(api_files or []) + list(cdn_files or []):
+        if not _tp:
+            continue
+        _tname = os.path.basename(_tp)
+        if _tname in _seen_tier_names:
+            continue
+        _seen_tier_names.add(_tname)
+        _tkey = filename_dedup_key(_tname)
+        if _tkey is not None and _tkey in _seen_success_keys:
+            continue
+        _resolved_tp = _tp if os.path.exists(_tp) else os.path.join(article_dir, _tname)
+        if os.path.exists(_resolved_tp):
+            tier_cands.append(Candidate(
+                url=f"file://{os.path.abspath(_resolved_tp)}",
+                filename=_tname,
+                link_text=_tname,
+                section="tier_cdn",
+                match_rule="tier_api_or_cdn",
+            ))
+    incomplete, reason = evidence.check(list(successful) + tier_cands)
     if incomplete:
         print(f"  [Warning] Downloaded set remains incomplete: {reason}")
 
@@ -2953,6 +3824,7 @@ def run_download(args, bsk_runtime):
                 max_mmc=args.max_mmc,
                 max_consecutive_misses=args.max_misses,
                 known_mmcs=missing_mmcs,
+                deadline=phase_deadline,
             )
             if extra_cdn_files:
                 success_count += len(extra_cdn_files)

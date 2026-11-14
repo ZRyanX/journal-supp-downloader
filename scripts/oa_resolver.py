@@ -113,7 +113,16 @@ def query_unpaywall(
     if not clean_doi:
         return None
 
-    email = email or DEFAULT_UNPAYWALL_EMAIL
+    if not email:
+        if os.environ.get("UNPAYWALL_EMAIL"):
+            email = os.environ["UNPAYWALL_EMAIL"].strip()
+        else:
+            try:
+                from supp_finder import load_local_skill_config
+                email = str(load_local_skill_config().get("unpaywall_email") or "").strip()
+            except Exception:
+                email = ""
+        email = email or DEFAULT_UNPAYWALL_EMAIL
     encoded_doi = urllib.parse.quote(clean_doi, safe="")
     api_url = f"https://api.unpaywall.org/v2/{encoded_doi}?email={email}"
 

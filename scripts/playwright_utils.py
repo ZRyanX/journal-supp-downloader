@@ -3,6 +3,7 @@ import os
 import re
 import glob
 import json
+import time
 import shutil
 import socket
 import urllib.parse
@@ -103,6 +104,56 @@ def find_playwright_chromium():
     return None
 
 
+def download_via_playwright_request(
+    context,
+    url: str,
+    dest_path: str,
+    headers: Optional[Dict[str, str]] = None,
+    timeout_ms: int = 30000,
+) -> Tuple[bool, str]:
+    """Download *url* using Playwright's ``context.request.get()`` so the request
+    automatically inherits the browser context's cookies, TLS settings, and proxy.
+
+    Writes atomically via a temporary file in ``dest_path``'s directory and returns
+    ``(True, content_type)`` on HTTP 2xx/3xx with non-empty body, or
+    ``(False, reason)`` otherwise.
+    """
+    req_ctx = getattr(context, "request", None)
+    if req_ctx is None:
+        return False, "context.request unavailable"
+    tmp_path = os.path.join(
+        os.path.dirname(os.path.abspath(dest_path)),
+        f".pwreq.{os.getpid()}.{os.path.basename(dest_path)}",
+    )
+    try:
+        kwargs: Dict[str, Any] = {"timeout": max(1000, int(timeout_ms))}
+        if headers:
+            kwargs["headers"] = headers
+        resp = req_ctx.get(url, **kwargs)
+        status = getattr(resp, "status", 0)
+        ok = getattr(resp, "ok", 200 <= status < 400)
+        if not ok or status >= 400:
+            return False, f"HTTP {status}"
+        body = resp.body()
+        if not body:
+            return False, "empty response body"
+        with open(tmp_path, "wb") as f:
+            f.write(body)
+        os.replace(tmp_path, dest_path)
+        resp_headers = getattr(resp, "headers", {}) or {}
+        ct = ""
+        if isinstance(resp_headers, dict):
+            ct = next((v for k, v in resp_headers.items() if k.lower() == "content-type"), "")
+        return True, ct
+    except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        return False, str(exc)
+
+
 def find_system_chromium():
     """
     Detects locally installed system Chromium-based browsers (Google Chrome, Microsoft Edge, Brave, Chromium).
@@ -192,6 +243,9 @@ def get_common_user_data_dirs():
     dirs = [
         os.path.join(home, ".journal_supp_chrome_debug_profile"),
         os.path.join(home, ".journal_supp_downloader_profile"),
+        os.path.join(home, ".zotero_chrome_debug_profile"),
+        os.path.join(home, ".zotero_playwright_profile"),
+        os.path.join(home, ".zotero_test_chrome_profile"),
         os.path.join(home, ".web-access"),
         os.path.join(home, ".web-access", "chrome-profile"),
         os.path.join(home, ".web-access", "browser-profile"),
@@ -394,6 +448,40 @@ def merge_cookies(existing_cookies, new_cookies) -> List[Dict[str, Any]]:
     return list(cookie_dict.values())
 
 
+def _looks_like_transient_challenge_shell(html_content: Optional[str]) -> bool:
+    """True if *html_content* appears to be an unresolved Turnstile/WAF/F5 pre-challenge shell.
+
+    Plain static 403/404 pages with a real ``<body>`` (e.g. ``<html><body>Forbidden page</body></html>``)
+    return False so unit mocks and terminal error pages are not delayed.
+    """
+    if not html_content or not isinstance(html_content, str):
+        return True
+    low = html_content.lower()
+    has_body = bool(re.search(r"<body\b", low))
+    if not has_body and ("<html" in low or "<head" in low or "<!doctype" in low):
+        return True
+    if "/tspd/" in low or "apm_do_not_touch" in low:
+        body_match = re.search(r"<body\b[^>]*>(.*?)</body>", low, re.DOTALL)
+        body_inner = body_match.group(1) if body_match else ""
+        body_vis = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", " ", body_inner, flags=re.DOTALL)
+        body_vis = re.sub(r"<[^>]+>", " ", body_vis).strip()
+        if len(body_vis) < 500:
+            return True
+    cleaned = re.sub(r"<(script|style|noscript|svg)\b[^>]*>.*?</\1>", " ", html_content, flags=re.IGNORECASE | re.DOTALL)
+    vis = re.sub(r"<[^>]+>", " ", cleaned)
+    vis = re.sub(r"\s+", " ", vis).strip().lower()
+    if len(vis) < 1500 and any(
+        m in vis for m in (
+            "just a moment", "checking your browser", "verify you are human",
+            "attention required", "enable javascript and cookies to continue",
+        )
+    ):
+        return True
+    if ("cf-turnstile" in low or "challenges.cloudflare.com" in low) and len(vis) < 1500:
+        return True
+    return False
+
+
 def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optional[str] = None, timeout: float = 30.0) -> Tuple[str, Optional[int], str, List[Dict[str, Any]]]:
     """
     Fetches or attaches to a page via a live CDP connection to the user's browser:
@@ -463,17 +551,40 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
         created_new_page = False
         page = matched_page
         nav_status = None
+        latest_doc_status = [None]
         if not page:
             page = context.new_page()
             created_new_page = True
+            try:
+                def _on_cdp_response(resp):
+                    try:
+                        req = getattr(resp, "request", None)
+                        rtype = getattr(req, "resource_type", None) if req is not None else None
+                        resp_frame = getattr(resp, "frame", None)
+                        main_frame = getattr(page, "main_frame", None)
+                        is_main_doc = (
+                            (rtype == "document" or rtype is None)
+                            and (resp_frame is None or main_frame is None or resp_frame == main_frame)
+                        )
+                        if is_main_doc:
+                            st = getattr(resp, "status", None)
+                            if isinstance(st, int):
+                                latest_doc_status[0] = st
+                    except Exception:
+                        pass
+
+                page.on("response", _on_cdp_response)
+            except Exception:
+                pass
             try:
                 nav_response = page.goto(target_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
                 resp_status = getattr(nav_response, "status", None) if nav_response is not None else None
                 # H1: only a real integer navigation status counts; a missing
                 # response (e.g. about:blank) leaves the status unknown.
-                nav_status = resp_status if isinstance(resp_status, int) else None
+                nav_status = resp_status if isinstance(resp_status, int) else latest_doc_status[0]
             except Exception:
-                pass
+                if isinstance(latest_doc_status[0], int):
+                    nav_status = latest_doc_status[0]
 
         try:
             if wait_selector:
@@ -481,6 +592,45 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
                     page.wait_for_selector(wait_selector, timeout=min(int(timeout * 500), 10000))
                 except Exception:
                     pass
+            else:
+                try:
+                    page.wait_for_load_state("networkidle", timeout=min(int(timeout * 250), 3000))
+                except Exception:
+                    pass
+
+            # Capture any main-document redirect/reload status that fired during wait_selector / networkidle
+            if isinstance(latest_doc_status[0], int):
+                nav_status = latest_doc_status[0]
+
+            # Bounded settle if initial DOM is a Turnstile / <NO BODY> / /TSPD/ pre-challenge shell
+            try:
+                probe_html = page.content()
+                if (nav_status in (403, 429, 503) or nav_status is None) and _looks_like_transient_challenge_shell(probe_html):
+                    settle_deadline = time.monotonic() + min(float(timeout) * 0.4, 8.0)
+                    settled_via_dom = False
+                    saw_new_doc_status = False
+                    while time.monotonic() < settle_deadline:
+                        latest_doc_status[0] = None
+                        try:
+                            page.wait_for_timeout(500)
+                        except Exception:
+                            break
+                        try:
+                            cur_html = page.content()
+                        except Exception:
+                            break
+                        if isinstance(latest_doc_status[0], int):
+                            nav_status = latest_doc_status[0]
+                            saw_new_doc_status = True
+                        if not _looks_like_transient_challenge_shell(cur_html):
+                            settled_via_dom = True
+                            break
+                    # If JS/XHR replaced the challenge shell in-place without a new document navigation,
+                    # clear the stale pre-challenge 403/429/503 so page_fetch_is_failure judges the real DOM.
+                    if settled_via_dom and not saw_new_doc_status and nav_status in (403, 429, 503):
+                        nav_status = None
+            except Exception:
+                pass
 
             try:
                 clicked_count = page.evaluate("""
@@ -531,6 +681,12 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
             html_content = page.content()
             final_url = page.url or target_url
             status_code = nav_status
+            try:
+                refreshed_cookies = context.cookies()
+                if refreshed_cookies:
+                    live_cookies = refreshed_cookies
+            except Exception:
+                pass
         finally:
             if created_new_page and page:
                 try:

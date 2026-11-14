@@ -68,8 +68,10 @@ python scripts/journal_downloader.py "<doi_or_url>" --bsk-browser "<browser-id>"
 |---|---|
 | `-o`, `--output-dir` | 输出目录，默认 `./journal_downloads` |
 | `--list-only` | 只列出候选与诊断，不下载附件 |
-| `--headful` | 显示独立抓取浏览器，便于排查 |
+| `--headful` | 从初始页面抓取即显示独立抓取浏览器，便于排查 |
 | `--cdp` / `--cdp-url` | 显式接入已经开放调试端口的 Chromium 浏览器 |
+| `--no-cdp` | 禁用阻塞/缺漏后的本地 Chrome CDP 自动接管 |
+| `--no-auto-headful` / `--no-auto-browser` | 禁用阻塞/缺漏后的独立有头 Chrome 自动回退 |
 | `--oa` / `--no-oa` | 优先查询/禁用开放获取仓储镜像查询 |
 | `--convert-markdown` | 用 MarkItDown 生成副本，保留原始文件 |
 
@@ -77,9 +79,14 @@ python scripts/journal_downloader.py "<doi_or_url>" --bsk-browser "<browser-id>"
 
 ## 认证与恢复
 
+- **自动分级浏览器接管与有头兜底**（快速 API / CDN / 请求与无头抓取均被拦截或结果不完整时按序自动触发，正常直连或已完成的文章不弹窗）：
+  1. **优先接管已打开的日常有头浏览器（无额外弹窗、零空闲开销）**：若未禁用 `--no-bsk` 且 `bsk` 已就绪则优先复用已连接浏览器；否则若未禁用 `--no-cdp` 且检测到本地开放调试端口的 Chrome（`discover_active_cdp_port`）则自动挂载并继承实时登录态与挑战通过状态。
+  2. **备用/开箱即用独立有头真 Chrome 回退**：当上述日常浏览器未开启或仍未取全且存在桌面图形环境时，若未传 `--no-auto-headful`，自动拉起 `headless=False`（自动检测本地 Chrome 启用 `real_chrome=True`、`network_idle=False`、`solve_cloudflare=True`）突破 Turnstile / Cloudflare / JS 动态渲染并延续到附件下载阶段。
 - **BrowserSkill**：浏览器扩展与 `bsk` 通信，使用已登录的浏览器，无需导出 Cookie。连接故障先查看 `python scripts/browserskill_adapter.py status --json` 和 `bsk doctor`。
 - **独立登录向导**：`python scripts/login_publishers.py` 保存会话到 `~/.journal_supp_downloader_profile/cookies.json`；两个下载器均可读取。
+- **网络与本地 API 配置**：默认直连校园网/机构 IP，无需设置代理环境（未显式传入 `--proxy` 时会忽略环境变量中的 `HTTP(S)_PROXY` / `ALL_PROXY`，不污染全局环境变量）；支持通过环境变量、仓库根目录 `.env`（模板见 `.env.example`，不提交仓库）或 `~/.journal_supp_downloader_profile/config.json` 配置 `ELSEVIER_API_KEY`、`IS_CAMPUS_NETWORK`、`ELSEVIER_INSTTOKEN`、`UNPAYWALL_EMAIL`、`CROSSREF_EMAIL`。
 - **scansci-pdf 凭据**：仅高级版读取其机构、WebVPN/CARSI 配置；轻量版不读取这些配置。
+- **GSA / DiVA 专用通道**：当 GeoScienceWorld（`10.1130/`）受反爬阻塞或未返回候选时，自动回退 Crossref → figshare API（含 `translate.goog` 镜像回退）；识别 `diva-portal.org` / `diva2:` / `urn:nbn:se:` 时启用 DiVA OAI-PMH 与镜像回退。
 - **开放获取镜像**：可通过 Unpaywall/OpenAlex 查找 PMC/Europe PMC 等公开来源。公开副本不一定包含全部补充材料，仍需核对完整性。
 - **动态补充区域**：轻量版可用 `--wait-selector` 等待实际附件元素；等待超时应视为恢复失败，不能当作内容已经就绪。
 

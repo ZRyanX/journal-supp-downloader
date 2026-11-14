@@ -698,12 +698,7 @@ class BrowserSkillSession:
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), {max(1, int(to * 1000))});
             try {{
-                let resp;
-                try {{
-                    resp = await fetch({json.dumps(url)}, {{credentials: 'include', signal: controller.signal}});
-                }} catch (fetchErr) {{
-                    resp = await fetch({json.dumps(url)}, {{credentials: 'omit', signal: controller.signal}});
-                }}
+                const resp = await fetch({json.dumps(url)}, {{credentials: 'include', signal: controller.signal}});
                 if (!resp.ok) throw new Error('HTTP ' + resp.status);
                 if (Number(resp.headers.get('content-length')) > {limit}) throw new Error('Native download required: file too large');
                 const reader = resp.body.getReader();

@@ -102,7 +102,7 @@ class TestPlaywrightUtils(unittest.TestCase):
                 f.write("#!/bin/sh\n")
             env = {"PLAYWRIGHT_BROWSERS_PATH": td}
             env.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
-            with patch.dict(os.environ, env, clear=False):
+            with patch.object(sys, "platform", "linux"), patch.dict(os.environ, env, clear=False):
                 os.environ.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
                 found = pu.find_playwright_chromium()
             self.assertEqual(found, exe)
@@ -118,7 +118,7 @@ class TestPlaywrightUtils(unittest.TestCase):
             for path in (old_exe, new_exe):
                 with open(path, "w") as f:
                     f.write("#!/bin/sh\n")
-            with patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": td}, clear=False):
+            with patch.object(sys, "platform", "linux"), patch.dict(os.environ, {"PLAYWRIGHT_BROWSERS_PATH": td}, clear=False):
                 os.environ.pop("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", None)
                 found = pu.find_playwright_chromium()
             self.assertEqual(found, old_exe)
