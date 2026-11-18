@@ -1,5 +1,7 @@
 # Journal Supplementary Data Downloader (文献附表与附件自动下载工具)
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 > 🌐 语言版本 / Language: [English](README.md) | **简体中文**
 
 本工具用于从学术期刊网站及关联数据仓储（ScienceDirect / Elsevier, SpringerLink / Nature, Wiley, Silverchair / GeoScienceWorld / Lyell Collection, Atypon, RSC, Cambridge, Frontiers, Copernicus, PeerJ, MDPI, OJS / J-STAGE / 中文期刊, Figshare, ScienceBase, DiVA 等）自动识别并批量下载文章的补充数据/附表文件（如 `xlsx`, `xls`, `csv`, `zip`, `docx`, `pdf` 等）。默认直连网络运行，支持静态解析、多出版商镜像回退、动态页面渲染与分级真实浏览器自动接管（`Tier 3-Auto`）。
@@ -21,6 +23,7 @@
 6. [常见问题 FAQ](#常见问题-faq)
 7. [鸣谢与参考](#鸣谢与参考)
 8. [附表完整性与恢复边界](#附表完整性与恢复边界)
+9. [许可证](#许可证)
 
 ---
 
@@ -209,6 +212,11 @@ python scripts/browserskill_adapter.py borrow-fetch <tab_id> -o ./page.html
   export ELSEVIER_INSTTOKEN="您的机构_TOKEN"
   ```
 
+> **网络与 AI Agent 选择提示**
+> - **走机构 IP 时不要走代理**：机构订阅按出口 IP 识别。访问出版商时请直连机构 IP（校园网 / 机构 VPN），不要用全局代理，否则出口 IP 会变成代理 IP，机构权限随之失效。
+> - **AI Agent 按地区选**：中国大陆请用 DeepSeek Harness、Qwen Work、WorkBuddy、Kimi Code、ZCode 等；中国大陆以外请用 Claude Code、Codex、Antigravity、Cursor、OpenCode、Grok Code 等。
+> - **大陆 + 机构 IP + 境外 Agent**：如需同时保留机构 IP 又用境外 Agent，请用 Proxifier 做局部（分应用）代理，只让 AI Agent 走代理，本工具及浏览器下载流量仍直连机构 IP。
+
 ---
 
 ### 4. Cookie 认证注入（突破非 API 限制）
@@ -339,3 +347,9 @@ API、CDN 和开放获取镜像的部分结果会保留并继续补查；当主�
 BrowserSkill 仅将明确标注下载的附表控件加入自动下载，并在点击前重新核验；删除、编辑等操作会被排除。挂起下载会持续等待同一个操作，检查失败、超时及实际落盘状态。alert 可以继续；confirm 仅在明确询问下载且不包含其他操作时接受，其余对话框报告需要明确决定。真实网站登录与扩展协议仍需要实机验证。
 
 ZIP/Office 文件检查容器目录和必要文档成员；解压后总量不超过 512 MiB 时额外检查 CRC，超过时仅检查目录结构并明确说明校验范围。Markdown 转换保留原文件，支持 `.xlsx`/`.xls` 多行合并表头展平与 `.zip` 包内嵌表格转换，适合作为阅读副本。
+
+---
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
