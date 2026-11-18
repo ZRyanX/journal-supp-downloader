@@ -172,6 +172,11 @@ For Elsevier / ScienceDirect journals, the API tier provides the fastest and mos
 * **Option A — Campus IP / University VPN** *(recommended)*: When connected to campus IP ranges or university VPN, set `IS_CAMPUS_NETWORK=true`.
 * **Option B — Institutional Token (InstToken)**: If your library provides an Elsevier InstToken for off-campus API calls, set `ELSEVIER_INSTTOKEN="YOUR_INSTTOKEN"`.
 
+> **Network & AI Agent Note**
+> - **Don't use a proxy when accessing via an institutional IP**: institutional subscription access is recognized by your egress IP. Connect directly via your institutional IP (campus network / institutional VPN) and don't route through a global proxy — otherwise your egress IP becomes the proxy's IP and institutional access will be lost.
+> - **Choose your AI agent by region**: in mainland China, use DeepSeek Harness, Qwen Work, WorkBuddy, Kimi Code, ZCode, etc.; outside mainland China, use Claude Code, Codex, Antigravity, Cursor, OpenCode, Grok Code, etc.
+> - **Mainland China + institutional IP + overseas agent**: if you need both, use Proxifier for per-app (split) proxying — route only the AI agent through the proxy, and keep this tool and browser download traffic on the direct institutional IP.
+
 ---
 
 ### 4. Browser Cookie Injection
