@@ -1,5 +1,7 @@
 # Journal Supplementary Data Downloader
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 > 🌐 Language: **English** | [简体中文 (Chinese Documentation)](README.zh-CN.md)
 
 **Journal Supplementary Data Downloader** is an automated CLI tool and AI Agent skill for discovering, downloading, and verifying supplementary data files and tables (`xlsx`, `xls`, `csv`, `zip`, `docx`, `pdf`, etc.) from academic publishers and external research data repositories.
@@ -25,6 +27,7 @@ Built with core components from [scansci-pdf](https://github.com/Rimagination/sc
 6. [FAQ](#faq)
 7. [Acknowledgements & References](#acknowledgements--references)
 8. [Completeness & Recovery Boundaries](#completeness--recovery-boundaries)
+9. [License](#license)
 
 ---
 
@@ -288,3 +291,9 @@ Completeness validation checks declared file counts, `S/A` table numbering, and 
 Partial hits from API, CDN, and OA sources are retained for follow-up recovery. When the primary host fails or returns zero candidates, Crossref `[chooser-alt]` alternates are explored within phase budgets. Repository landing pages are traversed within bounded limits (2 hops, max 16 pages, 2 MiB/page across Figshare REST API/`__APOLLO_STATE__`, ScienceBase JSON + bare DOI repair, GSA, and DiVA OAI-PMH) via shared `RepoBrowserSession` contexts; opaque `.zip` archives without enumerable internal table names avoid false-positive `S-table` missing alerts. Same-origin `Playwright context.request` is preferred after live browser recovery, followed by deduplicated OA fallbacks unless `--no-oa` is set.
 
 BrowserSkill triggers only explicitly verified supplement download controls (excluding edit/delete actions) and commits validated downloads atomically from temporary staging paths. ZIP/Office integrity checks verify archive directory structure and CRC (for unpacked sizes up to 512 MiB). MarkItDown conversion preserves originals while flattening merged multi-row Excel headers and extracting tables inside `.zip` archives.
+
+---
+
+## License
+
+Released under the [Apache License 2.0](LICENSE).

@@ -1,5 +1,7 @@
 # Journal Supplementary Data Downloader (文献附表与附件自动下载工具)
 
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 > 🌐 语言版本 / Language: [English](README.md) | **简体中文**
 
 本工具用于从学术期刊网站及关联数据仓储（ScienceDirect / Elsevier, SpringerLink / Nature, Wiley, Silverchair / GeoScienceWorld / Lyell Collection, Atypon, RSC, Cambridge, Frontiers, Copernicus, PeerJ, MDPI, OJS / J-STAGE / 中文期刊, Figshare, ScienceBase, DiVA 等）自动识别并批量下载文章的补充数据/附表文件（如 `xlsx`, `xls`, `csv`, `zip`, `docx`, `pdf` 等）。默认直连网络运行，支持静态解析、多出版商镜像回退、动态页面渲染与分级真实浏览器自动接管（`Tier 3-Auto`）。
@@ -21,6 +23,7 @@
 6. [常见问题 FAQ](#常见问题-faq)
 7. [鸣谢与参考](#鸣谢与参考)
 8. [附表完整性与恢复边界](#附表完整性与恢复边界)
+9. [许可证](#许可证)
 
 ---
 
@@ -341,5 +344,11 @@ A: 某些网络环境下 `doi.org` 会被屏蔽或发生 SSL 握手失败。脚�
 API、CDN 和开放获取镜像的部分结果会保留并继续补查；当主出版商无候选或受限时，自动通过 Crossref `[chooser-alt]` 切换替代出版商宿主继续发现。候选记录各自的来源页，用于解析相对地址及下载 Referer。仓储介绍页会在两层、最多 16 页、单页 2 MiB 的限制内继续寻找附件（含 Figshare REST API/`__APOLLO_STATE__`、ScienceBase JSON 裸 DOI 修正、GSA、DiVA OAI-PMH 与 `RepoBrowserSession` 上下文复用），未解析成功的来源仍会报告。仓储父链接的附表证据会保留，只有对应子文件均成功取得时才计入覆盖；非可枚举的纯附件 `.zip` 归档不会误计入 S 表缺失误报。文件传输在真实浏览器恢复后优先使用同源 `Playwright context.request`，失败后亦会补查 OA 镜像，同一轮不重复请求已尝试的文件地址；`--no-oa` 禁用这项补救。
 
 BrowserSkill 仅将明确标注下载的附表控件加入自动下载，并在点击前重新核验；删除、编辑等操作会被排除。挂起下载会持续等待同一个操作，检查失败、超时及实际落盘状态。alert 可以继续；confirm 仅在明确询问下载且不包含其他操作时接受，其余对话框报告需要明确决定。真实网站登录与扩展协议仍需要实机验证。
+
+---
+
+## 许可证
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
 
 ZIP/Office 文件检查容器目录和必要文档成员；解压后总量不超过 512 MiB 时额外检查 CRC，超过时仅检查目录结构并明确说明校验范围。Markdown 转换保留原文件，支持 `.xlsx`/`.xls` 多行合并表头展平与 `.zip` 包内嵌表格转换，适合作为阅读副本。
