@@ -1,7 +1,7 @@
 """Standalone CARSI download source — decoupled from WebVPN.
 
 CARSI can now be used independently: set carsi_enabled=True and carsi_idp_name,
-and it will be tried in the download tier system without requiring vpnsci_enabled.
+and it will be tried in the download tier system without requiring instsci_enabled.
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ def try_carsi(doi: str, output_path: Path, config: dict[str, Any]) -> dict[str, 
 
     try:
         from .carsi import CARSIClient, detect_publisher
-        from .vpnsci import _resolve_doi_url
+        from .instsci import _resolve_doi_url
 
         resolved_url = _resolve_doi_url(doi)
         if not resolved_url:
@@ -40,13 +40,21 @@ def try_carsi(doi: str, output_path: Path, config: dict[str, Any]) -> dict[str, 
         log.info(f"   [CARSI] Trying {publisher} via {idp_name} for {doi}")
         client = CARSIClient(config)
 
-        # Try stealth browser first (stealth browser, handles Cloudflare)
-        result = client.download_via_camofox(doi, resolved_url, output_path)
-        if result:
-            return result
+        # If resolved URL is on a mirror/proxy domain, rebuild using primary domain
+        from urllib.parse import urlparse
+        cfg = client._publisher_configs.get(publisher)
+        if cfg:
+            resolved_host = urlparse(resolved_url).hostname or ""
+            primary_domain = cfg.domains[0]
+            if resolved_host and primary_domain not in resolved_host:
+                # Reconstruct URL using primary domain + same path
+                from urllib.parse import urlunparse
+                parsed = urlparse(resolved_url)
+                resolved_url = urlunparse(parsed._replace(
+                    scheme="https", netloc=primary_domain))
+                log.info(f"   [CARSI] Redirected to primary domain: {resolved_url[:80]}")
 
-        # Fallback to Selenium browser
-        log.info(f"   [CARSI] Trying selenium download for {doi}")
+        # Try browser download (Playwright backend, Selenium fallback)
         result = client.download_via_browser(doi, resolved_url, output_path)
         if result:
             return result

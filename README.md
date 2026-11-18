@@ -147,10 +147,11 @@ The tool operates **direct-network by default** (no global proxy setup needed; e
    ELSEVIER_API_KEY=your_elsevier_api_key
    IS_CAMPUS_NETWORK=false
    ELSEVIER_INSTTOKEN=
+   SCANSCI_PDF_PROXY=
    UNPAYWALL_EMAIL=
    CROSSREF_EMAIL=
    ```
-2. **User profile config `~/.journal_supp_downloader_profile/config.json`**: JSON keys `elsevier_api_key`, `is_campus_network`, `elsevier_insttoken`, `unpaywall_email`, `crossref_email`.
+2. **User profile config `~/.journal_supp_downloader_profile/config.json`**: JSON keys `elsevier_api_key`, `is_campus_network`, `elsevier_insttoken`, `network_proxy`, `unpaywall_email`, `crossref_email`.
 3. **Environment variables**: uppercase environment variables take precedence.
 
 ---

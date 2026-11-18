@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from ..cache import cache_get, cache_set
-from ..config import load_config, DATA_DIR
-from ..identifiers import is_arxiv_identifier, normalize_doi, safe_filename
+from ..config import DATA_DIR, GREY_STRATEGIES, is_legal_only_profile, load_config
+from ..identifiers import is_arxiv_identifier, is_chinese_doi, normalize_doi, safe_filename
 from ..log import get_logger
 from ..pdf_utils import fail
 from ..rename import rename_pdf, generate_filename as rename_pdf_generate_filename
@@ -22,7 +22,6 @@ from ..rename import rename_pdf, generate_filename as rename_pdf_generate_filena
 try:
     from .._core.racing import (
         run_parallel_race as _run_parallel_race_compiled,
-        build_tiers as _build_tiers_compiled,
     )
     _HAS_COMPILED_CORE = True
 except ImportError:
@@ -38,21 +37,118 @@ from .libgen import try_libgen
 from .oa_discovery import try_doaj
 from .openalex import try_openalex_oa, try_openalex_content_api
 from .publishers import get_publisher_fast_sources
+from .scibban import try_scibban
 from .scihub import try_scihub
 from .semantic_scholar import try_semanticscholar
+from .openaire import try_openaire
 from .unpaywall import try_unpaywall
 from .vpnsci import try_vpnsci
 from .ezproxy import try_ezproxy
+from .ncpssd import try_ncpssd
+from .cn_journal import try_cn_journal_direct
+from .cn_databases import try_cn_database
+
+# Institutional bridge — uses instsci PaperFetcher when available
+def _try_institutional_bridge(doi: str, output_path: Path, config: dict) -> dict | None:
+    """Lazy-loaded instsci institutional bridge."""
+    try:
+        from ..institutional.instsci_bridge import try_institutional
+        return try_institutional(doi, output_path, config)
+    except ImportError:
+        return None
+
+# Global semaphore to limit concurrent browser-based sources across all DOI
+# Prevents batch_workers × browser_sources_per_DOI explosion of Chrome windows
+_browser_semaphore: threading.Semaphore | None = None
+_browser_semaphore_lock = threading.Lock()
+
+# Source labels that require launching a browser (browser)
+_BROWSER_SOURCE_LABELS = frozenset({
+    "ElsevierBrowser", "WileyBrowser", "IEEEBrowser", "ACSBrowser",
+    "RSCBrowser", "AIPBrowser", "SpringerBrowser", "APSBrowser",
+    "TandFBrowser", "IOPBrowser", "OxfordBrowser", "ACMBrowser",
+    "NatureBrowser", "ScienceBrowser", "SAGEBrowser", "ASCEBrowser",
+    "RoyalSocietyBrowser", "CopernicusDirect",
+    "GenericBrowser", "WebVPN", "CARSI", "EZProxy", "InstSci",
+    # CNKI/VIP need a visible browser for CARSI login / download clicks;
+    # Wanfang and NCPSSD are pure HTTP but share the same lane label.
+    "CNDatabase", "CNKI", "Wanfang", "VIP",
+    # Sci-Hub launches browser internally (browser-first pass +
+    # Cloudflare/ALTCHA challenge solving), so it must participate in the
+    # global browser-source concurrency budget.
+    "Sci-Hub",
+})
+
+# ponytail: negative cache — (source, publisher) -> expiry. A challenge/block
+# on one paper skips that source for the whole publisher prefix for 15 min,
+# saving the doomed timeout on every later paper. Broaden the key or raise
+# the TTL if false-skip reports come in.
+_NEG_TTL = 900.0
+_NEG_CACHE: dict[tuple[str, str], float] = {}
+_NEG_LOCK = threading.Lock()
+_NEG_KEYWORDS = ("cloudflare", "challenge", "captcha", "blocked", "forbidden", "403", "429")
+
+
+def _publisher_of(doi: str) -> str:
+    return doi.split("/")[0].lower() if doi.lower().startswith("10.") else "*"
+
+
+def _neg_record(label: str, doi: str, result: dict[str, Any]) -> None:
+    reason = (str(result.get("error_type", "")) + " " + str(result.get("error", ""))).lower()
+    if not any(k in reason for k in _NEG_KEYWORDS):
+        return  # one-off failures (404, paywall) must not poison the source
+    with _NEG_LOCK:
+        _NEG_CACHE[(label, _publisher_of(doi))] = time.time() + _NEG_TTL
+
+
+def _neg_blocked(label: str, doi: str) -> bool:
+    now = time.time()
+    with _NEG_LOCK:
+        expired = [k for k, exp in _NEG_CACHE.items() if exp <= now]
+        for k in expired:
+            _NEG_CACHE.pop(k, None)
+        pub = _publisher_of(doi)
+        return (label, pub) in _NEG_CACHE or (label, "*") in _NEG_CACHE
+
+
+
+def _any_institutional_path(config: dict[str, Any]) -> bool:
+    """Check if any institutional access is configured."""
+    return bool(
+        (config.get("carsi_enabled") and config.get("carsi_idp_name", "").strip())
+        or (config.get("vpnsci_enabled") and (config.get("vpnsci_school") or config.get("vpnsci_base_url")))
+        or (config.get("ezproxy_enabled") and config.get("ezproxy_login_url"))
+        or config.get("elsevier_api_key")
+    )
+
+
+def _get_browser_semaphore(config: dict[str, Any]) -> threading.Semaphore:
+    """Get or create the global browser concurrency semaphore."""
+    global _browser_semaphore
+    max_workers = config.get("max_browser_workers", 1)
+    if _browser_semaphore is None:
+        with _browser_semaphore_lock:
+            if _browser_semaphore is None:
+                _browser_semaphore = threading.Semaphore(max_workers)
+    return _browser_semaphore
+
+
+_institutional_key_locks: dict[str, threading.Lock] = {}
+_institutional_key_locks_lock = threading.Lock()
+
+
+def _institutional_key_lock(key: str) -> threading.Lock:
+    with _institutional_key_locks_lock:
+        lock = _institutional_key_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _institutional_key_locks[key] = lock
+        return lock
+
+
 from .carsi_source import try_carsi
 
 __all__ = ["download", "batch_download"]
-
-STRATEGIES = {
-    "fastest",       # 默认：全源竞速，最快获胜
-    "oa_first",      # OA 优先，Sci-Hub 兜底
-    "scihub_only",   # 只用 Sci-Hub
-    "legal_only",    # 只用合法源（无 Sci-Hub/LibGen）
-}
 
 _cleanup_done = False
 
@@ -70,6 +166,9 @@ def _cleanup_stale_files(target_dir: Path) -> None:
         if not f.is_file():
             continue
         name = f.name
+        # Skip hidden files (like .doi_index.json)
+        if name.startswith("."):
+            continue
         # Always clean up .part files
         if name.endswith(".part"):
             try:
@@ -109,6 +208,12 @@ def _try_source(
 ) -> dict[str, Any] | None:
     from .scoring import record_result, classify_error, get_user_advice
     t0 = time.time()
+
+    # Limit concurrency for browser-based sources
+    is_browser = label in _BROWSER_SOURCE_LABELS
+    sem = _get_browser_semaphore(config) if is_browser else None
+    if sem:
+        sem.acquire()
     try:
         sig = inspect.signature(source_fn)
         if "use_tor" in sig.parameters:
@@ -120,6 +225,15 @@ def _try_source(
             result["doi"] = doi
             result["identifier"] = doi
             if result.get("success"):
+                # Check for suspicious PDF (1-page or very small — likely not full text)
+                file_path = result.get("file", "")
+                if file_path:
+                    from ..pdf_utils import is_pdf_file, is_suspicious_pdf, suspicious_pdf
+                    fp = Path(file_path)
+                    if fp.suffix.lower() == ".pdf" and fp.exists() and is_pdf_file(fp) and is_suspicious_pdf(fp):
+                        log.info(f"   SUSPICIOUS {label}: PDF appears to be a preview/cover page, not full text")
+                        record_result(label, False, latency_ms, "suspicious_pdf")
+                        return suspicious_pdf(doi, fp, label)
                 record_result(label, True, latency_ms)
             else:
                 error_type = classify_error(result.get("status_code", 0))
@@ -128,10 +242,45 @@ def _try_source(
     except Exception as e:
         latency_ms = (time.time() - t0) * 1000
         error_type = classify_error(exception=e)
+        # Check if a valid PDF was actually written to disk despite the exception
+        # (common with Sci-Hub: browser download succeeds but post-download logic raises)
+        from ..pdf_utils import is_pdf_file as _is_pdf
+        if output_path.exists() and _is_pdf(output_path):
+            log.info(f"   OK {label} (recovered after {error_type})")
+            record_result(label, True, latency_ms)
+            return {"success": True, "identifier": doi, "doi": doi,
+                    "file": str(output_path), "source": label}
         record_result(label, False, latency_ms, error_type)
         advice = get_user_advice(error_type, label)
         log.info(f"   FAIL {label}: {error_type} — {advice}")
         return None
+    finally:
+        if sem:
+            sem.release()
+
+
+def _finalize_result_file(result: dict[str, Any], output_path: Path) -> dict[str, Any]:
+    """Move a winning lane's file into place without forcing a non-PDF to .pdf.
+
+    CNKI can legitimately return a CAJ artifact.  Renaming ``paper.caj`` to
+    ``paper.pdf`` would produce a file that every PDF reader rejects; keep the
+    original extension instead.
+    """
+    final_path = Path(result.get("file", ""))
+    if not final_path.exists():
+        return result
+    suffix = final_path.suffix.lower()
+    target = output_path if suffix in ("", ".pdf") else output_path.with_suffix(suffix)
+    if final_path == target:
+        return result
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.unlink(missing_ok=True)
+        final_path.replace(target)
+        result["file"] = str(target)
+    except OSError:
+        pass
+    return result
 
 
 def _run_tier(
@@ -154,13 +303,7 @@ def _run_tier(
         try:
             result = _try_source(fn, doi, src_output, config, label, use_tor=use_tor)
             if result and result.get("success"):
-                final_path = Path(result.get("file", ""))
-                if final_path != output_path and final_path.exists():
-                    output_path.parent.mkdir(parents=True, exist_ok=True)
-                    if output_path.exists():
-                        output_path.unlink()
-                    final_path.rename(output_path)
-                    result["file"] = str(output_path)
+                _finalize_result_file(result, output_path)
                 log.info(f"   OK {label}")
                 return result
             else:
@@ -188,13 +331,7 @@ def _run_tier(
                 except Exception:
                     result = None
                 if result and result.get("success"):
-                    final_path = Path(result.get("file", ""))
-                    if final_path != output_path and final_path.exists():
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        if output_path.exists():
-                            output_path.unlink()
-                        final_path.rename(output_path)
-                        result["file"] = str(output_path)
+                    _finalize_result_file(result, output_path)
                     for _, other_path in futures.values():
                         if other_path != output_path and other_path.exists():
                             try:
@@ -215,20 +352,33 @@ def _run_tier(
     return None
 
 
-def _build_tiers(doi: str, config: dict[str, Any], strategy: str, *, use_vpnsci: bool = False) -> list[tuple[list[tuple[Any, str]], str, int]]:
-    """Build tier list based on download strategy. Returns [(sources, label, timeout), ...].
+def _try_cn_database_free(doi: str, output_path: Path, config: dict[str, Any]) -> dict[str, Any] | None:
+    """CN database lane for the free phase: reuse cookies, never open a login browser.
 
-    Priority order:
-    1. Publisher direct + fast OA APIs (fast, legal)
-    2. OA discovery APIs (OpenAIRE, DOAJ, BASE, CrossrefPage)
-    3. More OA sources (EuropePMC, CORE, PMC)
-    4. LibGen (grey area)
-    5. Sci-Hub (grey area, requires opt-in)
-    6. WebVPN (institutional, last resort)
+    Interactive CARSI login can take minutes, far beyond the free-race budget.
+    The institutional phase re-runs this lane with auto-login enabled.
     """
-    publisher_fast = get_publisher_fast_sources(doi)
+    return try_cn_database(
+        doi, output_path,
+        {**config, "cn_auto_login": False, "cn_vip_fallback": False},
+    )
 
-    # Deduplicate: publisher_fast may already include Unpaywall, Crossref, etc.
+
+def _build_free_sources(doi: str, config: dict[str, Any]) -> list[tuple[Any, str]]:
+    """Build Phase 1 sources: all free/OA/grey sources, sorted by adaptive score.
+    
+    Respects config['download_strategy']:
+      - fastest:     all sources, EMA-sorted (default)
+      - scihub_first: all sources, but grey sources sorted first
+      - scihub_only:  only SciBban + Sci-Hub + LibGen
+      - oa_first:     all sources, but OA sources sorted before grey
+      - legal_only:   exclude grey sources (SciBban, Sci-Hub, LibGen)
+    """
+    from .scoring import sort_sources
+
+    strategy = config.get("download_strategy", "fastest")
+
+    publisher_fast = get_publisher_fast_sources(doi)
     _fast_names = {label for _, label in publisher_fast}
 
     extra_fast = []
@@ -236,96 +386,104 @@ def _build_tiers(doi: str, config: dict[str, Any], strategy: str, *, use_vpnsci:
         (try_unpaywall, "Unpaywall"),
         (try_openalex_oa, "OpenAlexOA"),
         (try_semanticscholar, "SemanticScholar"),
+        (try_openaire, "OpenAIRE"),
     ]:
         if label not in _fast_names:
             extra_fast.append((fn, label))
 
-    tier1_oa = publisher_fast + extra_fast
-    tier2_discovery = [
-        (try_doaj, "DOAJ"),
-        (try_crossref_page_scrape, "CrossrefPage"),
-    ]
-    tier3_oa = [
-        (try_europepmc, "EuropePMC"),
-        (try_core, "CORE"),
-        (try_pmc, "PMC"),
-    ]
-    # Content API: only when user has key configured, saves 100/day quota
-    tier3b_content = [(try_openalex_content_api, "OpenAlexContent")] if config.get("openalex_api_key") else []
-    tier4_libgen = [(try_libgen, "LibGen")]
-    tier5_scihub = [(try_scihub, "Sci-Hub")] if config.get("scihub_enabled", False) else []
-    # WebVPN is last resort - requires use_vpnsci=True and valid session
-    tier6_vpnsci = [(try_vpnsci, "WebVPN")] if use_vpnsci and config.get("vpnsci_enabled", False) else []
-    # CARSI federated auth - independent of WebVPN, uses publisher SSO directly
-    tier6b_carsi = [(try_carsi, "CARSI")] if config.get("carsi_enabled", False) and config.get("carsi_idp_name", "").strip() else []
-    # EZProxy institutional proxy - separate from WebVPN, uses library proxy
-    tier6c_ezproxy = [(try_ezproxy, "EZProxy")] if use_vpnsci and config.get("ezproxy_enabled", False) else []
+    # Chinese sources: NCPSSD free full text, journal official sites, and the
+    # CNKI/Wanfang/VIP institutional lanes (campus egress or CARSI cookies).
+    # They come first for Chinese DOIs because the Western OA indexes either
+    # do not know these DOIs or return nothing useful.
+    cn_sources: list[tuple[Any, str]] = []
+    if is_chinese_doi(doi):
+        if config.get("ncpssd_enabled", True):
+            cn_sources.append((try_ncpssd, "NCPSSD"))
+        if config.get("cn_databases_enabled", True):
+            cn_sources.append((_try_cn_database_free, "CNDatabase"))
+        if config.get("cn_journal_direct", True):
+            cn_sources.append((try_cn_journal_direct, "CNJournal"))
 
-    from .scoring import sort_sources
+    legal_sources = cn_sources + publisher_fast + extra_fast
+    legal_sources += [(try_doaj, "DOAJ"), (try_crossref_page_scrape, "CrossrefPage")]
+    legal_sources += [(try_europepmc, "EuropePMC"), (try_core, "CORE"), (try_pmc, "PMC")]
 
-    # Sort sources within each tier by adaptive score
-    tier1_oa = sort_sources(tier1_oa)
-    tier2_discovery = sort_sources(tier2_discovery)
-    tier3_oa = sort_sources(tier3_oa)
-    tier3b_content = sort_sources(tier3b_content)
-    tier4_libgen = sort_sources(tier4_libgen)
-    tier5_scihub = sort_sources(tier5_scihub)
-    tier6_vpnsci = sort_sources(tier6_vpnsci)
+    if config.get("openalex_api_key"):
+        legal_sources.append((try_openalex_content_api, "OpenAlexContent"))
+
+    # Grey / shadow-library sources (Sci-Hub, SciBban, LibGen) are gated by
+    # scihub_enabled. A compliance profile (e.g. the Qoder edition) is a hard
+    # ceiling and disables them regardless of the config file. Opt-out is
+    # otherwise explicit (scihub_enabled=false / strategy=legal_only).
+    grey_enabled = config.get("scihub_enabled", True) and not is_legal_only_profile()
+    grey_sources: list[tuple[Any, str]] = []
+    if grey_enabled:
+        grey_sources.append((try_scibban, "SciBban"))
+        grey_sources.append((try_libgen, "LibGen"))
+        grey_sources.append((try_scihub, "Sci-Hub"))
 
     if strategy == "scihub_only":
-        return [(tier5_scihub, "Sci-Hub", 30)] if tier5_scihub else []
+        # Only Sci-Hub (not SciBban, not LibGen)
+        return sort_sources([(try_scihub, "Sci-Hub")]) if grey_enabled else []
+    elif strategy == "grey_only":
+        return sort_sources(grey_sources)
+    elif strategy == "legal_only":
+        return sort_sources(legal_sources)
+    elif strategy == "scihub_first":
+        # Grey sources first, then legal
+        return sort_sources(grey_sources) + sort_sources(legal_sources)
+    elif strategy == "oa_first":
+        # Legal sources first, then grey
+        return sort_sources(legal_sources) + grey_sources
+    else:
+        # fastest: all sources EMA-sorted
+        return sort_sources(legal_sources + grey_sources)
 
-    if strategy == "legal_only":
-        result = [
-            (tier1_oa, "Fast-OA", 5),
-            (tier2_discovery, "Discovery", 10),
-            (tier3_oa, "OA", 8),
-            (tier3b_content, "ContentAPI", 10),
-            (tier6_vpnsci, "WebVPN", 20),
-        ]
-        if tier6b_carsi:
-            result.append((tier6b_carsi, "CARSI", 25))
-        if tier6c_ezproxy:
-            result.append((tier6c_ezproxy, "EZProxy", 25))
-        return result
 
-    if strategy == "oa_first":
-        result = [
-            (tier1_oa, "Fast-OA", 5),
-            (tier2_discovery, "Discovery", 10),
-            (tier3_oa, "OA", 8),
-            (tier3b_content, "ContentAPI", 10),
-            (tier4_libgen, "LibGen", 15),
-            (tier5_scihub, "Sci-Hub", 45),
-            (tier6_vpnsci, "WebVPN", 25),
-        ]
-        if tier6b_carsi:
-            result.append((tier6b_carsi, "CARSI", 25))
-        if tier6c_ezproxy:
-            result.append((tier6c_ezproxy, "EZProxy", 25))
-        return result
+def _build_institutional_sources(doi: str, config: dict[str, Any], *, use_vpnsci: bool = False) -> list[tuple[Any, str]]:
+    """Build Phase 2 sources: institutional access only."""
+    from .scoring import sort_sources
 
-    tier3_more_oa = sort_sources([
-        (try_europepmc, "EuropePMC"),
-        (try_core, "CORE"),
-        (try_pmc, "PMC"),
-    ])
-    tier4_grey = tier4_libgen + tier5_scihub
-    tiers = [
-        (tier1_oa, "Flash", 4),
-        (tier2_discovery, "Discovery", 10),
-        (tier3_more_oa, "OA", 8),
-    ]
-    if tier3b_content:
-        tiers.append((tier3b_content, "ContentAPI", 10))
-    tiers.append((tier4_grey, "Grey", 45))
-    if tier6_vpnsci:
-        tiers.append((tier6_vpnsci, "WebVPN", 20))
-    if tier6b_carsi:
-        tiers.append((tier6b_carsi, "CARSI", 25))
-    if tier6c_ezproxy:
-        tiers.append((tier6c_ezproxy, "EZProxy", 25))
-    return tiers
+    sources: list[tuple[Any, str]] = []
+
+    if _any_institutional_path(config) and not is_chinese_doi(doi):
+        sources.append((_try_institutional_bridge, "InstSci"))
+
+    # Chinese DOIs use the dedicated CNDatabase lane below; the generic
+    # publisher CARSI flow does not understand CNKI/Wanfang/VIP pages.
+    if (
+        config.get("carsi_enabled", False)
+        and config.get("carsi_idp_name", "").strip()
+        and not is_chinese_doi(doi)
+    ):
+        sources.append((try_carsi, "CARSI"))
+
+    # Chinese databases: the free phase only reuses saved cookies; this is
+    # where an interactive CARSI login is allowed.
+    if config.get("cn_databases_enabled", True) and is_chinese_doi(doi):
+        sources.append((try_cn_database, "CNDatabase"))
+
+    if use_vpnsci and config.get("vpnsci_enabled", False):
+        sources.append((try_vpnsci, "WebVPN"))
+
+    if use_vpnsci and config.get("ezproxy_enabled", False):
+        sources.append((try_ezproxy, "EZProxy"))
+
+    return sort_sources(sources)
+
+
+def _wait_any(events: tuple[threading.Event, threading.Event], timeout: float) -> bool:
+    """Wait for any event to be set, polling at a fine grain (no wait-any API).
+
+    Used by the racing engine to react to either the first success or the
+    completion of every submitted source, whichever comes first.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if any(e.is_set() for e in events):
+            return True
+        time.sleep(0.05)
+    return any(e.is_set() for e in events)
 
 
 def _run_tiers_parallel(
@@ -336,22 +494,41 @@ def _run_tiers_parallel(
     config: dict[str, Any],
     use_tor: bool,
     overall_timeout: int,
+    failures: list[dict[str, str]] | None = None,
 ) -> dict[str, Any] | None:
     """Race all tiers in parallel. First successful tier wins.
 
     Uses a shared result dict so that any source thread can publish its
     success immediately, even if it's running inside a nested parallel
-    call (like Sci-Hub domain racing).
+    call (like Sci-Hub domain racing). `failures` (optional) collects why
+    each losing lane failed — pool workers append to it.
     """
-    # Delegate to compiled racing engine if available
-    if _HAS_COMPILED_CORE:
+    if failures is None:
+        failures = []
+    # Delegate to the compiled racing engine only for the flat race: the
+    # hedged cascade needs staggered submission, which the compiled engine
+    # does not model.
+    race_mode = str(config.get("race_mode", "hedge")).lower()
+    if _HAS_COMPILED_CORE and race_mode == "full":
         all_sources = []
         for tier_sources, tier_label, tier_timeout in tiers:
             for fn, label in tier_sources:
                 all_sources.append((fn, label, tier_label, tier_timeout))
+
+        def _try_source_recorded(source_fn, doi_, out_path, config_, label_,
+                                 use_tor=False):
+            # Same recording contract as the pure-Python race below: the
+            # compiled engine only manages threading, it still calls back
+            # into _try_source for every lane (with use_tor as a keyword —
+            # see racing.pyx).
+            result = _try_source(source_fn, doi_, out_path, config_, label_,
+                                 use_tor=use_tor)
+            _record_source_failure(failures, label_, result)
+            return result
+
         return _run_parallel_race_compiled(
             all_sources, doi, target_dir, output_path, config,
-            use_tor, overall_timeout, _try_source, safe_filename, log,
+            use_tor, overall_timeout, _try_source_recorded, safe_filename, log,
         )
     if not tiers:
         return None
@@ -371,52 +548,124 @@ def _run_tiers_parallel(
         src_output = target_dir / f"{safe_filename(doi)}_{label}.pdf"
         result = _try_source(fn, doi, src_output, config, label, use_tor=use_tor)
         if result and result.get("success"):
-            final_path = Path(result.get("file", ""))
-            if final_path != output_path and final_path.exists():
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if output_path.exists():
-                    output_path.unlink()
-                final_path.rename(output_path)
-                result["file"] = str(output_path)
+            _finalize_result_file(result, output_path)
             return result
+        _record_source_failure(failures, label, result)
         return None
 
     # Shared result: any thread can publish success here, signaled via Event
     result_lock = threading.Lock()
     success_event = threading.Event()
+    cancel_event = threading.Event()
+    all_done_event = threading.Event()   # set when every submitted future returned
+    done_counter: list[int] = [0]
+    done_counter_lock = threading.Lock()
+    submission_done = threading.Event()  # staggered scheduler finished launching lanes
+    lanes_idle = threading.Event()       # every launched-so-far lane has answered
     shared_result: dict[str, Any] = {"result": None}
 
     def _try_and_publish(fn, label, src_output):
-        result = _try_source(fn, doi, src_output, config, label, use_tor=use_tor)
+        # Skip if another source already succeeded
+        if cancel_event.is_set():
+            return None
+        try:
+            result = _try_source(fn, doi, src_output, config, label, use_tor=use_tor)
+        finally:
+            # This pool is created per download (issue #57): once its worker
+            # threads die, their thread-local shared browsers are unreachable
+            # to close_shared_browser() and the atexit reaper only fires at
+            # process exit — a long-lived MCP server accumulates Chromium
+            # processes. Each worker closes its own browser before exiting.
+            try:
+                from ..browser_engine import shutdown_shared_browser
+                shutdown_shared_browser()
+            except Exception:
+                pass
+        if result and not result.get("success"):
+            # ponytail: (source, publisher) negative cache — a Cloudflare block
+            # on one paper must not burn every later paper's timeout; raise TTL
+            # or key by full DOI if false-skip reports come in.
+            _neg_record(label, doi, result)
+            _record_source_failure(failures, label, result)
         if result and result.get("success"):
             with result_lock:
                 if shared_result["result"] is None:
                     shared_result["result"] = (result, label, src_output)
+                    cancel_event.set()
                     success_event.set()
         return result
 
-    log.info(f"   Racing {len(all_sources)} sources across {len(tiers)} tiers (parallel)...")
-    pool = ThreadPoolExecutor(max_workers=len(all_sources))
+    def _on_future_done(fut) -> None:
+        with done_counter_lock:
+            done_counter[0] += 1
+            if done_counter[0] >= len(futures):
+                # Mid-scheduling this wakes the scheduler so a fast-failing
+                # lane widens immediately instead of idling out the hedge
+                # delay; after submission_done it means the race is over.
+                lanes_idle.set()
+                if submission_done.is_set():
+                    all_done_event.set()
+
+    # Hedged cascade (default): lanes arrive score-ordered by the caller.
+    # Launch the best first and only widen when it fails to answer within
+    # hedge_delay_seconds — cuts request volume and anti-bot heat vs a flat
+    # race while keeping tail latency close. race_mode=full restores the
+    # flat all-at-once race (compiled engine eligible again).
+    hedge_delay = max(0.0, float(config.get("hedge_delay_seconds", 1.5)))
+    if race_mode == "full":
+        hedge_delay = 0.0
+    mode_label = "hedged cascade" if hedge_delay > 0 else "flat race"
+
+    launchable: list[tuple[Any, str]] = []
+    for fn, label, _tier_label, _tier_timeout in all_sources:
+        if _neg_blocked(label, doi):
+            log.info(f"   SKIP {label} (negative cache: recently failed for this publisher)")
+            continue
+        launchable.append((fn, label))
+
+    log.info(f"   Racing {len(all_sources)} sources across {len(tiers)} tiers ({mode_label})...")
+    deadline = time.time() + overall_timeout + 5
+    pool = ThreadPoolExecutor(max_workers=max(1, len(launchable)))
     futures = {}
     try:
-        for fn, label, tier_label, tier_timeout in all_sources:
+        for i, (fn, label) in enumerate(launchable):
+            lanes_idle.clear()
             src_output = target_dir / f"{safe_filename(doi)}_{label}.pdf"
-            futures[pool.submit(_try_and_publish, fn, label, src_output)] = (label, src_output)
+            fut = pool.submit(_try_and_publish, fn, label, src_output)
+            futures[fut] = (label, src_output)
+            fut.add_done_callback(_on_future_done)
+            if hedge_delay <= 0 or i == len(launchable) - 1 or success_event.is_set():
+                continue
+            # Widen only when needed: another lane succeeded, everything
+            # launched so far already answered (fast failure), the hedge
+            # delay elapsed, or the overall deadline arrived.
+            now = time.time()
+            if now >= deadline:
+                break
+            _wait_any((success_event, lanes_idle),
+                      min(hedge_delay, deadline - now))
+            if success_event.is_set() or time.time() >= deadline:
+                break
+        submission_done.set()
+        with done_counter_lock:
+            if done_counter[0] >= len(futures):
+                all_done_event.set()
 
-        # Wait for first success or overall timeout - instant notification via Event
-        success_event.wait(timeout=overall_timeout + 5)
+        # Wait for first success, all sources done, or the overall timeout.
+        # all_done lets a full fast-failure return immediately instead of
+        # burning the whole timeout + grace period.
+        if not success_event.is_set() and not all_done_event.is_set():
+            _wait_any((success_event, all_done_event),
+                      max(0.0, deadline - time.time()))
 
         if shared_result["result"] is not None:
             result, label, src_output = shared_result["result"]
-            final_path = Path(result.get("file", ""))
-            if final_path != output_path and final_path.exists():
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if output_path.exists():
-                    output_path.unlink()
-                final_path.rename(output_path)
-                result["file"] = str(output_path)
+            _finalize_result_file(result, output_path)
             log.info(f"   OK {label}")
             return result
+        if all_done_event.is_set():
+            log.info("   All sources failed")
+            return None
 
         # Timeout reached — give late-finishing threads a grace period.
         # Visible browser login can take 60-300s (browser launch + SSO + redirect),
@@ -430,23 +679,23 @@ def _run_tiers_parallel(
         else:
             grace = 15
         log.info(f"   Racing timed out after {overall_timeout + 5}s, waiting up to {grace}s for late results...")
-        success_event.wait(timeout=grace)
+        _wait_any((success_event, all_done_event), grace)
         if shared_result["result"] is not None:
             result, label, src_output = shared_result["result"]
-            final_path = Path(result.get("file", ""))
-            if final_path != output_path and final_path.exists():
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                if output_path.exists():
-                    output_path.unlink()
-                final_path.rename(output_path)
-                result["file"] = str(output_path)
+            _finalize_result_file(result, output_path)
             log.info(f"   OK {label} (late)")
             return result
+        if all_done_event.is_set():
+            log.info("   All sources failed")
+            return None
 
         # Final scan: check if any source wrote a valid PDF file despite timeout
-        from ..pdf_utils import is_pdf_file
+        from ..pdf_utils import is_pdf_file, is_suspicious_pdf, suspicious_pdf
         for label, src_output in futures.values():
             if src_output.exists() and is_pdf_file(src_output):
+                if is_suspicious_pdf(src_output):
+                    log.info(f"   SUSPICIOUS {label} (file scan): skipping suspicious PDF")
+                    continue
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 if output_path.exists():
                     output_path.unlink()
@@ -457,7 +706,14 @@ def _run_tiers_parallel(
 
         log.info(f"   All sources failed")
     finally:
-        pool.shutdown(wait=False)
+        # Never block termination on sources that refuse to return: cancel
+        # pending futures and waive stragglers. Their own I/O deadlines
+        # (connect/read timeouts, stream deadline in pdf_utils) bound how long
+        # an abandoned worker thread can outlive the race.
+        alive = [f for f in futures if not f.done()]
+        if alive:
+            log.info(f"   Racing finished with {len(alive)} source(s) still running (waived)")
+        pool.shutdown(wait=False, cancel_futures=True)
         # Cleanup temp files
         for _, other_path in futures.values():
             if other_path != output_path and other_path.exists():
@@ -469,22 +725,158 @@ def _run_tiers_parallel(
     return None
 
 
-def _auto_rename(result: dict[str, Any], identifier: str, config: dict[str, Any]) -> None:
+#: Strategies that encode an explicit user source preference. For these, a
+#: cached file obtained through a different strategy is treated as a miss so
+#: the requested channel is actually used; the default strategies reuse cache.
+_EXPLICIT_STRATEGIES = ("scihub_only", "legal_only", "scihub_first")
+
+
+def _index_entry(entry: Any) -> dict[str, Any] | None:
+    """Normalize a .doi_index entry to a record dict.
+
+    Legacy ``str -> path`` entries have no provenance and no timestamp; they
+    are treated as fresh (ts=None) and upgraded on the next cache hit.
+    """
+    if isinstance(entry, str):
+        return {"file": entry, "source": "", "strategy": "", "ts": None}
+    if isinstance(entry, dict):
+        ts = entry.get("ts")
+        try:
+            ts_value = float(ts) if ts is not None else None
+        except (TypeError, ValueError):
+            ts_value = None
+        return {
+            "file": str(entry.get("file") or ""),
+            "source": str(entry.get("source") or ""),
+            "strategy": str(entry.get("strategy") or ""),
+            "ts": ts_value,
+        }
+    return None
+
+
+def _index_entry_is_fresh(entry: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Apply the cache TTL (cache_ttl_hours) to an index entry."""
+    try:
+        ttl_hours = float(config.get("cache_ttl_hours", 168))
+    except (TypeError, ValueError):
+        ttl_hours = 168.0
+    if ttl_hours <= 0 or entry.get("ts") is None:
+        return True
+    return (time.time() - entry["ts"]) <= ttl_hours * 3600
+
+
+def _index_strategy_compatible(entry: dict[str, Any], config: dict[str, Any]) -> bool:
+    """Honor an explicitly requested download strategy over cached files."""
+    current = str(config.get("download_strategy") or "fastest").strip()
+    if current not in _EXPLICIT_STRATEGIES:
+        return True
+    recorded = str(entry.get("strategy") or "").strip()
+    return recorded == current
+
+
+def _update_doi_index(
+    target_dir: Path,
+    doi: str,
+    file_path: Path,
+    *,
+    source: str = "",
+    strategy: str = "",
+    config: dict[str, Any] | None = None,
+) -> None:
+    """Update the DOI→file index for dedup.
+
+    Records carry provenance (``source``/``strategy``) and a timestamp so
+    stale or channel-mismatched entries can be invalidated by TTL and by
+    explicit strategy changes instead of manual ``rm``. Existing entries keep
+    their recorded source/strategy when the caller does not supply new ones
+    (e.g. a rename that just moves the file).
+    """
+    doi_index = target_dir / ".doi_index.json"
+    try:
+        idx: dict[str, Any] = {}
+        if doi_index.exists():
+            idx = json.loads(doi_index.read_text(encoding="utf-8"))
+        existing = _index_entry(idx.get(doi)) if doi in idx else None
+        if existing:
+            source = source or existing["source"]
+            strategy = strategy or existing["strategy"]
+        idx[doi] = {
+            "file": str(file_path),
+            "source": source or "",
+            "strategy": strategy or (config or {}).get("download_strategy", "") or "",
+            "ts": time.time(),
+        }
+        doi_index.write_text(json.dumps(idx, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _auto_rename(result: dict[str, Any], identifier: str, config: dict[str, Any], doi: str = "", target_dir: Path | None = None) -> None:
     """Auto-rename downloaded PDF based on metadata."""
     if not config.get("auto_rename", True):
         return
     file_path = Path(result.get("file", ""))
     if not file_path.exists():
         return
+    if file_path.suffix.lower() != ".pdf":
+        # Non-PDF artifacts (e.g. the ElsevierAPI text/plain full text) keep
+        # their own extension — rename_pdf would force a .pdf name onto them.
+        log.info(f"   Non-PDF artifact ({file_path.suffix or 'no ext'}) — skipping auto-rename")
+        return
     # Use cached metadata or fetch from Crossref
     from ..citation import fetch_metadata
-    doi = result.get("doi", identifier)
-    metadata = fetch_metadata(doi, config)
+    _doi = doi or result.get("doi", identifier)
+    metadata = fetch_metadata(_doi, config)
     if metadata:
         new_path = rename_pdf(file_path, metadata)
         if new_path and new_path != file_path:
             result["file"] = str(new_path)
             result["renamed"] = True
+            log.info(f"   Renamed: {file_path.name} -> {new_path.name}")
+            # Update DOI→file index for dedup
+            if target_dir and _doi:
+                _update_doi_index(
+                    target_dir,
+                    _doi,
+                    new_path,
+                    source=result.get("source") or "",
+                    strategy=config.get("download_strategy", ""),
+                    config=config,
+                )
+        else:
+            log.info(f"   Kept original name: {file_path.name}")
+    else:
+        log.info(f"   No metadata for rename, keeping: {file_path.name}")
+
+
+# Single-flight guard: at most one download() per identifier per process.
+# Duplicate submissions (e.g. an MCP client retrying after its own 30s client
+# timeout while the server is still racing sources) used to start a second,
+# parallel browser task for the same paper — the "infinite popup" experience.
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: set[str] = set()
+
+
+# Per-download record of WHY each racing source failed. A channel being
+# unreachable is usually temporary or a missing user decision (e.g. Unpaywall
+# needs the user's email) — surfaced in the final failure result so the
+# user/agent can choose: retry, fix config, or switch channel. Never skip a
+# channel silently. The list is created per download() and threaded through
+# _run_tiers_parallel (pool workers append to it; list.append is atomic).
+def _record_source_failure(failures: list[dict[str, str]], label: str,
+                           result: dict[str, Any] | None) -> None:
+    """Collect structured failure reasons (label, reason, error_type, action)."""
+    if not result or result.get("success"):
+        return
+    try:
+        failures.append({
+            "source": label,
+            "reason": str(result.get("reason") or result.get("error") or "")[:200],
+            "error_type": str(result.get("error_type", "")),
+            "action": str(result.get("action", "")),
+        })
+    except Exception:
+        pass
 
 
 def download(
@@ -495,16 +887,80 @@ def download(
     use_tor: bool = False,
     use_vpnsci: bool = False,
     bibtex: bool = False,
-    strategy: str | None = None,
     rename: bool = True,
+    _institutional: bool = True,
+    _validated: bool = False,
+    strategy: str | None = None,
 ) -> dict[str, Any]:
+    key = identifier.strip()
+    if not is_arxiv_identifier(key):
+        key = normalize_doi(key)
+    with _INFLIGHT_LOCK:
+        if key in _INFLIGHT:
+            log.info(f"   Single-flight: download already in progress for {key}")
+            return fail(
+                key,
+                reason="download already in progress for this identifier",
+                error_type="in_progress",
+                action="wait for the in-flight attempt to finish (it is still "
+                       "racing sources); retry in a minute only if it failed",
+            )
+        _INFLIGHT.add(key)
+    try:
+        return _download_impl(
+            identifier,
+            output_dir,
+            scihub_enabled=scihub_enabled,
+            use_tor=use_tor,
+            use_vpnsci=use_vpnsci,
+            bibtex=bibtex,
+            rename=rename,
+            _institutional=_institutional,
+            _validated=_validated,
+            strategy=strategy,
+        )
+    finally:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT.discard(key)
+
+
+def _download_impl(
+    identifier: str,
+    output_dir: str | Path | None = None,
+    *,
+    scihub_enabled: bool | None = None,
+    use_tor: bool = False,
+    use_vpnsci: bool = False,
+    bibtex: bool = False,
+    rename: bool = True,
+    _institutional: bool = True,
+    _validated: bool = False,
+    strategy: str | None = None,
+) -> dict[str, Any]:
+    race_failures: list[dict[str, str]] = []
     config = load_config()
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     if scihub_enabled is not None:
         config["scihub_enabled"] = scihub_enabled
 
-    strategy = strategy or config.get("download_strategy", "fastest")
+    if strategy is not None:
+        config["download_strategy"] = strategy
+
+    if is_legal_only_profile():
+        # A compliance profile is a hard ceiling on the source set. An explicit
+        # MCP/CLI argument cannot re-enable grey sources in this process.
+        if scihub_enabled is True or (strategy or "").lower() in GREY_STRATEGIES:
+            return fail(
+                identifier,
+                "This edition is legal-only; grey sources are disabled by the "
+                "active compliance profile",
+                error_type="compliance_profile",
+                action="use the full open-source package if you have verified "
+                       "authorization for grey sources",
+            )
+        config["scihub_enabled"] = False
+        config["download_strategy"] = "legal_only"
 
     target_dir = Path(output_dir) if output_dir else Path(config["output_dir"])
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -527,13 +983,50 @@ def download(
     # Scan output dir for existing file with same rename pattern
     doi = normalize_doi(identifier) if not is_arxiv_identifier(identifier) else identifier
 
-    # Validate DOI before attempting download
-    if not is_arxiv_identifier(identifier):
+    # Validate DOI before attempting download. A batch has already validated
+    # every identifier before scheduling it, so it passes _validated=True instead
+    # of paying for a second HEAD per DOI (#72).
+    if not _validated and not is_arxiv_identifier(identifier):
         from ..identifiers import validate_doi
         valid, msg = validate_doi(doi)
         if not valid:
             log.info(f"   DOI validation failed: {msg}")
             return {"success": False, "identifier": identifier, "doi": doi, "error": f"Invalid DOI: {msg}"}
+
+    # Scan output dir for any PDF already downloaded for this DOI.
+    # Uses a DOI→file index to catch renamed files reliably.
+    doi_index = target_dir / ".doi_index.json"
+    if doi_index.exists():
+        try:
+            idx = json.loads(doi_index.read_text(encoding="utf-8"))
+            raw_entry = idx.get(doi)
+            if raw_entry:
+                entry = _index_entry(raw_entry)
+                candidate = Path(entry["file"]) if entry and entry.get("file") else None
+                if entry and candidate and _index_entry_is_fresh(entry, config) and _index_strategy_compatible(entry, config):
+                    if candidate.exists():
+                        log.info(f"   Found existing file (index): {candidate.name}")
+                        result = {
+                            "success": True, "identifier": identifier,
+                            "doi": doi, "file": str(candidate),
+                            "source": "local_cache", "cached": True,
+                        }
+                        # Upgrade legacy entries to records and refresh provenance.
+                        idx[doi] = {
+                            "file": str(candidate),
+                            "source": entry["source"] or "local_cache",
+                            "strategy": entry["strategy"] or config.get("download_strategy", ""),
+                            "ts": time.time(),
+                        }
+                        doi_index.write_text(json.dumps(idx, indent=2, ensure_ascii=False), encoding="utf-8")
+                        cache_set(identifier, result, config)
+                        return result
+                # Stale (file deleted), TTL-expired, or strategy-mismatched entry —
+                # drop it so the download is retried instead of serving stale state.
+                del idx[doi]
+                doi_index.write_text(json.dumps(idx, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
 
     from ..citation import fetch_metadata
     metadata = fetch_metadata(doi, config)
@@ -552,14 +1045,22 @@ def download(
                     cache_set(identifier, result, config)
                     return result
 
-    log.info(f"ScanSci PDF - {identifier} [{strategy}]")
+    log.info(f"ScanSci PDF - {identifier}")
 
     if is_arxiv_identifier(identifier):
         log.info("   [L0] arXiv direct")
         result = try_arxiv(identifier, output_path, config)
         if result:
+            _update_doi_index(
+                target_dir,
+                identifier,
+                Path(result.get("file", "")),
+                source=result.get("source") or "arXiv",
+                strategy=config.get("download_strategy", ""),
+                config=config,
+            )
             if rename:
-                _auto_rename(result, identifier, config)
+                _auto_rename(result, identifier, config, doi=identifier, target_dir=target_dir)
             cache_set(identifier, result, config)
             if bibtex:
                 from ..bibtex import fetch_bibtex
@@ -568,19 +1069,89 @@ def download(
         return fail(identifier, "arXiv PDF not available")
 
     doi = normalize_doi(identifier)
-    tiers = _build_tiers(doi, config, strategy, use_vpnsci=use_vpnsci)
 
-    # Race all tiers in parallel - first success wins
-    max_tier_timeout = max((t[2] for t in tiers), default=20)
-    result = _run_tiers_parallel(tiers, doi, target_dir, output_path, config, use_tor, max_tier_timeout)
-    if result:
-        if rename:
-            _auto_rename(result, identifier, config)
-        cache_set(identifier, result, config)
-        if bibtex:
-            from ..bibtex import fetch_bibtex
-            result["bibtex"] = fetch_bibtex(doi, config)
-        return result
+    # Phase 1: Free sources (OA + grey) — parallel race
+    free_sources = _build_free_sources(doi, config)
+    if free_sources:
+        result = _run_tiers_parallel(
+            [(free_sources, "Free", 15)], doi, target_dir, output_path, config, use_tor, 15,
+            failures=race_failures,
+        )
+        if result:
+            _update_doi_index(
+                target_dir,
+                doi,
+                Path(result.get("file", "")),
+                source=result.get("source") or "",
+                strategy=config.get("download_strategy", ""),
+                config=config,
+            )
+            if rename:
+                _auto_rename(result, identifier, config, doi=doi, target_dir=target_dir)
+            cache_set(identifier, result, config)
+            if bibtex:
+                from ..bibtex import fetch_bibtex
+                result["bibtex"] = fetch_bibtex(doi, config)
+            return result
+
+    # Phase 2: Institutional access — only when Phase 1 failed
+    # Skip institutional fallback for grey_only/scihub_only strategy
+    if _institutional and config.get("download_strategy") not in ("scihub_only", "grey_only"):
+        # Session self-healing: validate and refresh institutional sessions
+        # before racing them (WebVPN only; CARSI self-heals inside login()).
+        try:
+            from ..session_heal import ensure_institutional_sessions
+            heal_report = ensure_institutional_sessions(config, use_vpnsci=use_vpnsci)
+            for channel, state in heal_report.items():
+                log.info(f"   [session-heal] {channel}: {state.get('status')}")
+        except Exception as exc:
+            log.info(f"   [session-heal] skipped: {exc}")
+        inst_sources = _build_institutional_sources(doi, config, use_vpnsci=use_vpnsci)
+        if inst_sources:
+            log.info("   Phase 1 failed, trying institutional access...")
+            result = _run_tiers_parallel(
+                [(inst_sources, "Institutional", 30)], doi, target_dir, output_path, config, use_tor, 30,
+                failures=race_failures,
+            )
+            if result:
+                _update_doi_index(
+                    target_dir,
+                    doi,
+                    Path(result.get("file", "")),
+                    source=result.get("source") or "",
+                    strategy=config.get("download_strategy", ""),
+                    config=config,
+                )
+                if rename:
+                    _auto_rename(result, identifier, config, doi=doi, target_dir=target_dir)
+                cache_set(identifier, result, config)
+                if bibtex:
+                    from ..bibtex import fetch_bibtex
+                    result["bibtex"] = fetch_bibtex(doi, config)
+                return result
+
+    # Late capture: wait briefly for browser downloads that complete after race timeout,
+    # then scan for any PDFs (or CAJ artifacts) that were saved to disk by racing threads.
+    import time as _time
+    _time.sleep(2)  # grace period for browser threads to finish writing
+    for pattern in (f"{safe_filename(identifier)}*.pdf", f"{safe_filename(identifier)}*.caj"):
+        for p in target_dir.glob(pattern):
+            if p.stat().st_size > 5000:
+                result = {
+                    "success": True, "identifier": identifier, "doi": doi,
+                    "file": str(p), "source": "late_capture",
+                }
+                if p.suffix.lower() == ".caj":
+                    from ..caj import caj_hints
+                    result["format"] = "caj"
+                    result.update(caj_hints(p))
+                cache_set(identifier, result, config)
+                if rename:
+                    _auto_rename(result, identifier, config, doi=doi, target_dir=target_dir)
+                if bibtex:
+                    from ..bibtex import fetch_bibtex
+                    result["bibtex"] = fetch_bibtex(identifier, config)
+                return result
 
     # Build actionable guidance based on what was tried
     guidance = _build_failure_guidance(doi, config)
@@ -592,7 +1163,16 @@ def download(
     except Exception:
         error_type, error_action = "", ""
 
-    hint: dict[str, Any] = {"manual_url": f"https://sci-hub.st/{doi}", "guidance": guidance}
+    # A Chinese database lane that hit a login wall is more informative than
+    # the generic "not found": promote it so the user gets the campus/CARSI
+    # guidance instead of a Sci-Hub hint.
+    if not error_type:
+        for failure in race_failures:
+            if failure.get("action") == "login_required":
+                error_type, error_action = "paywall", "login_required"
+                break
+
+    hint: dict[str, Any] = {"manual_url": f"https://sci-hub.ru/{doi}", "guidance": guidance}
 
     reason = "no PDF found"
     if error_type == "paywall":
@@ -609,10 +1189,18 @@ def download(
             error_type=error_type or "paywall",
             action=error_action or "login_required",
         )
-        result["agent_hint"] = (
-            f"此论文需要机构登录才能下载。请运行 scansci_pdf_login(identifier=\"{doi}\") "
-            "打开浏览器让用户登录机构账号，登录后关闭浏览器，然后重试下载。"
-        )
+        if is_chinese_doi(doi):
+            result["agent_hint"] = (
+                "中文论文需要校园网出口或机构订阅。请选择：1) 连接学校校园网/机构 VPN 后重试"
+                "（万方/维普按 IP 授权）；2) 运行 scansci_pdf_config 设置 "
+                'carsi_enabled=true 和 carsi_idp_name="<学校名>"，再重试（会打开 CARSI 登录浏览器）；'
+                "3) 若知网只提供 CAJ，请用 CAJViewer 打开或 caj2pdf 转 PDF。"
+            )
+        else:
+            result["agent_hint"] = (
+                f"此论文需要机构登录才能下载。请运行 scansci_pdf_login(identifier=\"{doi}\") "
+                "打开浏览器让用户登录机构账号，登录后关闭浏览器，然后重试下载。"
+            )
     else:
         result = fail(
             identifier,
@@ -622,6 +1210,21 @@ def download(
             action=error_action or "",
         )
     result["source"] = "none"
+
+    # Surface WHY each channel failed so the user can decide (channels are
+    # often only temporarily unreachable; some need a user decision, e.g.
+    # Unpaywall requires the user's real email).
+    source_failures = race_failures
+    if source_failures:
+        result["source_failures"] = source_failures
+        config_needs = [f for f in source_failures if f.get("error_type") == "config_needed"]
+        if config_needs and "agent_hint" not in result:
+            channels = ", ".join(sorted({f["source"] for f in config_needs}))
+            result["agent_hint"] = (
+                f"配置缺失（{channels}）：Unpaywall 等渠道需要用户真实邮箱。"
+                '请询问用户的邮箱地址，调用 scansci_pdf_config(key="email", value="<用户邮箱>") '
+                "后重试下载。"
+            )
     return result
 
 
@@ -629,6 +1232,13 @@ def _build_failure_guidance(doi: str, config: dict[str, Any]) -> list[str]:
     """Build actionable guidance when all download sources fail."""
     import os
     tips = []
+
+    if is_chinese_doi(doi):
+        tips.append("中文论文已尝试：NCPSSD（国家哲社文献中心）→ 期刊官网 → 万方 → 知网 → 维普")
+        tips.append("→ 校园网用户：连接学校网络/机构 VPN 后重试（万方/维普通常按 IP 授权）")
+        tips.append("→ CARSI 用户：scansci-pdf config_set carsi_enabled true 且设置 carsi_idp_name")
+        tips.append("→ 知网若只提供 CAJ：用 CAJViewer 打开，或用 caj2pdf 转换为 PDF")
+        tips.append("→ NCPSSD 手动检索: https://www.ncpssd.cn/ （按标题/作者检索）")
 
     # Check if browser strategy detected a paywall
     try:
@@ -645,11 +1255,11 @@ def _build_failure_guidance(doi: str, config: dict[str, Any]) -> list[str]:
         tips.append("→ 重新运行下载命令即可")
     elif error_type == "cloudflare_blocked":
         tips.append("Cloudflare 防护阻止了访问")
-        tips.append("→ 启动 camofox-browser（默认端口 9377）绕过反爬")
+        tips.append("→ 安装可见浏览器后端 (pip install 'scansci-pdf[patchright]') 绕过反爬")
         tips.append("→ 或配置代理: scansci_pdf config_set network_proxy \"socks5://127.0.0.1:1080\"")
-    elif error_type == "camofox_unavailable":
-        tips.append("camofox-browser 未运行，无法使用浏览器下载策略")
-        tips.append("→ 启动 camofox-browser（默认端口 9377）")
+    elif error_type == "browser_unavailable":
+        tips.append("browser 不可用，无法使用浏览器下载策略")
+        tips.append("→ 运行: pip install 'scansci-pdf[patchright]' 或 'scansci-pdf[camoufox]'")
 
     # Check scansci-pdf proxy config
     cfg_proxy = config.get("network_proxy", "")
@@ -667,13 +1277,6 @@ def _build_failure_guidance(doi: str, config: dict[str, Any]) -> list[str]:
         else:
             tips.append("未配置代理 — 如果网络受限，运行: scansci-pdf config_set network_proxy \"socks5://127.0.0.1:1080\"")
 
-    # Check strategy
-    strategy = config.get("download_strategy", "fastest")
-    if strategy == "fastest":
-        tips.append("仅用合法源重试: scansci-pdf download <doi> --strategy legal_only")
-    elif strategy == "legal_only":
-        tips.append("含 Sci-Hub 重试: scansci-pdf download <doi> --strategy fastest")
-
     # Check Tor
     try:
         from ..tor import check_tor_circuit
@@ -687,7 +1290,7 @@ def _build_failure_guidance(doi: str, config: dict[str, Any]) -> list[str]:
         tips.append("有高校账号？运行: scansci-pdf config_set vpnsci_enabled true")
 
     # Manual fallback
-    tips.append(f"手动下载: https://sci-hub.st/{doi}")
+    tips.append(f"手动下载: https://sci-hub.ru/{doi}")
 
     # Network diagnostic
     tips.append("运行网络诊断: scansci-pdf network_diagnose")
@@ -713,6 +1316,8 @@ def _save_progress(batch_id: str, identifier: str, result: dict[str, Any]) -> No
         "source": result.get("source", "none"),
         "file": result.get("file", ""),
         "doi": result.get("doi", ""),
+        "error": result.get("error", ""),
+        "reason": result.get("reason", ""),
     }
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with _progress_lock:
@@ -751,6 +1356,350 @@ def _clear_progress(batch_id: str) -> None:
             pass
 
 
+def _publisher_result_to_standard(
+    result: Any, doi: str, output_dir: Path, publisher_name: str, transport: str = "browser"
+) -> dict[str, Any]:
+    """Convert a PublisherBatchDownloader DownloadResult to the standard result format."""
+    if result.ok and result.pdf_path:
+        src = Path(result.pdf_path)
+        dst = output_dir / f"{safe_filename(doi)}.pdf"
+        try:
+            if src != dst:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                if dst.exists():
+                    dst.unlink()
+                src.rename(dst)
+        except OSError:
+            dst = src
+        return {
+            "success": True, "doi": doi, "identifier": doi,
+            "file": str(dst), "source": f"institutional:{transport}:{publisher_name}",
+            "full_text_length": result.text_length,
+        }
+    return fail(doi, result.reason or "institutional download failed")
+
+
+def _batch_institutional_phase(
+    failed_dois: list[str],
+    output_dir: Path,
+    config: dict[str, Any],
+    batch_id: str,
+    results_map: dict[str, dict[str, Any]],
+    *,
+    scihub_enabled: bool | None = None,
+    use_vpnsci: bool = True,
+) -> None:
+    """Group phase-2 DOIs by broker key and keep each key on one browser session."""
+    try:
+        from .. import session_broker
+        from ..institutional.publisher_profiles import (
+            infer_publisher_profile,
+            infer_publisher_profile_from_url,
+            publisher_profile_key,
+        )
+        from ..institutional.publisher_batch import PaperRecord, PublisherBatchDownloader
+    except ImportError:
+        log.info("   [Batch] publisher_batch not available, skipping institutional phase")
+        return
+
+    try:
+        from ..browser_backend import launch_persistent_context  # noqa: F401
+        from ..browser_backend import is_available as _browser_backend_available
+        if not _browser_backend_available(config=config):
+            log.info("   [Batch] no browser backend available, skipping institutional phase")
+            return
+    except ImportError:
+        log.info("   [Batch] no browser backend available, skipping institutional phase")
+        return
+
+    def _local_cache(doi: str) -> dict[str, Any] | None:
+        safe_name = safe_filename(doi)
+        for path in output_dir.glob(f"{safe_name}*.pdf"):
+            if path.stat().st_size > 5000:
+                return {
+                    "success": True, "doi": doi, "identifier": doi,
+                    "file": str(path), "source": "local_cache",
+                }
+        return None
+
+    grouped: dict[str, dict[str, Any]] = {}
+    ungrouped: list[str] = []
+
+    def _add_to_group(profile: Any, doi: str) -> None:
+        key = publisher_profile_key(profile)
+        group = grouped.setdefault(key, {"profile": profile, "dois": []})
+        group["dois"].append(doi)
+
+    for doi in failed_dois:
+        profile = infer_publisher_profile(doi)
+        if profile:
+            _add_to_group(profile, doi)
+        else:
+            ungrouped.append(doi)
+
+    if ungrouped:
+        from ..institutional.instsci_bridge import _resolve_doi
+
+        needs_resolution: list[str] = []
+        for doi in ungrouped:
+            cached = _local_cache(doi)
+            if cached:
+                results_map[doi] = cached
+                _save_progress(batch_id, doi, cached)
+            else:
+                needs_resolution.append(doi)
+
+        ungrouped = []
+        if needs_resolution:
+            with ThreadPoolExecutor(max_workers=min(2, len(needs_resolution))) as pool:
+                resolved_urls = list(pool.map(_resolve_doi, needs_resolution))
+            for doi, resolved_url in zip(needs_resolution, resolved_urls):
+                profile = infer_publisher_profile_from_url(resolved_url) if resolved_url else None
+                if profile:
+                    _add_to_group(profile, doi)
+                else:
+                    ungrouped.append(doi)
+
+    if not grouped and not ungrouped:
+        return
+
+    institution_query = config.get("vpnsci_school", "")
+    login_timeout = int(config.get("browser_login_timeout", 300))
+    post_login_hold = int(config.get("post_login_hold", 0))
+    workers_inst = max(1, min(int(config.get("institutional_workers", 1) or 1), 2))
+
+    def _manifest_results(
+        profile_name: str, dois: list[str], run_dir: Path, transport: str
+    ) -> dict[str, dict[str, Any]]:
+        manifest_path = run_dir / "complete" / "manifest.json"
+        if not manifest_path.exists():
+            return {}
+        rows: dict[str, dict[str, Any]] = {}
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, list):
+                raise TypeError("manifest must be a list")
+            doi_to_manifest = {}
+            for entry in manifest:
+                if not isinstance(entry, dict):
+                    raise TypeError("manifest entries must be objects")
+                doi_to_manifest[str(entry.get("doi", ""))] = entry
+            for doi in dois:
+                entry = doi_to_manifest.get(doi, {})
+                if entry.get("status") == "success":
+                    pdf_path = entry.get("pdf_path", "")
+                    if not isinstance(pdf_path, str):
+                        raise TypeError("manifest pdf_path must be a string")
+                    if pdf_path and Path(pdf_path).exists():
+                        rows[doi] = _publisher_result_to_standard(
+                            type("R", (), {"ok": True, "pdf_path": pdf_path, "text_length": 0})(),
+                            doi, output_dir, profile_name, transport,
+                        )
+                    else:
+                        rows[doi] = fail(doi, "PDF not found after batch download")
+                else:
+                    rows[doi] = fail(doi, entry.get("reason", "institutional download failed"))
+        except Exception as exc:
+            log.info(f"   [Batch] Failed to consume manifest for {profile_name}: {exc}")
+            return {doi: row for doi, row in rows.items() if row.get("success")}
+        return rows
+
+    def _run_group(key: str, profile: Any, dois: list[str]) -> dict[str, dict[str, Any]]:
+        from uuid import uuid4
+
+        profile_name = profile.name
+        log.info(f"   [Batch] Phase 2: {len(dois)} DOIs via {profile_name} (one session)")
+        records = [PaperRecord(doi=doi) for doi in dois]
+        run_root = output_dir / ".publisher_runs" / profile_name / uuid4().hex
+        broker_dir = run_root / "broker"
+        direct_dir = run_root / "browser"
+        run_root.mkdir(parents=True, exist_ok=True)
+        broker_rows: dict[str, dict[str, Any]] = {}
+
+        with _get_browser_semaphore(config):
+            legacy_key = session_broker.broker_key(profile_name)
+            broker_candidates = [key, legacy_key]
+            broker_candidates.extend(
+                session_broker.broker_key(alias.strip().lower().replace(" ", "-"))
+                for alias in getattr(profile, "aliases", ())
+            )
+            active_broker = None
+            try:
+                for candidate in dict.fromkeys(broker_candidates):
+                    if session_broker.broker_is_running(candidate):
+                        active_broker = candidate
+                        break
+            except Exception as exc:
+                log.info(f"   [Batch] {profile_name} broker discovery failed, using one-shot session: {exc}")
+
+            if active_broker:
+                try:
+                    summary = session_broker.submit_broker_job(
+                        publisher=active_broker,
+                        records=[
+                            {"doi": record.doi, "title": record.title,
+                             "published": record.published, "url": record.url}
+                            for record in records
+                        ],
+                        output_dir=str(broker_dir),
+                        institution=institution_query,
+                        login_timeout=login_timeout,
+                        pdf_timeout=60,
+                        post_login_hold=post_login_hold,
+                        post_run_hold=0,
+                        timeout_seconds=max(120, login_timeout + len(records) * (post_login_hold + 120)),
+                    )
+                    if summary.get("error"):
+                        log.info(f"   [Batch] {profile_name} broker job failed, using one-shot session: {summary['error']}")
+                    else:
+                        broker_rows = _manifest_results(profile_name, dois, broker_dir, "broker")
+                        if broker_rows and all(row.get("success") for row in broker_rows.values()):
+                            return broker_rows
+                except TimeoutError:
+                    return {
+                        doi: fail(doi, "broker job timed out; direct fallback suppressed while the job may be active")
+                        for doi in dois
+                    }
+                except Exception as exc:
+                    try:
+                        broker_may_be_active = session_broker.broker_is_running(active_broker)
+                    except Exception:
+                        broker_may_be_active = True
+                    if broker_may_be_active:
+                        return {
+                            doi: fail(doi, "broker job outcome unknown; direct fallback suppressed")
+                            for doi in dois
+                        }
+                    log.info(f"   [Batch] {profile_name} broker stopped, using one-shot session: {exc}")
+
+            direct_dois = [doi for doi in dois if not broker_rows.get(doi, {}).get("success")]
+            direct_records = [record for record in records if record.doi in direct_dois]
+            try:
+                downloader = PublisherBatchDownloader(
+                    config=config,
+                    profile=profile,
+                    institution_query=institution_query,
+                    login_timeout_sec=login_timeout,
+                    pdf_timeout_sec=60,
+                    post_login_hold_sec=post_login_hold,
+                    post_run_hold_sec=0,
+                    require_interactive_browser=True,
+                )
+                downloader.run_records(
+                    direct_records, direct_dir, retry_failed=True, concurrency=1,
+                    report_progress=workers_inst <= 1,
+                )
+            except Exception as exc:
+                log.info(f"   [Batch] {profile_name} batch failed: {exc}")
+                return {doi: row for doi, row in broker_rows.items() if row.get("success")}
+
+            direct_rows = _manifest_results(profile_name, direct_dois, direct_dir, "browser")
+            if not direct_rows:
+                return {doi: row for doi, row in broker_rows.items() if row.get("success")}
+            return {**broker_rows, **direct_rows}
+
+    def _collect_group(item: tuple[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        key, group = item
+        with _institutional_key_lock(key):
+            return _run_group(key, group["profile"], group["dois"])
+
+    items = list(grouped.items())
+    if workers_inst <= 1 or len(items) < 2:
+        group_results = [_collect_group(item) for item in items]
+    else:
+        with ThreadPoolExecutor(max_workers=workers_inst) as pool:
+            group_results = list(pool.map(_collect_group, items))
+
+    for (_, group), rows in zip(items, group_results):
+        for doi, result in rows.items():
+            results_map[doi] = result
+            _save_progress(batch_id, doi, result)
+        ungrouped.extend(doi for doi in group["dois"] if doi not in rows)
+
+    for doi in ungrouped:
+        if doi in results_map and results_map[doi].get("success"):
+            continue
+        cached = _local_cache(doi)
+        if cached:
+            results_map[doi] = cached
+            _save_progress(batch_id, doi, cached)
+            continue
+        log.info(f"   [Batch] Phase 2 fallback: {doi}")
+        result = download(
+            doi, output_dir,
+            scihub_enabled=(config.get("scihub_enabled", True) if scihub_enabled is None else scihub_enabled),
+            use_vpnsci=use_vpnsci, _institutional=True,
+        )
+        results_map[doi] = result
+        _save_progress(batch_id, doi, result)
+
+
+def _write_download_results(results: list[dict[str, Any]], output_dir: str | Path | None, **extra: Any) -> None:
+    """Persist batch outcomes as download_results.json for scansci-find reconcile."""
+    try:
+        out = Path(output_dir) if output_dir else Path(load_config().get("output_dir", "."))
+        out.mkdir(parents=True, exist_ok=True)
+        report: dict[str, Any] = {
+            "service": "scansci-pdf",
+            "total": len(results),
+            "succeeded": sum(1 for r in results if r and r.get("success")),
+            "entries": [
+                {
+                    "identifier": r.get("identifier") or r.get("doi") or "",
+                    "doi": r.get("doi") or "",
+                    "success": bool(r.get("success")),
+                    "source": r.get("source") or "",
+                    "file": r.get("file") or "",
+                    "cached": bool(r.get("cached")),
+                    "preprint_fallback": r.get("preprint_fallback") or "",
+                    "error_type": r.get("error_type") or "",
+                    "reason": r.get("reason") or r.get("error") or "",
+                }
+                for r in results
+                if r
+            ],
+        }
+        report.update(extra)
+        target = out / "download_results.json"
+        tmp = out / "download_results.json.tmp"
+        tmp.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(target)
+    except Exception:
+        pass
+
+
+def _apply_preprint_fallbacks(
+    fallbacks: dict[str, list[str]],
+    identifiers: list[str],
+    final_map: dict[str, dict[str, Any]],
+    batch_id: str,
+    *,
+    output_dir: str | Path | None,
+    scihub_enabled: bool | None,
+    use_tor: bool,
+    use_vpnsci: bool,
+) -> None:
+    """Retry failed DOIs with their matched preprint arXiv IDs, in place.
+
+    Updates ``final_map`` (and the batch progress file) when a fallback
+    download succeeds so downstream result aggregation picks it up.
+    """
+    for ident in [i for i in identifiers if not (final_map.get(i) or {}).get("success")]:
+        for fallback_id in fallbacks.get(ident, []):
+            log.info(f"   [Fallback] {ident} -> preprint {fallback_id}")
+            fb_result = download(
+                fallback_id, output_dir,
+                scihub_enabled=scihub_enabled, use_tor=use_tor, use_vpnsci=False, _institutional=False,
+            )
+            if fb_result and fb_result.get("success"):
+                fb_result["identifier"] = ident
+                fb_result["doi"] = ident
+                fb_result["preprint_fallback"] = fallback_id
+                _save_progress(batch_id, ident, fb_result)
+                final_map[ident] = fb_result
+                break
+
+
 def batch_download(
     identifiers: list[str],
     output_dir: str | Path | None = None,
@@ -761,6 +1710,7 @@ def batch_download(
     progress_callback: Any = None,
     batch_id: str | None = None,
     resume: bool = True,
+    fallbacks: dict[str, list[str]] | None = None,
 ) -> dict[str, Any]:
     config = load_config()
     workers = config.get("batch_workers", 5)
@@ -800,7 +1750,7 @@ def batch_download(
         log.info("All items already completed")
         all_results = [completed_map[i] for i in unique_identifiers]
         succeeded = sum(1 for r in all_results if r.get("success"))
-        return {
+        summary = {
             "total": len(identifiers),
             "unique": len(unique_identifiers),
             "skipped_duplicates": skipped_duplicates,
@@ -811,6 +1761,8 @@ def batch_download(
             "failed_dois": [i for i in unique_identifiers if not completed_map.get(i, {}).get("success")],
             "batch_id": batch_id,
         }
+        _write_download_results(all_results, output_dir)
+        return summary
 
     # Pre-validate DOIs concurrently
     from ..identifiers import validate_doi
@@ -863,54 +1815,86 @@ def batch_download(
 
     delay_lock = threading.Lock()
     last_download_time = [0.0]
-    delay_between = float(config.get("request_delay_max", 0.3)) * 2
+    delay_between = float(config.get("batch_stagger_seconds", 0.3))
     total = len(pending_identifiers)
     completed_count = [0]
     num_invalid = len(invalid_results)
 
     def _staggered_download(ident: str) -> dict[str, Any]:
+        # Everything reaching here was validated above, so the per-DOI check in
+        # _download_impl would be a second HEAD for the same identifier (#72).
         with delay_lock:
             elapsed = time.time() - last_download_time[0]
             if elapsed < delay_between:
                 time.sleep(delay_between - elapsed)
             last_download_time[0] = time.time()
-        return download(ident, output_dir, scihub_enabled=scihub_enabled, use_tor=use_tor, use_vpnsci=use_vpnsci)
+        return download(ident, output_dir, scihub_enabled=scihub_enabled, use_tor=use_tor, use_vpnsci=use_vpnsci, _institutional=False, _validated=True)
 
     results: list[dict[str, Any] | None] = [None] * total
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        future_to_idx = {pool.submit(_staggered_download, ident): i for i, ident in enumerate(pending_identifiers)}
-        try:
-            for future in as_completed(future_to_idx, timeout=600):
-                idx = future_to_idx[future]
+    total_budget = float(config.get("batch_total_timeout", 600))
+    pool = ThreadPoolExecutor(max_workers=workers)
+    future_to_idx = {pool.submit(_staggered_download, ident): i for i, ident in enumerate(pending_identifiers)}
+    try:
+        for future in as_completed(future_to_idx, timeout=total_budget):
+            idx = future_to_idx[future]
+            try:
+                result = future.result()
+            except Exception:
+                result = fail(pending_identifiers[idx], "download exception")
+            results[idx] = result
+
+            # Save progress immediately
+            _save_progress(batch_id, pending_identifiers[idx], result)
+
+            completed_count[0] += 1
+            if progress_callback:
                 try:
-                    result = future.result()
+                    progress_callback(
+                        completed_count[0] + skipped_completed + num_invalid,
+                        len(unique_identifiers),
+                        pending_identifiers[idx],
+                        result,
+                    )
                 except Exception:
-                    result = fail(pending_identifiers[idx], "download exception")
-                results[idx] = result
-
-                # Save progress immediately
-                _save_progress(batch_id, pending_identifiers[idx], result)
-
-                completed_count[0] += 1
-                if progress_callback:
-                    try:
-                        progress_callback(
-                            completed_count[0] + skipped_completed + num_invalid,
-                            len(unique_identifiers),
-                            pending_identifiers[idx],
-                            result,
-                        )
-                    except Exception:
-                        pass
-        except TimeoutError:
-            log.info(f"Batch {batch_id}: timeout after 600s")
+                    pass
+    except TimeoutError:
+        log.info(f"Batch {batch_id}: timeout after {int(total_budget)}s")
+    finally:
+        # Waive stragglers so the batch report always lands within budget;
+        # per-source I/O deadlines bound the lifetime of abandoned workers.
+        alive = [f for f in future_to_idx if not f.done()]
+        if alive:
+            log.info(f"Batch {batch_id}: {len(alive)} source(s) still running (waived)")
+        pool.shutdown(wait=False, cancel_futures=True)
 
     for i, r in enumerate(results):
         if r is None:
             results[i] = fail(pending_identifiers[i], "timeout or incomplete")
 
+    # Phase 2: Publisher-grouped institutional download for failed DOIs
+    phase1_results = dict(zip(pending_identifiers, results))
+    failed_phase1 = [doi for doi, r in phase1_results.items() if r and not r.get("success")]
+    if failed_phase1:
+        log.info(f"Batch {batch_id}: Phase 1 failed for {len(failed_phase1)} DOIs, starting Phase 2...")
+        _batch_institutional_phase(
+            failed_phase1, Path(config["output_dir"]) if not output_dir else Path(output_dir),
+            config, batch_id, phase1_results,
+            scihub_enabled=scihub_enabled, use_vpnsci=use_vpnsci,
+        )
+        # Merge every Phase 2 outcome, including explicit failures that progress
+        # resume intentionally does not retain.
+        results = [phase1_results[ident] for ident in pending_identifiers]
+
     # Reload progress to include newly-saved invalid results
     final_map = _load_progress(batch_id)
+
+    # Preprint fallback: DOIs that failed every phase retry with the arXiv
+    # preprint IDs recorded in the ScanSci Find download queue (fallbacks map).
+    if fallbacks:
+        _apply_preprint_fallbacks(
+            fallbacks, pending_identifiers, final_map, batch_id,
+            output_dir=output_dir, scihub_enabled=scihub_enabled, use_tor=use_tor, use_vpnsci=use_vpnsci,
+        )
 
     # Build a lookup from pending_identifiers → download results
     pending_results = dict(zip(pending_identifiers, results))
@@ -934,7 +1918,7 @@ def batch_download(
     if not failed_dois:
         _clear_progress(batch_id)
 
-    return {
+    summary = {
         "total": len(identifiers),
         "unique": len(unique_identifiers),
         "skipped_duplicates": skipped_duplicates,
@@ -946,3 +1930,5 @@ def batch_download(
         "failed_dois": failed_dois,
         "batch_id": batch_id,
     }
+    _write_download_results(all_results, output_dir)
+    return summary

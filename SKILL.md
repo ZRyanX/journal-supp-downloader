@@ -10,7 +10,7 @@ description: 从 DOI 或期刊文章链接识别、下载和校验独立的补�
 ## 选择入口
 
 - **单篇常规下载**：`scripts/journal_downloader.py`，使用 Requests + Scrapling StealthyFetcher 抓取文章并识别附件。
-- **高校、校园网或 Elsevier 多级下载**：`scripts/scansci_supp_downloader.py`，增加 Elsevier API/CDN、`scansci-pdf` 已保存凭据、WebVPN、CARSI 与隧道熔断支持。
+- **高校、校园网或 Elsevier 多级下载**：`scripts/scansci_supp_downloader.py`，增加 Elsevier API/CDN、`scansci-pdf`（v1.21.0）已保存凭据、WebVPN（146 所高校 + 会话过期预检）、EasyConnect/aTrust SOCKS5 校园连接器、EZProxy、CARSI（12 家出版商含知网/万方/维普/SAGE/ASCE）与隧道熔断支持。
 - **需要网站现有登录态或应对高强度反爬**：两个入口在受阻/候选不完整时会自动探测已就绪的 BrowserSkill 或本地 Chrome CDP，最终回退至独立有头 Chrome；也可显式传入 `--bsk` / `--bsk-auto` / `--cdp`。阅读 [BrowserSkill 接入说明](references/browserskill.md) 了解配置、会话边界与故障诊断。
 
 安装 Python 依赖及独立浏览器内核：
@@ -87,11 +87,11 @@ python scripts/journal_downloader.py "<doi_or_url>" --bsk-browser "<browser-id>"
   2. **备用/开箱即用独立有头真 Chrome 回退**：当上述日常浏览器未开启或仍未取全且存在桌面图形环境时，若未传 `--no-auto-headful`，自动拉起 `headless=False`（自动检测本地 Chrome 启用 `real_chrome=True`、`network_idle=False`、`solve_cloudflare=True`）突破 Turnstile / Cloudflare / JS 动态渲染并延续到附件下载阶段。
 - **BrowserSkill**：浏览器扩展与 `bsk` 通信，使用已登录的浏览器，无需导出 Cookie。连接故障先查看 `python scripts/browserskill_adapter.py status --json` 和 `bsk doctor`。
 - **独立登录向导**：`python scripts/login_publishers.py` 保存会话到 `~/.journal_supp_downloader_profile/cookies.json`；两个下载器均可读取。
-- **网络与本地 API 配置**：默认直连校园网/机构 IP，无需设置代理环境（未显式传入 `--proxy` 时自动忽略 `HTTP(S)_PROXY` / `ALL_PROXY` 等环境代理变量）；支持通过环境变量、仓库根目录 `.env`（模板见 `.env.example`，不提交仓库）或 `~/.journal_supp_downloader_profile/config.json` 配置 `ELSEVIER_API_KEY`、`IS_CAMPUS_NETWORK`、`ELSEVIER_INSTTOKEN`、`UNPAYWALL_EMAIL`、`CROSSREF_EMAIL`。
-- **scansci-pdf 凭据**：仅高级版读取其机构、WebVPN/CARSI 配置；轻量版不读取这些配置。
+- **网络与本地 API 配置**：默认直连校园网/机构 IP，无需设置代理环境（未显式传入 `--proxy` / `SCANSCI_PDF_PROXY` / `network_proxy` 时自动忽略 `HTTP(S)_PROXY` / `ALL_PROXY` 等环境代理变量）；支持通过环境变量、仓库根目录 `.env`（模板见 `.env.example`，不提交仓库）或 `~/.journal_supp_downloader_profile/config.json` 配置 `ELSEVIER_API_KEY`、`IS_CAMPUS_NETWORK`、`ELSEVIER_INSTTOKEN`、`SCANSCI_PDF_PROXY`、`UNPAYWALL_EMAIL`、`CROSSREF_EMAIL`。
+- **scansci-pdf 凭据**：仅高级版读取其机构、WebVPN / EasyConnect / aTrust / EZProxy / CARSI 与 `institutional_allow_self_signed` 配置（普通 HTTPS 请求默认保持严格 TLS 校验）；轻量版不读取这些配置。
 - **多出版商回退与仓储穿透**：当主出版商（如 Lyell Collection `10.1144/` 无 IP 订阅）受限或无候选时，两个入口均支持通过 Crossref `[chooser-alt]` 切换同 DOI 的替代出版商宿主（如 GeoScienceWorld）；同时识别 Figshare（REST API + `__APOLLO_STATE__`）、ScienceBase（JSON + 裸 DOI 修正）、GSA（`10.1130/` → Crossref/Figshare）、DiVA（`diva-portal.org` / `diva2:` / `urn:nbn:se:` OAI-PMH 与镜像回退），并通过 `RepoBrowserSession` 复用浏览器上下文。
 - **GeoScienceWorld / Silverchair 超时防护**：自动拦截阻塞渲染或下载的第三方挂起域名（如 `ajax.googleapis.com`），并优先使用 Playwright `context.request` 在同源浏览器上下文下载。
-- **开放获取镜像**：可通过 Unpaywall/OpenAlex 查找 PMC/Europe PMC 等公开来源。公开副本不一定包含全部补充材料，仍需核对完整性。
+- **开放获取镜像**：可通过 Unpaywall / OpenAlex（及 OpenAIRE 第三级绿色 OA 回退）查找 PMC/Europe PMC/Zenodo 等公开来源。公开副本不一定包含全部补充材料，仍需核对完整性。
 - **动态补充区域**：轻量版可用 `--wait-selector` 等待实际附件元素；等待超时应视为恢复失败，不能当作内容已经就绪。
 
 ## 维护与验证

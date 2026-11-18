@@ -43,6 +43,7 @@ def _load_publisher_cookies(session: requests.Session, config: dict[str, Any]) -
 from .nature import try_nature_direct
 from .openalex import try_openalex_oa
 from .semantic_scholar import try_semanticscholar
+from .springer_tdm import try_springer_tdm
 from .unpaywall import try_unpaywall
 
 # ============================================================
@@ -84,6 +85,8 @@ DOI_PREFIX_TO_PUBLISHER: dict[str, str] = {
     "10.1364/": "OSA",
     "10.1080/": "Tandfonline",
     "10.1116/": "AIP",  # AVS (pubs.aip.org)
+    "10.1177/": "SAGE",
+    "10.1061/": "ASCE",
     "10.1146/": "AnnualReviews",
     "10.31219/": "Research Square",
     "10.21203/": "Research Square",
@@ -117,7 +120,7 @@ PUBLISHER_TOOL_MAP: dict[str, list[str]] = {
     "PNAS": ["PNASDirect", "Crossref", "Unpaywall"],
     "Oxford": ["OxfordBrowser", "Crossref", "Unpaywall"],
     "ACS": ["ACSBrowser", "Crossref", "Unpaywall"],
-    "Springer": ["SpringerBrowser", "Crossref", "Unpaywall"],
+    "Springer": ["SpringerTDM", "SpringerBrowser", "Crossref", "Unpaywall"],
     "APS": ["APSBrowser", "Crossref", "Unpaywall"],
     "IOP": ["IOPBrowser", "Crossref", "Unpaywall"],
     "PLOS": ["PLOSDirect", "Crossref", "Unpaywall"],
@@ -129,6 +132,8 @@ PUBLISHER_TOOL_MAP: dict[str, list[str]] = {
     "IEEE": ["IEEEBrowser", "Crossref", "Unpaywall"],
     "OSA": ["Crossref", "Unpaywall"],
     "Tandfonline": ["TandFBrowser", "Crossref", "Unpaywall"],
+    "SAGE": ["SAGEBrowser", "Crossref", "Unpaywall"],
+    "ASCE": ["ASCEBrowser", "Crossref", "Unpaywall"],
     "AnnualReviews": ["Crossref", "Unpaywall"],
     "KPS": ["Crossref", "Unpaywall"],
     "Beilstein": ["Crossref", "Unpaywall"],
@@ -611,31 +616,24 @@ def _elsevier_api_fn() -> Any:
 
 
 def _browser_strategy(publisher: str) -> Any:
-    """Create a browser download function for a publisher."""
-    from ..publisher_strategies import (
-        try_elsevier_browser, try_wiley_browser, try_ieee_browser,
-        try_acs_browser, try_rsc_browser, try_aip_browser,
-        try_springer_browser, try_aps_browser, try_tandfonline_browser,
-        try_iop_browser, try_oxford_browser, try_acm_browser,
-        try_nature_browser, try_science_browser, try_generic_browser,
-    )
-    mapping = {
-        "Elsevier": try_elsevier_browser,
-        "Wiley": try_wiley_browser,
-        "IEEE": try_ieee_browser,
-        "ACS": try_acs_browser,
-        "RSC": try_rsc_browser,
-        "AIP": try_aip_browser,
-        "Springer": try_springer_browser,
-        "APS": try_aps_browser,
-        "Tandfonline": try_tandfonline_browser,
-        "IOP": try_iop_browser,
-        "Oxford": try_oxford_browser,
-        "ACM": try_acm_browser,
-        "Nature": try_nature_browser,
-        "Science": try_science_browser,
-    }
-    return mapping.get(publisher, try_generic_browser)
+    """Create a browser download function for a publisher.
+
+    Uses the new StrategyRegistry to validate the publisher, then returns
+    the legacy ``try_*_browser`` function via the compatibility bridge.
+    """
+    from ..publisher_strategies import StrategyRegistry
+    from .._publisher_strategies_core import try_generic_browser
+
+    strategy = StrategyRegistry.get_by_name(publisher)
+    if not strategy:
+        return try_generic_browser
+
+    # Resolve the legacy function name from the strategy's data
+    # Standard naming: try_{publisher.lower()}_browser
+    # Special cases handled by the strategy's aliases
+    fn_name = f"try_{strategy.name.lower().replace(' ', '_')}_browser"
+    from .. import _publisher_strategies_core as _core
+    return getattr(_core, fn_name, try_generic_browser)
 
 
 def get_publisher_fast_sources(doi: str) -> list[tuple[Any, str]]:
@@ -667,6 +665,7 @@ _FN_MAP.update({
     "OpenAlexOA": try_openalex_oa,
     "SemanticScholar": try_semanticscholar,
     "MDPIDirect": try_mdpi_direct,
+    "SpringerTDM": try_springer_tdm,
     "ScienceDirect": try_science_direct,
     "PNASDirect": try_pnas_direct,
     "PLOSDirect": try_plos_direct,
@@ -689,5 +688,7 @@ _FN_MAP.update({
     "ACMBrowser": _browser_strategy("ACM"),
     "NatureBrowser": _browser_strategy("Nature"),
     "ScienceBrowser": _browser_strategy("Science"),
+    "SAGEBrowser": _browser_strategy("SAGE"),
+    "ASCEBrowser": _browser_strategy("ASCE"),
     "GenericBrowser": _browser_strategy(""),
 })

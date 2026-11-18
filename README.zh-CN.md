@@ -150,10 +150,11 @@ python scripts/browserskill_adapter.py borrow-fetch <tab_id> -o ./page.html
    ELSEVIER_API_KEY=您的_API_KEY
    IS_CAMPUS_NETWORK=false
    ELSEVIER_INSTTOKEN=
+   SCANSCI_PDF_PROXY=
    UNPAYWALL_EMAIL=
    CROSSREF_EMAIL=
    ```
-2. **用户配置目录 `~/.journal_supp_downloader_profile/config.json`**：支持 JSON 字段 `elsevier_api_key`、`is_campus_network`、`elsevier_insttoken`、`unpaywall_email`、`crossref_email`。
+2. **用户配置目录 `~/.journal_supp_downloader_profile/config.json`**：支持 JSON 字段 `elsevier_api_key`、`is_campus_network`、`elsevier_insttoken`、`network_proxy`、`unpaywall_email`、`crossref_email`。
 3. **系统环境变量**：同名大写变量会优先生效。
 
 > 提示：本技能**无需配置代理环境变量**；仅在确需走特定代理出口时通过 `--proxy http://host:port` 按次显式传入。

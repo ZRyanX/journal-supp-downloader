@@ -18,13 +18,25 @@ def get_tor_proxy(config: dict[str, Any] | None = None) -> str | None:
     Priority:
     1. TOR_PROXY env var
     2. Config tor_proxy
-    3. Default 1080 port
+    3. Embedded instance, if one is already running (never started here)
+    4. Default 1080 port
+
+    Consulting the embedded instance keeps the health probe in sync with the
+    download path (ensure_tor), which falls back to embedded Tor when the
+    configured proxy is absent (#61).
     """
     proxy = os.environ.get("TOR_PROXY", "")
     if proxy:
         return proxy
     if config and config.get("tor_proxy"):
         return config["tor_proxy"]
+    try:
+        from .embedded_tor import running_embedded_tor
+        tor = running_embedded_tor()
+        if tor:
+            return tor.proxy_url
+    except Exception:
+        pass
     return DEFAULT_TOR_PROXY
 
 
@@ -54,13 +66,17 @@ def ensure_tor(config: dict[str, Any]) -> str | None:
 
     # 2. Try starting embedded Tor (auto-install if needed)
     try:
-        from .embedded_tor import get_embedded_tor
+        from .embedded_tor import TorIntegrityError, get_embedded_tor
         log.info("Tor: starting embedded Tor...")
         tor = get_embedded_tor(config)
         if tor and tor.is_running():
             log.info(f"Tor: embedded Tor started at {tor.proxy_url}")
             return tor.proxy_url
         log.warning("Tor: embedded Tor failed to start")
+    except TorIntegrityError as e:
+        # A tampered cache is a security event, not a startup hiccup; say so
+        # loudly before the downloader falls back to a direct connection.
+        log.error(f"Tor: installed bundle failed verification, refusing to use it: {e}")
     except Exception as e:
         log.warning(f"Tor: embedded Tor error: {e}")
 

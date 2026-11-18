@@ -37,8 +37,13 @@ def check_tor() -> dict[str, Any]:
     # Check embedded Tor binary
     from .config import load_config
     config = load_config()
-    from .embedded_tor import _tor_binary
-    embedded = _tor_binary(config)
+    from .embedded_tor import TorIntegrityError, _tor_binary
+    try:
+        embedded = _tor_binary(config)
+    except TorIntegrityError as e:
+        # A tampered cache is a diagnosis, not a crash (mirrors install_tor).
+        result["error"] = f"Tor bundle failed verification: {e}"
+        embedded = None
     if embedded:
         result["installed"] = True
         result["embedded"] = True
@@ -99,11 +104,11 @@ def check_docker() -> dict[str, Any]:
     return result
 
 
-def check_camofox() -> dict[str, Any]:
-    """Check camofox-browser connectivity."""
+def check_browser() -> dict[str, Any]:
+    """Check browser backend availability."""
     result: dict[str, Any] = {"running": False}
     try:
-        from .camofox import is_available
+        from .browser_engine import is_available
         from .config import load_config
         result["running"] = is_available(load_config())
     except Exception:
@@ -177,7 +182,7 @@ def setup_check() -> dict[str, Any]:
     sys_info = detect_system()
     tor = check_tor()
     docker = check_docker()
-    camofox = check_camofox()
+    browser = check_browser()
 
     commands = get_install_commands(sys_info, tor, docker)
 
@@ -187,19 +192,37 @@ def setup_check() -> dict[str, Any]:
         issues.append("Tor 未运行且 Docker 未安装，Sci-Hub/LibGen 通过 Tor 访问受限")
     if not docker.get("installed"):
         issues.append("Docker 未安装，无法使用 Tor 容器化部署")
-    if not camofox["running"]:
-        issues.append("camofox-browser 未运行，Cloudflare 防护可能无法绕过")
+    if not browser["running"]:
+        issues.append("浏览器后端不可用，Cloudflare 防护可能无法绕过")
 
     readiness = "ready" if not issues else "partial"
-    if not tor["running"] and not docker.get("running") and not camofox["running"]:
+    if not tor["running"] and not docker.get("running") and not browser["running"]:
         readiness = "limited"
+
+    from .config import load_config
+    config = load_config()
+    services = {
+        "elsevier_api": "configured" if config.get("elsevier_api_key") else "not_configured",
+        "sciverse": "configured" if config.get("sciverse_api_key") else "not_configured",
+    }
+    recommendations = []
+    if (
+        services["sciverse"] == "not_configured"
+        and config.get("sciverse_enabled", True)
+    ):
+        recommendations.append(
+            "Sciverse 未配置：运行 scansci-pdf sciverse-setup --token <token> --test "
+            "启用语义检索/元数据/引文图谱（可选，不影响下载）"
+        )
 
     return {
         "system": sys_info,
         "tor": tor,
         "docker": docker,
-        "camofox": camofox,
+        "browser": browser,
         "install_commands": commands,
+        "services": services,
         "issues": issues,
+        "recommendations": recommendations,
         "readiness": readiness,
     }

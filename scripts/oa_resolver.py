@@ -290,6 +290,70 @@ def query_openalex(
     )
 
 
+_OPENAIRE_WEBRESOURCE_RE = re.compile(r"<webresource>\s*<url>([^<]+)</url>", re.IGNORECASE)
+
+
+def query_openaire(
+    doi: str,
+    timeout: int = 10,
+    session: Optional[requests.Session] = None,
+) -> Optional[OAResult]:
+    """
+    Query OpenAIRE XML publications API for green OA / institutional repository URLs.
+    Endpoint: https://api.openaire.eu/search/publications?doi={doi}
+    """
+    clean_doi = extract_doi(doi)
+    if not clean_doi:
+        return None
+
+    encoded_doi = urllib.parse.quote(clean_doi, safe="")
+    api_url = f"https://api.openaire.eu/search/publications?doi={encoded_doi}"
+
+    http = session or requests
+    try:
+        resp = http.get(
+            api_url,
+            timeout=timeout,
+            headers={"User-Agent": "journal-supp-downloader/1.0 (academic tool)"},
+        )
+        if resp.status_code != 200:
+            return None
+        xml_text = getattr(resp, "text", "") or ""
+    except Exception:
+        return None
+
+    if not xml_text:
+        return None
+
+    from html import unescape
+
+    oa_urls: List[str] = []
+    seen = set()
+    for raw_url in _OPENAIRE_WEBRESOURCE_RE.findall(xml_text):
+        cand_url = unescape(raw_url).strip()
+        if (
+            cand_url.startswith(("http://", "https://"))
+            and "doi.org" not in cand_url
+            and not _is_direct_pdf_url(cand_url)
+            and cand_url not in seen
+        ):
+            seen.add(cand_url)
+            oa_urls.append(cand_url)
+
+    if not oa_urls:
+        return None
+
+    oa_urls.sort(key=_score_oa_url, reverse=True)
+    return OAResult(
+        doi=clean_doi,
+        is_oa=True,
+        oa_status="green",
+        publisher_url=f"https://doi.org/{clean_doi}",
+        oa_landing_urls=oa_urls,
+        source="openaire",
+    )
+
+
 def resolve_oa_info(
     doi_or_url: str,
     prefer_openalex: bool = False,
@@ -297,7 +361,7 @@ def resolve_oa_info(
     session: Optional[requests.Session] = None,
 ) -> OAResult:
     """
-    Unified entry point: resolve a DOI with Unpaywall and OpenAlex with automatic fallback.
+    Unified entry point: resolve a DOI with Unpaywall, OpenAlex, and OpenAIRE fallback.
     Returns OAResult with title, canonical publisher URL, and all discovered OA mirrors.
     """
     doi = extract_doi(doi_or_url)
@@ -317,30 +381,46 @@ def resolve_oa_info(
     res1 = primary_fn(doi, timeout=timeout, session=session)
     # Merge independent catalogues; one mirror is not proof of completeness.
     res2 = fallback_fn(doi, timeout=timeout, session=session)
+    merged: Optional[OAResult] = None
     if res2:
         if not res1:
-            return res2
-        # Merge: take title/publisher if missing, and combine OA landing URLs
-        if not res1.title and res2.title:
-            res1.title = res2.title
-        if not res1.publisher_url and res2.publisher_url:
-            res1.publisher_url = res2.publisher_url
-        for u in res2.oa_landing_urls:
-            if u not in res1.oa_landing_urls:
-                res1.oa_landing_urls.append(u)
-        res1.oa_landing_urls.sort(key=_score_oa_url, reverse=True)
-        if res2.is_oa:
-            res1.is_oa = True
-        return res1
+            merged = res2
+        else:
+            # Merge: take title/publisher if missing, and combine OA landing URLs
+            if not res1.title and res2.title:
+                res1.title = res2.title
+            if not res1.publisher_url and res2.publisher_url:
+                res1.publisher_url = res2.publisher_url
+            for u in res2.oa_landing_urls:
+                if u not in res1.oa_landing_urls:
+                    res1.oa_landing_urls.append(u)
+            res1.oa_landing_urls.sort(key=_score_oa_url, reverse=True)
+            if res2.is_oa:
+                res1.is_oa = True
+            merged = res1
+    else:
+        merged = res1
 
-    if not res1:
+    if not merged or not merged.oa_landing_urls:
+        res3 = query_openaire(doi, timeout=timeout, session=session)
+        if res3 and res3.oa_landing_urls:
+            if not merged:
+                return res3
+            for u in res3.oa_landing_urls:
+                if u not in merged.oa_landing_urls:
+                    merged.oa_landing_urls.append(u)
+            merged.oa_landing_urls.sort(key=_score_oa_url, reverse=True)
+            merged.is_oa = True
+            return merged
+
+    if not merged:
         return OAResult(
             doi=doi,
             publisher_url=f"https://doi.org/{doi}",
             source="none",
         )
 
-    return res1
+    return merged
 
 
 def main():

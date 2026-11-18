@@ -1,73 +1,79 @@
-"""Anti-bot bypass — delegates to camofox-browser.
+"""FlareSolverr client for bypassing Cloudflare protection."""
 
-This module retains the flaresolverr.py filename for caller compatibility.
-All actual bypass logic goes through camofox.
-"""
+import logging
 
-from __future__ import annotations
+import requests
 
-from typing import Any
+logger = logging.getLogger(__name__)
 
-from .log import get_logger
-
-log = get_logger()
-
-_DEFAULT_TIMEOUT = 60000
+DEFAULT_URL = "http://127.0.0.1:8191/v1"
 
 
-def is_available(config: dict[str, Any]) -> bool:
-    """Check if camofox-browser is reachable."""
-    from .camofox import is_available as _camofox_avail
-    return _camofox_avail(config)
+class FlareSolverrClient:
+    """HTTP client that uses FlareSolverr to bypass Cloudflare challenges.
 
+    FlareSolverr must be running as a separate service (Docker or standalone).
+    See: https://github.com/FlareSolverr/FlareSolverr
+    """
 
-def solve_url(
-    url: str,
-    config: dict[str, Any],
-    *,
-    max_timeout: int = _DEFAULT_TIMEOUT,
-    session_id: str | None = None,
-    skip_curl_cffi: bool = False,
-) -> dict[str, Any] | None:
-    """Solve anti-bot challenges via camofox-browser."""
-    if not config.get("camofox_url"):
-        return None
-    from .camofox import solve_url as _camofox_solve
-    log.info(f"camofox: solving {url}")
-    result = _camofox_solve(url, config, max_timeout=max_timeout)
-    if result:
-        log.info("camofox: solved")
-    return result
+    def __init__(self, base_url: str = DEFAULT_URL):
+        self.base_url = base_url.rstrip("/")
 
+    def is_available(self) -> bool:
+        """Check if FlareSolverr is running."""
+        try:
+            resp = requests.get(self.base_url, timeout=3)
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
 
-def get_cookies(
-    url: str,
-    config: dict[str, Any],
-    *,
-    max_timeout: int = _DEFAULT_TIMEOUT,
-) -> dict[str, str] | None:
-    """Solve and return cookies as a dict."""
-    from .camofox import get_cookies as _camofox_cookies
-    return _camofox_cookies(url, config, max_timeout=max_timeout)
+    def get(self, url: str, wait_seconds: int = 8) -> str | None:
+        """Fetch a URL through FlareSolverr, returning HTML content.
 
+        Uses fast-path retry: first tries with wait_seconds=0, then retries
+        with the full wait if a challenge is detected.
+        """
+        html = self._request(url, wait_seconds=0)
+        if html and len(html) > 1000:
+            return html
 
-def get_html(
-    url: str,
-    config: dict[str, Any],
-    *,
-    max_timeout: int = _DEFAULT_TIMEOUT,
-) -> str | None:
-    """Solve and return page HTML."""
-    from .camofox import get_html as _camofox_html
-    return _camofox_html(url, config, max_timeout=max_timeout)
+        logger.info("FlareSolverr fast path failed, retrying with %ds wait...", wait_seconds)
+        return self._request(url, wait_seconds=wait_seconds)
 
+    def _request(self, url: str, wait_seconds: int = 8) -> str | None:
+        """Make a single FlareSolverr request."""
+        payload = {
+            "cmd": "request.get",
+            "url": url,
+            "waitInSeconds": wait_seconds,
+            "disableMedia": True,
+        }
+        try:
+            resp = requests.post(
+                self.base_url,
+                json=payload,
+                timeout=wait_seconds + 30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
 
-def create_session(config: dict[str, Any], session_id: str) -> bool:
-    """No-op — camofox manages sessions internally."""
-    return is_available(config)
+            if data.get("status") != "ok":
+                logger.warning("FlareSolverr returned status: %s", data.get("status"))
+                return None
 
+            solution = data.get("solution", {})
+            status_code = solution.get("status", 0)
+            html = solution.get("response", "")
 
-def destroy_session(config: dict[str, Any], session_id: str) -> None:
-    """No-op — camofox manages sessions internally."""
-    from .camofox import close_all_tabs
-    close_all_tabs(config)
+            if status_code == 200 and html:
+                return html
+
+            logger.warning("FlareSolverr solution status: %d", status_code)
+            return None
+
+        except requests.RequestException as e:
+            logger.warning("FlareSolverr request failed: %s", e)
+            return None
+        except (KeyError, ValueError) as e:
+            logger.warning("FlareSolverr response parse error: %s", e)
+            return None

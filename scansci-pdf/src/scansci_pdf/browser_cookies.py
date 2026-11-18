@@ -1,6 +1,6 @@
-"""Extract cookies via camofox-browser for publisher access.
+"""Extract cookies via browser for publisher access.
 
-Opens a visible camofox browser window, lets user log in to their institution,
+Opens a visible browser window, lets user log in to their institution,
 then captures and saves publisher cookies for automated downloads.
 """
 
@@ -38,6 +38,7 @@ PUBLISHER_DOMAINS = [
     "oup.com",
     "academic.oup.com",
     "sagepub.com",
+    "sage.cnpereading.com",
     "mdpi.com",
     "frontiersin.org",
 ]
@@ -59,6 +60,7 @@ PUBLISHER_LOGIN_URLS = {
     "iop": "https://iopscience.iop.org/",
     "oxford": "https://academic.oup.com/",
     "acm": "https://dl.acm.org/",
+    "sage-cn": "https://sage.cnpereading.com/login",
 }
 
 
@@ -92,7 +94,7 @@ def _is_publisher_cookie(cookie: dict[str, Any]) -> bool:
     return any(domain.endswith(d) for d in PUBLISHER_DOMAINS)
 
 
-def extract_via_camofox(
+def extract_via_browser(
     config: dict[str, Any],
     *,
     url: str = "https://www.sciencedirect.com/",
@@ -109,12 +111,19 @@ def extract_via_camofox(
         Result dict with success, cookies_count, domains, etc.
     """
     try:
-        from cloakbrowser import launch
+        from .browser_backend import launch
+        from .browser_backend import is_available as _browser_backend_available
+        if not _browser_backend_available(config=config):
+            return {
+                "success": False,
+                "error": "no browser backend available",
+                "fix": "pip install patchright (or pip install 'scansci-pdf[camoufox]')",
+            }
     except ImportError:
         return {
             "success": False,
-            "error": "cloakbrowser not installed",
-            "fix": "pip install cloakbrowser",
+            "error": "no browser backend available",
+            "fix": "pip install patchright (or pip install 'scansci-pdf[camoufox]')",
         }
 
     from .config import DATA_DIR
@@ -128,8 +137,8 @@ def extract_via_camofox(
     print(f"  登录完成后关闭浏览器窗口即可\n")
 
     try:
-        browser = launch(headless=False, humanize=True)
-        context = browser.new_context(viewport={"width": 1440, "height": 900}, ignore_https_errors=True)
+        browser = launch(headless=False, humanize=True, config=config)
+        context = browser.new_context(viewport={"width": 1440, "height": 900})
         page = context.new_page()
 
         try:
@@ -177,12 +186,12 @@ def extract_via_camofox(
         _save_cookies_json(save_cookies, cookie_file)
         _save_cookies_netscape(save_cookies, netscape_file)
 
-        # Import into camofox-browser server if running
-        camofox_imported = 0
+        # Import into browser server if running
+        browser_imported = 0
         try:
-            from .camofox import import_cookies, is_available
+            from .browser_engine import import_cookies, is_available
             if is_available(config):
-                camofox_imported = import_cookies(netscape_file, config)
+                browser_imported = import_cookies(netscape_file, config)
         except Exception:
             pass
 
@@ -196,7 +205,7 @@ def extract_via_camofox(
             "cookie_file": str(cookie_file),
             "netscape_file": str(netscape_file),
             "domains": domains_found,
-            "camofox_imported": camofox_imported,
+            "browser_imported": browser_imported,
             "message": f"捕获 {len(all_cookies)} 个 cookies，其中 {len(publisher_cookies)} 个属于出版社。"
                        f"已保存，后续下载自动使用。",
         }
@@ -287,7 +296,7 @@ def publisher_login(
     Takes a DOI or publisher name, resolves to the article page, and opens
     a visible stealth browser. User clicks "Access through your institution",
     completes SSO login, then closes the browser. Cookies are captured and
-    imported into camofox-browser for automated downloads.
+    imported into browser for automated downloads.
 
     Args:
         identifier: DOI (e.g. 10.1126/science.aec6396) or publisher name
@@ -331,4 +340,4 @@ def publisher_login(
                 "error": f"Unknown publisher: '{identifier}'. Available: {available}",
             }
 
-    return extract_via_camofox(config, url=url, max_wait=max_wait)
+    return extract_via_browser(config, url=url, max_wait=max_wait)

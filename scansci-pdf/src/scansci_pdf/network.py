@@ -29,25 +29,88 @@ USER_AGENT = (
     "Chrome/124.0 Safari/537.36 ScanSci PDF/3"
 )
 
-_session_pool: dict[str, requests.Session] = {}
+# Browser UA without the ScanSci suffix: some CDNs (sci.bban.top PDF edge,
+# observed 2026-09) 403 any UA that names a non-browser client, even with a
+# valid Referer. Use only where impersonation is required to read at all.
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
+
+CLOUDFLARE_CHALLENGE_SIGNALS = (
+    "just a moment", "attention required", "verify", "security check",
+    "请稍候", "正在验证", "checking", "cloudflare",
+)
+
+
+def is_cloudflare_challenge(title: str) -> bool:
+    """Check if a page title indicates a Cloudflare/anti-bot challenge."""
+    lower = title.lower()
+    return any(sig in lower for sig in CLOUDFLARE_CHALLENGE_SIGNALS)
+
+_thread_local = threading.local()
+
+
+def configured_proxy(config: dict[str, Any] | None = None) -> str:
+    """The one explicit proxy setting: SCANSCI_PDF_PROXY env > network_proxy config.
+
+    HTTP_PROXY/HTTPS_PROXY are ignored: sessions run trust_env=False, and the
+    package __init__ adds NO_PROXY='*' only in the IDE-proxy situation it was
+    written for. Campus-bound traffic (Elsevier/Springer TDM entitlement is
+    IP-based) must go through THIS setting or it egresses off-campus.
+    """
+    return os.environ.get("SCANSCI_PDF_PROXY") or (config or {}).get("network_proxy") or ""
+
+
+def _new_pooled_session(proxies: dict[str, str] | None) -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({"User-Agent": USER_AGENT})
+    if proxies:
+        if not HAS_SOCKS and any(v.startswith("socks") for v in proxies.values()):
+            log.warning("SOCKS proxy configured but PySocks not installed. Install: pip install requests[socks]")
+        session.proxies = dict(proxies)
+    return session
+
+
+def thread_session(proxies: dict[str, str] | None = None) -> requests.Session:
+    """A pooled Session owned by the calling thread.
+
+    Batch downloads and batch validation run on a ThreadPoolExecutor.
+    requests.Session is not documented as thread-safe, so handing every worker
+    one shared session is not right -- but building a fresh session per request
+    costs a TCP + TLS handshake per PDF, measured at 40 connections for a 40-PDF
+    loopback run against 4 when the session is reused (#72).
+
+    One session per thread gets both: connections are reused within a worker,
+    and no session state is shared across workers.
+    """
+    key = tuple(sorted((proxies or {}).items())) or ("__direct__",)
+    sessions = getattr(_thread_local, "sessions", None)
+    if sessions is None:
+        sessions = _thread_local.sessions = {}
+    session = sessions.get(key)
+    if session is None:
+        session = _new_pooled_session(proxies)
+        sessions[key] = session
+    return session
 
 
 def _get_session(config: dict[str, Any]) -> requests.Session:
-    proxy = os.environ.get("SCANSCI_PDF_PROXY") or config.get("network_proxy") or ""
-    key = proxy or "__none__"
-    if key not in _session_pool:
-        s = requests.Session()
-        s.trust_env = False
-        adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=0)
-        s.mount("https://", adapter)
-        s.mount("http://", adapter)
-        s.headers.update({"User-Agent": USER_AGENT})
-        if proxy:
-            if proxy.startswith("socks") and not HAS_SOCKS:
-                log.warning("SOCKS proxy configured but PySocks not installed. Install: pip install requests[socks]")
-            s.proxies = {"http": proxy, "https": proxy}
-        _session_pool[key] = s
-    return _session_pool[key]
+    """A pooled session for the configured proxy, owned by the calling thread.
+
+    Kept under its existing name because it is what the rest of the package
+    calls, but it no longer hands the *same* object to every caller. `fetch`
+    reaches it from the batch worker pools, so a module-level pool here meant one
+    `requests.Session` behind every worker -- the shared-session question from
+    #71 item 4. Delegating to `thread_session` fixes every caller at once,
+    including any that is not obviously concurrent today.
+    """
+    return thread_session(proxy_dict(configured_proxy(config)))
 
 
 def request_timeout(config: dict[str, Any]) -> tuple[int, int]:
@@ -60,6 +123,18 @@ def proxy_dict(proxy: str | None) -> dict[str, str] | None:
     return {"http": proxy, "https": proxy}
 
 
+def allow_self_signed(config: dict[str, Any] | None) -> bool:
+    """Whether TLS verification may be skipped for campus connectors.
+
+    Self-signed certificates are a real property of campus connectors
+    (EasyConnect/aTrust, some WebVPN gateways), so the ability has to exist —
+    but as an explicit, default-off choice. Deriving it from "a proxy
+    environment variable is set" turned certificate validation off for every
+    request on the shared retry path, off-machine proxies and all (#70).
+    """
+    return bool((config or {}).get("institutional_allow_self_signed", False))
+
+
 def select_proxy_for_url(url: str, config: dict[str, Any], use_tor: bool = False) -> str | None:
     if use_tor:
         from .tor import ensure_tor
@@ -68,7 +143,25 @@ def select_proxy_for_url(url: str, config: dict[str, Any], use_tor: bool = False
             return tor_proxy
         log.warning("Tor requested but unavailable — falling back to direct connection")
 
-    explicit = os.environ.get("SCANSCI_PDF_PROXY") or config.get("network_proxy")
+    # Some hosts rate-limit by egress IP, and every proxy user shares ONE exit
+    # — so proxied requests get walled quickly (measured live on sci-hub.ru,
+    # 2026-08-30: proxied = standing verification wall, direct = clean). These
+    # hosts route DIRECT by default; ``direct_domains`` extends the set,
+    # ``scihub_direct: false`` disables the behavior.
+    from urllib.parse import urlparse
+
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        host = ""
+    direct_hosts = {"sci-hub.ru"}
+    direct_hosts |= {str(d).lower().lstrip(".") for d in (config.get("direct_domains") or [])}
+    if config.get("scihub_direct", True) and any(
+        host == h or host.endswith("." + h) for h in direct_hosts if h
+    ):
+        return None
+
+    explicit = configured_proxy(config)
     if explicit:
         return explicit
     return None
@@ -84,7 +177,7 @@ def fetch(
     use_tor: bool = False,
 ) -> requests.Response:
     domain_rate_limit(url)
-    host_concurrency_acquire(url, config)
+    host_lease = host_concurrency_acquire(url, config)
     try:
         merged_headers = {"User-Agent": USER_AGENT}
         if headers:
@@ -101,7 +194,7 @@ def fetch(
             stream=stream,
         )
     finally:
-        host_concurrency_release(url, config)
+        host_concurrency_release(url, config, host_lease)
 
 
 def fetch_json(
@@ -111,13 +204,29 @@ def fetch_json(
     headers: dict[str, str] | None = None,
     use_tor: bool = False,
 ) -> dict[str, Any] | None:
+    # In-memory probe cache: avoid hammering metadata endpoints during racing.
+    ttl = float(config.get("json_probe_cache_seconds", 0) or 0)
+    now = time.time()
+    if ttl > 0:
+        cached = _json_cache.get(url)
+        if cached is not None and _json_cache_expires.get(url, 0) > now:
+            return cached
     try:
         resp = fetch(url, config, headers={"Accept": "application/json", **(headers or {})}, use_tor=use_tor)
         if resp.status_code >= 400:
             return None
-        return resp.json()
+        data = resp.json()
     except Exception:
         return None
+    if ttl > 0:
+        _json_cache[url] = data
+        _json_cache_expires[url] = now + ttl
+    return data
+
+
+# Module-level JSON probe caches (see fetch_json). Mutable for test reset.
+_json_cache: dict[str, dict[str, Any]] = {}
+_json_cache_expires: dict[str, float] = {}
 
 
 def _is_cloudflare_block(resp: requests.Response) -> bool:
@@ -135,14 +244,14 @@ def _is_cloudflare_block(resp: requests.Response) -> bool:
     return False
 
 
-def fetch_with_camofox(
+def fetch_with_browser(
     url: str,
     config: dict[str, Any],
     *,
     stream: bool = False,
 ) -> requests.Response | None:
-    """Fetch URL using camofox-browser to bypass Cloudflare challenges."""
-    from .camofox import solve_url, is_available
+    """Fetch URL using browser to bypass Cloudflare challenges."""
+    from .browser_engine import solve_url, is_available
     if not is_available(config):
         return None
     result = solve_url(url, config)
@@ -165,6 +274,10 @@ def fetch_with_camofox(
 
 
 def polite_delay(config: dict[str, Any]) -> None:
+    # Polite delay is opt-in: only sleep when fixed_request_delay_enabled is True.
+    # Without it, racing/parallel sources would be needlessly slowed.
+    if not config.get("fixed_request_delay_enabled", False):
+        return
     lo = float(config.get("request_delay_min", 0))
     hi = float(config.get("request_delay_max", 0))
     if hi > 0:
@@ -221,7 +334,45 @@ _DEFAULT_HOST_CONCURRENCY: dict[str, int] = {
     "export.arxiv.org": 2,
 }
 
-_host_semaphores: dict[str, threading.Semaphore] = {}
+class _HostConcurrencyLease:
+    def __init__(self, gate: _HostConcurrencyGate, limit: int):
+        self._gate = gate
+        self._limit = limit
+
+    def release(self) -> None:
+        self._gate.release(self._limit)
+
+
+class _HostConcurrencyGate:
+    """A host gate that respects every active and waiting caller's limit."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._active: list[int] = []
+        self._waiting: list[int] = []
+
+    def acquire(self, limit: int) -> _HostConcurrencyLease:
+        with self._condition:
+            self._waiting.append(limit)
+            try:
+                while len(self._active) >= min(self._active + self._waiting):
+                    self._condition.wait()
+                self._waiting.remove(limit)
+                self._active.append(limit)
+                return _HostConcurrencyLease(self, limit)
+            except BaseException:
+                self._waiting.remove(limit)
+                self._condition.notify_all()
+                raise
+
+    def release(self, limit: int) -> None:
+        with self._condition:
+            self._active.remove(limit)
+            self._condition.notify_all()
+
+
+_host_semaphores: dict[str, _HostConcurrencyGate] = {}
+_host_semaphores_lock = threading.Lock()
 
 
 def _get_host_concurrency(host: str, config: dict[str, Any]) -> int:
@@ -236,23 +387,33 @@ def _get_host_concurrency(host: str, config: dict[str, Any]) -> int:
     return 0
 
 
-def host_concurrency_acquire(url: str, config: dict[str, Any]) -> None:
-    """Acquire a per-host concurrency slot. Blocks if at limit."""
+def host_concurrency_acquire(url: str, config: dict[str, Any]) -> _HostConcurrencyLease | None:
+    """Acquire a per-host concurrency lease. Blocks if at the effective limit."""
     host = _extract_domain(url)
     if not host:
-        return
+        return None
     limit = _get_host_concurrency(host, config)
     if limit <= 0:
+        return None
+    gate = _host_semaphores.get(host)
+    if gate is None:
+        with _host_semaphores_lock:
+            gate = _host_semaphores.get(host)
+            if gate is None:
+                gate = _HostConcurrencyGate()
+                _host_semaphores[host] = gate
+    return gate.acquire(limit)
+
+
+def host_concurrency_release(
+    url: str, config: dict[str, Any], lease: _HostConcurrencyLease | None = None
+) -> None:
+    """Release the acquired lease; the two-argument form remains compatible."""
+    if lease is not None:
+        lease.release()
         return
-    if host not in _host_semaphores:
-        _host_semaphores[host] = threading.Semaphore(limit)
-    _host_semaphores[host].acquire()
-
-
-def host_concurrency_release(url: str, config: dict[str, Any]) -> None:
-    """Release a per-host concurrency slot."""
     host = _extract_domain(url)
-    if not host:
-        return
-    if host in _host_semaphores:
-        _host_semaphores[host].release()
+    limit = _get_host_concurrency(host, config) if host else 0
+    gate = _host_semaphores.get(host)
+    if gate is not None and limit > 0:
+        gate.release(limit)

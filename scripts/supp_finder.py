@@ -7031,6 +7031,7 @@ _LOCAL_ENV_TO_CONFIG_KEY = {
     "CROSSREF_EMAIL": "crossref_email",
     "OPENALEX_API_KEY": "openalex_api_key",
     "CORE_API_KEY": "core_api_key",
+    "SCANSCI_PDF_PROXY": "network_proxy",
 }
 
 
@@ -7038,12 +7039,11 @@ def configure_session_direct(session, proxy: Optional[str] = None):
     """Ensure direct connection by default (ignoring env proxies) unless an explicit proxy is supplied."""
     if session is None:
         return session
-    if not proxy:
-        try:
-            session.trust_env = False
-        except Exception:
-            pass
-    else:
+    try:
+        session.trust_env = False
+    except Exception:
+        pass
+    if proxy:
         try:
             session.proxies = {"http": proxy, "https": proxy}
         except Exception:

@@ -1,23 +1,39 @@
 [project]
 name = "scansci-pdf"
-version = "1.5.0"
+version = "1.21.0"
 description = "MCP server for academic paper downloading with Sci-Hub, OA sources, multi-university WebVPN, and Tor support"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
     "requests[socks]>=2.31",
+    "urllib3>=2.7.0",
     "beautifulsoup4>=4.12",
-    "mcp[cli]>=1.12",
+    "mcp[cli]>=1.12,<3.0",
     "typer>=0.15",
     "uvicorn>=0.34",
+    "pymupdf>=1.24",
+    "openpyxl>=3.1",
+    # Capped below 2.0: upstream ships pymupdf4llm 2.0 as an *empty* shim for
+    # pymupdf 2.x ("this is an empty package"), so an unbounded floor resolves
+    # to a distribution with no importable module and breaks markdown export on
+    # a stock pymupdf 1.x install.
+    "pymupdf4llm>=0.0.17,<2",
 ]
 
 [project.optional-dependencies]
 fast = ["lxml>=4.9"]
-vpnsci = ["pycryptodome>=3.20", "selenium>=4.15"]
-cloakbrowser = ["cloakbrowser>=0.3"]
+# vpnsci is the canonical extra (v1.7.0+). instsci is kept as a legacy alias
+# so existing `pip install scansci-pdf[instsci]` commands keep working.
+vpnsci = ["pycryptodome>=3.20"]
+instsci = ["pycryptodome>=3.20"]
+# patchright is the default browser backend; camoufox is the Firefox fallback.
+# ego-lite is an external desktop browser connected over CDP; it uses the
+# patchright/camoufox Playwright client rather than adding another package.
+camoufox = ["camoufox[geoip]>=0.4.11"]
+patchright = ["patchright>=1.61"]
 dev = ["pytest>=8.0"]
 compile = ["cython>=3.0"]
 
@@ -25,11 +41,16 @@ compile = ["cython>=3.0"]
 scansci-pdf = "scansci_pdf.main:main"
 
 [build-system]
-requires = ["setuptools>=68.0", "pycryptodome>=3.20"]
+requires = ["setuptools>=77.0", "pycryptodome>=3.20"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-scansci_pdf = ["data/*.json", "data/*.dat", "_core/*.pyd", "_core/*.so"]
+scansci_pdf = ["data/*.json", "_core/*.pyx"]
+
+[tool.pytest.ini_options]
+# Manual network/browser scripts in the repo root (e.g. test_download_pnas.py)
+# must not be collected as tests.
+testpaths = ["tests"]

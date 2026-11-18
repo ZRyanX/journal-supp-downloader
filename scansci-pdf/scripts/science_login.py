@@ -12,8 +12,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from scansci_pdf.camofox_login import (
-    _save_cookies_json, _save_cookies_netscape, _import_to_camofox_browser,
+from scansci_pdf.browser_login import (
+    _save_cookies_json, _save_cookies_netscape, _import_to_browser as _import_to_camofox_browser,
 )
 from scansci_pdf.config import load_config, DATA_DIR
 
@@ -26,7 +26,7 @@ print(f"Opening: {url}")
 print("Log in with your institution. Script will auto-detect when done.")
 print()
 
-from cloakbrowser import launch
+from scansci_pdf.browser_backend import launch
 
 LOGIN_INDICATORS = [
     'sign out', 'signout', 'log out', 'logout',
@@ -62,7 +62,8 @@ def _save_all(context, config, cookie_file):
 
 
 browser = launch(headless=False, humanize=True,
-                 args=["--disable-features=CrossOriginOpenerPolicy"])
+                 args=["--disable-features=CrossOriginOpenerPolicy"],
+                 config=config)
 context = browser.new_context()
 page = context.new_page()
 page.goto(url, wait_until="domcontentloaded", timeout=60000)

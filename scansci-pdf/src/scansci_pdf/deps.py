@@ -15,14 +15,16 @@ CORE_DEPS = {
     "bs4": "HTML parsing (beautifulsoup4)",
     "mcp": "MCP protocol",
     "typer": "CLI framework",
-    "uvicorn": "ASGI server",
+    "uvicorn": "ASGI server (MCP HTTP transport)",
+    "pymupdf": "PDF text extraction (PyMuPDF)",
 }
 
 # Optional dependencies
 OPTIONAL_DEPS = {
     "socks": "SOCKS proxy support (requests[socks])",
     "Crypto": "WebVPN AES encryption (pycryptodome)",
-    "selenium": "WebVPN browser login",
+    "patchright": "Stealth browser backend (default; open-source Playwright fork)",
+    "camoufox": "Anti-detect Firefox fallback browser backend",
 }
 
 _feature_status: dict[str, bool] = {}
@@ -67,7 +69,7 @@ def is_feature_available(feature: str) -> bool:
 
     feature_deps = {
         "socks_proxy": ["socks"],
-        "vpnsci": ["Crypto", "selenium"],
+        "instsci": ["Crypto", "patchright"],
         "html_parse": ["bs4"],
     }
 
@@ -108,6 +110,25 @@ def print_status() -> None:
         log.info(f"  [{status}] {module} - {info['description']}")
 
     if has_optional:
-        log.info("  Install optional deps: pip install scansci-pdf[tor,redis]")
+        log.info("  Install optional deps: pip install scansci-pdf[fast,vpnsci]")
+
+    # Service credentials are optional but high-leverage; surface them during
+    # every `scansci-pdf check` so users know they can enable fast/semantic lanes.
+    try:
+        from .config import load_config
+        config = load_config()
+        log.info("=== Service Configuration ===")
+        elsevier_state = "OK" if config.get("elsevier_api_key") else "optional"
+        log.info(
+            f"  [{elsevier_state}] elsevier_api_key - ScienceDirect fast-track"
+            + ("" if config.get("elsevier_api_key") else " (run: scansci-pdf elsevier-setup)")
+        )
+        sciverse_state = "OK" if config.get("sciverse_api_key") else "optional"
+        log.info(
+            f"  [{sciverse_state}] sciverse_api_key - semantic evidence/metadata/relations"
+            + ("" if config.get("sciverse_api_key") else " (run: scansci-pdf sciverse-setup --token <token> --test)")
+        )
+    except Exception:
+        pass
 
     log.info("========================")

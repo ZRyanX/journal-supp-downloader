@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import atexit
+import threading
 import time
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -11,7 +13,16 @@ from typing import Any
 import requests
 
 from ..config import DEFAULT_SCIHUB_DOMAINS
-from ..domain_db import load_stats, record_result, update_probe, set_probe_timestamp, get_probe_timestamp
+from .. import domain_db
+from ..domain_db import (
+    load_stats,
+    record_result,
+    update_probe,
+    set_probe_timestamp,
+    get_probe_timestamp,
+    get_wall_state,
+    set_wall_state,
+)
 from ..log import get_logger
 from ..network import fetch, proxy_dict, select_proxy_for_url, _is_cloudflare_block, USER_AGENT
 from ..pdf_utils import extract_pdf_url_from_html, is_pdf_file, success, _response_looks_pdf
@@ -31,16 +42,164 @@ except ImportError:
 
 log = get_logger()
 
-# Track domains that require camofox-browser (in-memory, per session)
-_camofox_domains: set[str] = set()
+# Track domains that require browser bypass (in-memory, per session)
+_browser_domains: set[str] = set()
 
-def _mark_camofox_required(domain: str, config: dict[str, Any]) -> None:
-    """Mark a domain as requiring camofox-browser for future ranking."""
-    _camofox_domains.add(domain)
+def _mark_browser_required(domain: str, config: dict[str, Any]) -> None:
+    """Mark a domain as requiring browser bypass for future ranking."""
+    _browser_domains.add(domain)
 
-def _is_camofox_domain(domain: str) -> bool:
-    """Check if domain requires camofox-browser."""
-    return domain in _camofox_domains
+def _is_browser_domain(domain: str) -> bool:
+    """Check if domain requires browser bypass."""
+    return domain in _browser_domains
+
+
+# ---------------------------------------------------------------------------
+# Persistent browser-worker pool
+# ---------------------------------------------------------------------------
+# Every browser-backed Sci-Hub attempt (browser-first download, tab racing,
+# Cloudflare/ALTCHA bypass) runs on THIS pool instead of ad-hoc per-paper
+# executors. Its threads live for the whole process, so each worker's
+# thread-local browser (browser_engine._get_shared_browser) is created once
+# and reused for every paper: no per-paper window flashing, no per-paper
+# startup cost, and Cloudflare clearance cookies survive between attempts.
+# Workers are closed by _shutdown_scihub_pool (registered below) — never per
+# paper. browser_engine's atexit reaper is the last-resort backstop.
+
+_RACE_POOL: ThreadPoolExecutor | None = None
+_RACE_POOL_LOCK = threading.Lock()
+
+
+def _race_pool(config: dict[str, Any]) -> ThreadPoolExecutor:
+    global _RACE_POOL
+    with _RACE_POOL_LOCK:
+        if _RACE_POOL is None:
+            workers = max(1, int(config.get("scihub_browser_workers", 3) or 3))
+            _RACE_POOL = ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="scihub-browser"
+            )
+        return _RACE_POOL
+
+
+def _close_my_browser() -> None:
+    """Runs INSIDE a pool worker: closes that worker's own thread-local browser."""
+    try:
+        from ..browser_engine import shutdown_shared_browser
+        shutdown_shared_browser()
+    except Exception:
+        pass
+
+
+def _shutdown_scihub_pool() -> None:
+    """Gracefully close every pool worker's browser, then the pool. Idempotent."""
+    global _RACE_POOL
+    with _RACE_POOL_LOCK:
+        pool, _RACE_POOL = _RACE_POOL, None
+    if pool is None:
+        return
+    try:
+        # Idle workers each pick up one shutdown task and close their own
+        # browser in their own thread (Playwright sync objects are
+        # thread-affine). shutdown(wait=False) so a worker stuck in an
+        # interactive Cloudflare wait can't hang process exit; anything
+        # missed here is tree-killed by the process-exit reaper in
+        # browser_engine (issue #57).
+        for _ in range(pool._max_workers):  # type: ignore[attr-defined]
+            pool.submit(_close_my_browser)
+        pool.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_scihub_pool)
+
+# ---------------------------------------------------------------------------
+# Verification-wall pacing (ALTCHA gates, e.g. sci-hub.ru)
+# ---------------------------------------------------------------------------
+# Empirically (2026-08-30 live tests): the gate escalates with request
+# VELOCITY, not per session — solving works once, then rapid repeat
+# verifications earn a standing "你是机器人吗" wall on every request. So the
+# winning strategy is pacing (space verifications out) plus exponential
+# cooldown when a wall persists after a solve, instead of hammering.
+
+_WALL_MIN_SPACING_SEC = 25.0     # min gap between verification solves
+_WALL_COOLDOWN_BASE_SEC = 90.0   # first persistent-wall cooldown
+_WALL_COOLDOWN_CAP_SEC = 900.0   # never cool down longer than this
+_MIRROR_STRUCTURAL_COOLDOWN_SEC = 7200.0  # structurally broken mirror: skip 2h
+
+# Serialize INTERACTIVE Turnstile solving across pool workers. Each pool
+# worker owns a browser, so without this lock N workers hitting a gate open N
+# "please click the captcha" windows at once. Queued workers re-check after
+# the first solve; the clearance cookie is shared per domain, so they usually
+# pass without a new human challenge.
+_TURNSTILE_INTERACTIVE_LOCK = threading.Lock()
+
+
+def _wall_guard(domain: str, config: dict[str, Any]) -> bool:
+    """True while a domain is cooling down after persistent walls — skip it.
+
+    State lives in domain_db (wall_state table): persistent across processes
+    and sessions. Do NOT reintroduce in-memory health dicts — that split
+    caused three generations of mirror-health rework.
+    """
+    st = domain_db.get_wall_state(domain, config)
+    return time.time() < st["cooldown_until"]
+
+
+def _wall_pace(domain: str, config: dict[str, Any]) -> None:
+    """Sleep so consecutive verification solves stay spaced out."""
+    st = domain_db.get_wall_state(domain, config)
+    wait = _WALL_MIN_SPACING_SEC - (time.time() - st["last_solve"])
+    if wait > 0:
+        time.sleep(min(wait, _WALL_MIN_SPACING_SEC))
+
+
+def _note_wall(domain: str, config: dict[str, Any]) -> None:
+    """A wall persisted after a solve attempt — escalate the cooldown."""
+    st = domain_db.get_wall_state(domain, config)
+    walls = int(st["walls"]) + 1
+    cooldown = min(_WALL_COOLDOWN_BASE_SEC * (3 ** (walls - 1)), _WALL_COOLDOWN_CAP_SEC)
+    until = time.time() + cooldown
+    domain_db.set_wall_state(domain, config, last_solve=time.time(), walls=walls, cooldown_until=until)
+    log.info(f"   Sci-Hub: {domain} verification wall persists — cooling down {cooldown:.0f}s")
+
+
+def _note_wall_success(domain: str, config: dict[str, Any]) -> None:
+    """A solve cleared the wall — reset escalations, record the solve time."""
+    domain_db.set_wall_state(domain, config, last_solve=time.time(), walls=0, cooldown_until=0.0)
+
+
+def _note_structural(domain: str, config: dict[str, Any]) -> None:
+    """Structurally broken response (homepage shell / interactive gate).
+
+    Unlike transient walls, re-paying the timeout every paper is pure loss:
+    skip the mirror for hours. It retries automatically once the cooldown
+    lapses, so a mirror that comes back to life is picked up again.
+    """
+    until = time.time() + _MIRROR_STRUCTURAL_COOLDOWN_SEC
+    domain_db.set_wall_state(domain, config, last_solve=time.time(), walls=1, cooldown_until=until)
+    log.info(f"   Sci-Hub: {domain} structurally broken — skipping for "
+             f"{_MIRROR_STRUCTURAL_COOLDOWN_SEC / 3600:.0f}h")
+
+
+def _classify_mirror_page(html: str) -> str:
+    """Classify a mirror response: turnstile | homepage | other.
+
+    ALTCHA walls are intentionally NOT classified here — the dedicated ALTCHA
+    solver handles them.
+    """
+    low = (html or "").lower()
+    if "challenges.cloudflare.com/turnstile" in low or "verification - sci-hub" in low:
+        return "turnstile"
+    if "search proxy to download" in low:
+        return "homepage"
+    return "other"
+
+
+def _racing_browser_headless(config: dict[str, Any]) -> bool:
+    """Mirror the headless computation used to launch the racing browser."""
+    return bool(config.get("scihub_browser_headless", config.get("browser_headless", False)))
+
 
 _PROBE_TTL_HOURS = 4
 _SCIHUB_PROBE_WORKERS = 8
@@ -55,12 +214,12 @@ def _probe_single_domain(domain: str, proxy: str | None, timeout: tuple[int, int
         resp = s.get(domain, timeout=timeout, proxies=proxies, allow_redirects=True,
                      headers={"User-Agent": USER_AGENT})
         # Accept 200/302/301 as reachable (302/301 = redirect, still means domain is alive)
-        # 403/503 = reachable but blocked (Cloudflare) — still mark reachable for camofox bypass
+        # 403/503 = reachable but blocked (Cloudflare) — still mark reachable for browser bypass
         reachable = resp.status_code in (200, 301, 302, 403, 503)
         ok = resp.status_code == 200 and ("sci-hub" in resp.text[:5000].lower() or "scihub" in resp.text[:5000].lower())
-        # 403/503 with Cloudflare signature = reachable via camofox
+        # 403/503 with Cloudflare signature = reachable via browser
         if resp.status_code in (403, 503) and _is_cloudflare_block(resp):
-            _mark_camofox_required(domain, None)
+            _mark_browser_required(domain, None)
             reachable = True
         latency = (time.time() - t0) * 1000
         return (domain, ok if ok else reachable, latency)
@@ -79,7 +238,7 @@ def _probe_scihub_domains(config: dict[str, Any]) -> None:
     if now - last_probe < _PROBE_TTL_HOURS * 3600:
         return
 
-    proxy = select_proxy_for_url("https://sci-hub.st", config)
+    proxy = select_proxy_for_url("https://sci-hub.mksa.top", config)
     domains = config.get("scihub_domains") or DEFAULT_SCIHUB_DOMAINS
     timeout = (5, 10)
 
@@ -92,59 +251,303 @@ def _probe_scihub_domains(config: dict[str, Any]) -> None:
     set_probe_timestamp(config)
 
 
-def _is_camofox_available(config: dict[str, Any]) -> bool:
-    """Check if camofox-browser is reachable."""
+def _is_browser_available(config: dict[str, Any]) -> bool:
+    """Check if browser is available. Returns False in asyncio context."""
+    # A running asyncio loop normally means "user asyncio code — the Playwright
+    # sync API cannot serve it". Exception: our persistent pool workers, where
+    # the loop was created by the sync API itself (browser_engine tracks it).
     try:
-        from ..camofox import is_available
+        import asyncio
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        from ..browser_engine import is_playwright_owned_loop
+        if not is_playwright_owned_loop(loop):
+            return False
+    try:
+        from ..browser_engine import is_available
         return is_available(config)
     except Exception:
         return False
 
 
-def _camofox_first_download(
+def _solve_altcha_and_reload(
+    solve_result: dict[str, Any],
     landing_url: str,
     doi: str,
     output_path: Path,
     config: dict[str, Any],
 ) -> dict[str, Any] | None:
-    """Try Camofox-first download for Sci-Hub. Bypasses Cloudflare/CAPTCHA."""
+    """Solve ALTCHA anti-bot verification on a Sci-Hub page, then reload and extract PDF.
+
+    ALTCHA is a proof-of-work CAPTCHA used by sci-hub.ru. The page shows a checkbox
+    labelled "不是" (No/Not a robot). After clicking, a proof-of-work computation runs,
+    then the page shows "您是人类！" (You are human!). Once verified, we reload the page
+    to get the actual paper content.
+    """
+    import time as _time
+
     try:
-        from ..camofox import solve_url, download_pdf_via_camofox
+        from ..browser_engine import get_browser_page
+    except ImportError:
+        log.info("   [altcha] browser engine not available for ALTCHA bypass")
+        return None
+
+    domain = urllib.parse.urlparse(landing_url).netloc
+    if _wall_guard(domain, config):
+        log.info(f"   [altcha] {domain} in wall cooldown — skipping this attempt")
+        return None
+    _wall_pace(domain, config)
+
+    page = None
+    try:
+        page = get_browser_page(config)
+        if not page:
+            log.info("   [altcha] could not get browser page")
+            return None
+
+        # Navigate to the landing URL
+        page.goto(landing_url, wait_until="domcontentloaded", timeout=20000)
+        _time.sleep(2)
+
+        # Find and click the ALTCHA checkbox
+        checkbox_selectors = [
+            "input[type='checkbox']",
+            "#altcha_checkbox",
+            "[id^='altcha_checkbox_']",
+        ]
+        clicked = False
+        for selector in checkbox_selectors:
+            try:
+                el = page.query_selector(selector)
+                if el:
+                    el.click(timeout=5000)
+                    clicked = True
+                    log.info(f"   [altcha] clicked checkbox: {selector}")
+                    break
+            except Exception:
+                continue
+
+        if not clicked:
+            # Try clicking the "不是" div
+            try:
+                no_btn = page.query_selector("div[onclick='check()']")
+                if no_btn:
+                    no_btn.click(timeout=5000)
+                    clicked = True
+                    log.info("   [altcha] clicked '不是' button")
+            except Exception:
+                pass
+
+        if not clicked:
+            log.info("   [altcha] could not find checkbox/button to click")
+            return None
+
+        # Wait for verification to complete (poll for "您是人类" or "verified")
+        for i in range(15):
+            _time.sleep(1)
+            try:
+                body_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+            except Exception:
+                continue
+            if "您是人类" in body_text or "verified" in body_text.lower():
+                log.info(f"   [altcha] verified after {i + 3}s")
+                break
+            if i % 5 == 4:
+                log.info(f"   [altcha] still verifying... ({i + 3}s)")
+
+        # Reload the page to get the actual paper content
+        log.info("   [altcha] reloading page after verification...")
+        page.goto(landing_url, wait_until="domcontentloaded", timeout=20000)
+        _time.sleep(2)
+
+        # Now try to extract PDF
+        try:
+            html = page.content()
+        except Exception:
+            log.info("   [altcha] failed to get page content after reload")
+            return None
+
+        # Check for a PERSISTENT wall: if the reloaded page is still the
+        # "你是机器人吗" verification, solving again would only deepen the
+        # rate limit — record it and let the cooldown skip this domain.
+        from ..pdf_utils import is_pdf_file, success, extract_pdf_url_from_html
+        from ..browser_engine import download_pdf_via_browser
+
+        lower = html.lower()
+        if "你是机器人吗" in html or "altcha" in lower and "iframe" not in lower:
+            _note_wall(domain, config)
+            log.info("   [altcha] verification wall persists after solve")
+            return None
+
+        if any(sig in lower for sig in ["article not found", "статья не найдена", "не найден"]):
+            log.info("   [altcha] article not found after verification")
+            return None
+
+        # Extract PDF URL
+        pdf_url = extract_pdf_url_from_html(html, landing_url)
+        if pdf_url:
+            log.info(f"   [altcha] found PDF: {pdf_url[:80]}")
+            if download_pdf_via_browser(pdf_url, output_path, config):
+                if is_pdf_file(output_path):
+                    _note_wall_success(domain, config)
+                    return success(doi, output_path, "Sci-Hub(altcha)")
+
+        log.info("   [altcha] no PDF found after verification")
+        return None
+
+    except Exception as e:
+        log.info(f"   [altcha] error: {e}")
+        return None
+    finally:
+        if page:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+
+def _browser_first_download(
+    landing_url: str,
+    doi: str,
+    output_path: Path,
+    config: dict[str, Any],
+    fail_notes: list[str] | None = None,
+) -> dict[str, Any] | None:
+    """Try browser-first download for Sci-Hub. Bypasses Cloudflare/CAPTCHA.
+
+    fail_notes (optional): appended with a short classification string at
+    every failure exit so callers can report WHY Sci-Hub gave up
+    (not_in_library / challenge_* / network / http_*).
+    """
+    try:
+        from ..browser_engine import solve_url, download_pdf_via_browser
         from ..pdf_utils import is_pdf_file, success, extract_pdf_url_from_html
         from urllib.parse import urlparse
         domain = urlparse(landing_url).netloc or landing_url[:40]
 
-        log.info(f"   [camofox-first] trying {landing_url[:80]}")
+        log.info(f"   [browser-first] trying {landing_url[:80]}")
         result = solve_url(landing_url, config, max_timeout=30000)
         if not result:
-            log.info(f"   [camofox-first] no response")
+            log.info(f"   [browser-first] no response")
+            if fail_notes is not None:
+                fail_notes.append("network(no response)")
             return None
 
         solution = result.get("solution", {})
         html = solution.get("response", "")
         if not html:
-            log.info(f"   [camofox-first] empty response")
+            log.info(f"   [browser-first] empty response")
+            if fail_notes is not None:
+                fail_notes.append("network(empty response)")
             return None
 
         # Check for article not found
         lower = html.lower()
         if any(sig in lower for sig in ["article not found", "статья не найдена", "не найден"]):
-            log.info(f"   [camofox-first] article not found on {domain}")
+            log.info(f"   [browser-first] article not found on {domain}")
+            if fail_notes is not None:
+                fail_notes.append("not_in_library")
+            return None
+
+        # Structural failures: mirror shell or interactive gate. These cost a
+        # fixed timeout every paper until cooled down — note once, skip for hours.
+        kind = _classify_mirror_page(html)
+        if kind == "homepage":
+            _note_structural(domain, config)
+            log.info(f"   [browser-first] {domain} serves its homepage shell — structural, cooling down")
+            if fail_notes is not None:
+                fail_notes.append("structural_homepage")
+            return None
+        if kind == "turnstile":
+            if _racing_browser_headless(config) or not config.get("scihub_turnstile_click", True):
+                _note_structural(domain, config)
+                log.info(f"   [browser-first] Turnstile gate on {domain} — headless/no-click session, cooling down")
+                return None
+            # Interactive mode: surface it on the progress bar, wait for one
+            # human click. The clearance cookie then lasts the whole batch.
+            # Serialized across pool workers — see _TURNSTILE_INTERACTIVE_LOCK.
+            with _TURNSTILE_INTERACTIVE_LOCK:
+                from ..browser_engine import get_browser_page
+                page = get_browser_page(config)
+                if page is None:
+                    _note_structural(domain, config)
+                    return None
+                attention_key = f"turnstile:{domain}"
+                try:
+                    from .. import progress_reporter as _pr
+                    _pr.set_attention(attention_key, "请在浏览器窗口完成 Turnstile 人机验证",
+                                      current=doi, phase="人工验证")
+                except Exception:
+                    _pr = None
+                passed = False
+                try:
+                    deadline = time.time() + max(30, int(config.get("turnstile_wait_sec", 180)))
+                    while time.time() < deadline:
+                        time.sleep(5)
+                        page.goto(landing_url, wait_until="domcontentloaded", timeout=30000)
+                        html = page.content()
+                        if _classify_mirror_page(html) != "turnstile":
+                            passed = True
+                            break
+                    if not passed:
+                        log.info(f"   [browser-first] Turnstile not passed within wait window")
+                        if fail_notes is not None:
+                            fail_notes.append("challenge_turnstile_timeout")
+                        return None
+                    solution["url"] = page.url
+                    log.info(f"   [browser-first] Turnstile cleared by human — cookie kept for the batch")
+                finally:
+                    if _pr is not None:
+                        try:
+                            _pr.clear_attention(attention_key)
+                        except Exception:
+                            pass
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                lower = html.lower()
+
+        # Check for ALTCHA anti-bot verification (used by sci-hub.ru and other mirrors)
+        if any(sig in lower for sig in ["altcha", "你是机器人吗", "not a robot"]):
+            log.info(f"   [browser-first] ALTCHA detected on {domain}, attempting bypass...")
+            try:
+                altcha_result = _solve_altcha_and_reload(result, landing_url, doi, output_path, config)
+                if altcha_result:
+                    return altcha_result
+            except Exception as e:
+                log.info(f"   [browser-first] ALTCHA bypass failed: {e}")
+
+        # Check for Cloudflare challenge page
+        if any(sig in lower for sig in ["checking your browser", "just a moment", "cf-browser-verification"]):
+            log.info(f"   [browser-first] Cloudflare challenge on {domain}, page may need more time")
+            # The solve_url should have waited, but if we still see the challenge,
+            # mark this domain as needing browser bypass for future attempts
+            if fail_notes is not None:
+                fail_notes.append("challenge_cloudflare")
             return None
 
         # Check for empty embed (Sci-Hub has no PDF)
         if '<embed' in lower and 'src=""' in lower:
-            log.info(f"   [camofox-first] empty embed — article not in Sci-Hub database")
+            log.info(f"   [browser-first] empty embed — article not in Sci-Hub database")
+            if fail_notes is not None:
+                fail_notes.append("not_in_library")
             return None
 
         # Extract PDF URL from HTML
         pdf_url = extract_pdf_url_from_html(html, solution.get("url", landing_url))
         if pdf_url:
-            log.info(f"   [camofox-first] found PDF: {pdf_url[:80]}")
-            # Download via Camofox (handles Cloudflare on PDF host too)
-            if download_pdf_via_camofox(pdf_url, output_path, config):
-                if is_pdf_file(output_path):
-                    return success(doi, output_path, f"Sci-Hub(camofox)")
+            log.info(f"   [browser-first] found PDF: {pdf_url[:80]}")
+            # Download via browser (handles Cloudflare on PDF host too)
+            if download_pdf_via_browser(pdf_url, output_path, config):
+                # Retry is_pdf_file check — browser may still be flushing to disk
+                for _retry in range(5):
+                    if is_pdf_file(output_path):
+                        return success(doi, output_path, f"Sci-Hub(browser)")
+                    time.sleep(0.2)
+                log.info(f"   [browser-first] downloaded but file not recognized as PDF")
 
         # Check if the response itself is a PDF
         import base64
@@ -156,14 +559,18 @@ def _camofox_first_download(
                     output_path.parent.mkdir(parents=True, exist_ok=True)
                     output_path.write_bytes(pdf_bytes)
                     if is_pdf_file(output_path):
-                        return success(doi, output_path, f"Sci-Hub(camofox)")
+                        return success(doi, output_path, f"Sci-Hub(browser)")
             except Exception:
                 pass
 
-        log.info(f"   [camofox-first] no PDF found in response")
+        log.info(f"   [browser-first] no PDF found in response")
+        if fail_notes is not None:
+            fail_notes.append("not_in_library(no pdf in response)")
         return None
     except Exception as e:
-        log.info(f"   [camofox-first] error: {e}")
+        log.info(f"   [browser-first] error: {e}")
+        if fail_notes is not None:
+            fail_notes.append(f"network({type(e).__name__})")
         return None
 
 
@@ -173,26 +580,46 @@ def try_scihub_domain(
     output_path: Path,
     config: dict[str, Any],
     use_tor: bool = False,
+    fail_notes: list[str] | None = None,
 ) -> dict[str, Any] | None:
     landing_url = f"{domain.rstrip('/')}/{urllib.parse.quote(doi, safe='/')}"
 
-    # Camofox-first: bypass Cloudflare/CAPTCHA before HTTP attempt
-    if _is_camofox_available(config):
-        result = _camofox_first_download(landing_url, doi, output_path, config)
+    # Browser-first: bypass Cloudflare/CAPTCHA before HTTP attempt.
+    # scihub_browser_first=false forces the pure-HTTP path — when the PDF
+    # CDN challenges headless browsers but serves plain requests (observed
+    # in the field, 2026-09: sci.bban.top), HTTP is the working lane.
+    if (config.get("scihub_browser_first", True)
+            and _is_browser_available(config)):
+        result = _browser_first_download(landing_url, doi, output_path, config,
+                                         fail_notes=fail_notes)
         if result:
             return result
+
+    # Sci-Hub pages and the PDF CDN are slow through proxies; racing-grade
+    # timeouts (users run connect=3/read=7 for source racing) starve this
+    # lane — a 3s read timeout kills every attempt before the page lands.
+    # Floor the timeouts for this lane only; other sources keep their pace.
+    config = {
+        **config,
+        "connect_timeout": max(int(config.get("connect_timeout", 3)), 10),
+        "read_timeout": max(int(config.get("read_timeout", 7)), 25),
+    }
 
     try:
         resp = fetch(landing_url, config, stream=True, use_tor=use_tor)
 
-        # Fallback to camofox on Cloudflare/403/CAPTCHA
+        # Fallback to browser on Cloudflare/403/CAPTCHA
         if resp.status_code in (403, 503) or _is_cloudflare_block(resp):
-            _mark_camofox_required(domain, config)
-            resp = _try_camofox(landing_url, config, resp)
+            _mark_browser_required(domain, config)
+            resp = _try_browser(landing_url, config, resp)
             if resp is None:
+                if fail_notes is not None:
+                    fail_notes.append("challenge(browser bypass failed)")
                 return None
 
         if resp.status_code >= 400:
+            if fail_notes is not None:
+                fail_notes.append(f"http_{resp.status_code}")
             return None
 
         first = next(resp.iter_content(chunk_size=8192), b"")
@@ -200,16 +627,18 @@ def try_scihub_domain(
         if resp.status_code == 200 and first:
             content_sample = first[:5000].decode('utf-8', errors='ignore').lower()
             if 'captcha' in content_sample or 'recaptcha' in content_sample:
-                log.info(f"   CAPTCHA detected, trying camofox...")
-                # Use camofox to bypass CAPTCHA
-                camofox_resp = _try_camofox(landing_url, config, resp)
-                if camofox_resp is None:
-                    log.warning(f"   camofox failed — is camofox-browser running? Start: cd camofox-browser && npm start")
+                log.info(f"   CAPTCHA detected, trying browser...")
+                # Use browser to bypass CAPTCHA
+                browser_resp = _try_browser(landing_url, config, resp)
+                if browser_resp is None:
+                    log.warning(f"   browser bypass failed — is a browser backend installed? Run: pip install 'scansci-pdf[patchright]'")
+                    if fail_notes is not None:
+                        fail_notes.append("challenge(captcha bypass failed)")
                     return None
-                # Get new content from camofox response
-                resp = camofox_resp
+                # Get new content from browser response
+                resp = browser_resp
                 first = resp.content[:8192] if resp.content else b""
-                log.info(f"   camofox bypassed CAPTCHA, content size: {len(first)}")
+                log.info(f"   browser bypassed CAPTCHA, content size: {len(first)}")
 
         if _response_looks_pdf(resp, first):
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -227,7 +656,7 @@ def try_scihub_domain(
             if is_pdf_file(output_path):
                 return success(doi, output_path, f"Sci-Hub({domain})")
 
-        # Collect full HTML content (camofox responses have _content, direct responses need raw.read)
+        # Collect full HTML content (browser responses have _content, direct responses need raw.read)
         if resp._content:
             html = first + resp._content
         else:
@@ -237,23 +666,36 @@ def try_scihub_domain(
                 html = first
         pdf_url = extract_pdf_url_from_html(html.decode("utf-8", errors="ignore"), resp.url)
         if not pdf_url:
+            if fail_notes is not None:
+                fail_notes.append("not_in_library(no pdf url)")
             return None
-        result = download_pdf_from_scihub(pdf_url, output_path, config, f"Sci-Hub({domain})", use_tor=use_tor, cookies=resp.cookies)
+        result = download_pdf_from_scihub(pdf_url, output_path, config, f"Sci-Hub({domain})",
+                                          use_tor=use_tor, cookies=resp.cookies, referer=landing_url)
         if result:
             result["doi"] = doi
             result["identifier"] = doi
+        elif fail_notes is not None:
+            fail_notes.append("not_in_library(pdf download failed)")
         return result
-    except Exception:
+    except Exception as e:
+        log.warning("   [scihub] %s HTTP lane failed: %r", domain, e, exc_info=True)
+        if fail_notes is not None:
+            fail_notes.append(f"network({type(e).__name__})")
         return None
 
 
-def _try_camofox(
+def _try_browser(
     url: str,
     config: dict[str, Any],
     original_resp: requests.Response,
 ) -> requests.Response | None:
-    """Try camofox-browser to bypass Cloudflare. Returns Response or None."""
-    from ..flaresolverr import solve_url
+    """Try browser to bypass Cloudflare. Returns Response or None."""
+    if not _is_browser_available(config):
+        return None
+    # solve_url lives in browser_engine (flaresolverr.py only hosts the
+    # raw FlareSolverr client); the old import path broke the challenge
+    # bypass with ImportError.
+    from ..browser_engine import solve_url
     result = solve_url(url, config)
     if not result:
         return None
@@ -261,7 +703,7 @@ def _try_camofox(
     status = solution.get("status", 0)
     if status >= 400:
         return None
-    # Build a Response from camofox solution
+    # Build a Response from browser solution
     resp = requests.Response()
     resp.status_code = status
     html_content = solution.get("response", "")
@@ -287,23 +729,197 @@ def download_pdf_from_scihub(
     source: str,
     use_tor: bool = False,
     cookies: Any = None,
+    referer: str = "",
 ) -> dict[str, Any] | None:
     from ..pdf_utils import download_pdf
-    return download_pdf(url, output_path, config, source, require_pdf_like_url=False, use_tor=use_tor, cookies=cookies)
+    return download_pdf(url, output_path, config, source, require_pdf_like_url=False,
+                        use_tor=use_tor, cookies=cookies, referer=referer, browser_ua=True)
+
+
+def _race_browser_domains(
+    domains: list[str],
+    doi: str,
+    output_path: Path,
+    config: dict[str, Any],
+    max_workers: int = 3,
+) -> dict[str, Any] | None:
+    """Race multiple Sci-Hub domains using multiple tabs in ONE browser.
+
+    Instead of spawning N threads each with their own browser (heavy),
+    this opens N tabs in a single browser context and polls them in
+    round-robin. The browser's internal network stack handles all tabs
+    concurrently, so we get real parallelism without multiple processes.
+
+    Each tab writes to its own temp output file to avoid conflicts.
+    The winning file is renamed to output_path; loser tabs and temp
+    files are cleaned up.
+    """
+    from ..browser_engine import _get_shared_browser, is_available as _browser_available
+
+    if not _browser_available(config):
+        return None
+
+    try:
+        browser, context = _get_shared_browser(config)
+    except Exception as e:
+        log.info(f"   Sci-Hub: cannot get browser: {e}")
+        return None
+
+    log.info(f"   Sci-Hub: racing {len(domains)} browser domains via tabs (1 browser)...")
+
+    # Phase 1: Fire all navigations — open a tab per domain, trigger navigation
+    # without blocking (use JS location assignment, returns immediately)
+    tabs: list[tuple[str, Any, Path]] = []  # (domain, page, temp_output)
+    for domain in domains:
+        landing_url = f"{domain.rstrip('/')}/{urllib.parse.quote(doi, safe='/')}"
+        safe_suffix = domain.split("//")[-1].replace(".", "_").replace("/", "_")[:25]
+        temp_output = output_path.parent / f"{output_path.stem}_browser_{safe_suffix}.pdf"
+        try:
+            page = context.new_page()
+            # Fire-and-forget via JS — navigate without blocking so all tabs load concurrently
+            page.evaluate(f"window.location.href = '{landing_url}'")
+            tabs.append((domain, page, temp_output))
+        except Exception as e:
+            log.info(f"   Sci-Hub: tab open failed for {domain}: {e}")
+            try:
+                page.close()
+            except Exception:
+                pass
+
+    if not tabs:
+        return None
+
+    # Wait a moment for all navigations to start, then poll for DOM readiness
+    time.sleep(1.5)
+
+    # Phase 2: Poll tabs in round-robin — wait for DOM, then extract PDF URL
+    deadline = time.time() + 30
+    winner: tuple[dict[str, Any], Path] | None = None
+
+    while time.time() < deadline and winner is None:
+        for domain, page, temp_output in tabs:
+            try:
+                # Wait for this tab's DOM to be ready (short timeout per check)
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=3000)
+                except Exception:
+                    pass  # Not ready yet, try next tab
+
+                html = page.content()
+                if len(html) < 5000:
+                    continue
+
+                lower = html.lower()
+                # Skip if still on Cloudflare challenge or article not found
+                if any(sig in lower for sig in ["checking your browser", "just a moment"]):
+                    continue
+                if any(sig in lower for sig in ["article not found", "статья не найдена"]):
+                    log.info(f"   Sci-Hub: {domain} — article not found")
+                    continue
+
+                # Try to extract PDF URL
+                pdf_url = extract_pdf_url_from_html(html, page.url)
+                if pdf_url:
+                    log.info(f"   Sci-Hub: {domain} found PDF, downloading...")
+                    from ..browser_engine import download_pdf_via_browser
+                    if download_pdf_via_browser(pdf_url, temp_output, config):
+                        # Verify PDF file — retry with backoff (browser may still flush)
+                        for _retry in range(10):
+                            if temp_output.exists() and temp_output.stat().st_size > 5000:
+                                if is_pdf_file(temp_output):
+                                    result = success(doi, temp_output, f"Sci-Hub(tab:{domain.split('//')[-1][:15]})")
+                                    winner = (result, temp_output)
+                                    break
+                            time.sleep(0.3)
+                        if winner is not None:
+                            break
+                        else:
+                            log.info(f"   Sci-Hub: {domain} download finished but PDF check failed")
+            except Exception:
+                continue
+        if winner is None:
+            time.sleep(0.3)
+
+    # Phase 3: Cleanup — close all tabs, remove loser temp files
+    for domain, page, temp_output in tabs:
+        try:
+            page.close()
+        except Exception:
+            pass
+        if winner is None or temp_output != winner[1]:
+            if temp_output.exists():
+                try:
+                    temp_output.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    if winner is not None:
+        result, temp_output = winner
+        if temp_output != output_path and temp_output.exists():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            if output_path.exists():
+                output_path.unlink()
+            temp_output.rename(output_path)
+            result["file"] = str(output_path)
+        return result
+
+    log.info("   Sci-Hub: no tab found a PDF")
+    return None
 
 
 def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: bool = False) -> dict[str, Any] | None:
+    # All browser-backed attempts below run on the persistent worker pool
+    # (_race_pool): pool threads live for the whole process, so each worker's
+    # thread-local browser is created once and reused across papers — no
+    # per-paper window flashing. Do NOT shut browsers down here; cleanup is
+    # _shutdown_scihub_pool (atexit) plus browser_engine's process-exit reaper.
+    try:
+        return _try_scihub_impl(doi, output_path, config, use_tor)
+    except Exception as e:
+        log.info(f"   Sci-Hub: unexpected error: {type(e).__name__}: {e}")
+        # Check if a PDF was written to disk despite the exception
+        if output_path.exists():
+            from ..pdf_utils import is_pdf_file as _is_pdf
+            if _is_pdf(output_path):
+                log.info(f"   Sci-Hub: recovered PDF after {type(e).__name__}")
+                return {"success": True, "identifier": doi, "doi": doi,
+                        "file": str(output_path), "source": "Sci-Hub(recovered)"}
+        return None
+
+
+def _try_scihub_impl(doi: str, output_path: Path, config: dict[str, Any], use_tor: bool = False) -> dict[str, Any] | None:
     log.info(f"   try_scihub called for {doi}")
     if not config.get("scihub_enabled", False):
         log.info(f"   Sci-Hub disabled")
         return None
 
-    # Camofox-first pass: try a few reliable domains via Camofox before HTTP
-    if _is_camofox_available(config):
-        camofox_domains = ["https://sci-hub.se", "https://sci-hub.st", "https://sci-hub.ru", "https://sci-hub.ee"]
-        for domain in camofox_domains:
-            landing_url = f"{domain}/{urllib.parse.quote(doi, safe='/')}"
-            result = _camofox_first_download(landing_url, doi, output_path, config)
+    # Browser-first pass: race configured domains via browser in parallel.
+    # Opt-in (default off) — opening browser for every Sci-Hub attempt
+    # is slow and can leave orphan Chromium processes (issue #19). The HTTP
+    # path below still works; browser is only tried when explicitly enabled
+    # or as a Cloudflare/ALTCHA challenge fallback.
+    if config.get("scihub_browser_first_enabled", False) and _is_browser_available(config):
+        configured_domains = config.get("scihub_domains") or DEFAULT_SCIHUB_DOMAINS
+        browser_domains = [d for d in configured_domains[:5] if not _wall_guard(d, config)]
+        if not browser_domains:
+            browser_domains = [d for d in configured_domains[:5]]  # all cooling down — try anyway, paced
+        max_workers = min(config.get("scihub_browser_workers", 3), len(browser_domains))
+
+        pool = _race_pool(config)
+        if max_workers <= 1 or len(browser_domains) == 1:
+            # Single worker or single domain: sequential attempts on the pool
+            # (browser lives on the pool worker, not the caller's thread).
+            for domain in browser_domains:
+                landing_url = f"{domain.rstrip('/')}/{urllib.parse.quote(doi, safe='/')}"
+                result = pool.submit(
+                    _browser_first_download, landing_url, doi, output_path, config
+                ).result()
+                if result:
+                    return result
+        else:
+            result = pool.submit(
+                _race_browser_domains, browser_domains, doi, output_path, config, max_workers
+            ).result()
             if result:
                 return result
 
@@ -311,13 +927,21 @@ def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: boo
     all_domains = config.get("scihub_domains") or DEFAULT_SCIHUB_DOMAINS
     stats = load_stats(config)
 
+    # Track failure reason for better diagnostic messages
+    _failure_reason = "all domains unreachable"
+    _any_reachable = False
+    _any_browser_tried = False
+    fail_notes: list[str] = []
+
 
     if _HAS_COMPILED_CORE:
-        domains = _select_domains_compiled(all_domains, stats, _is_camofox_domain)
+        domains = _select_domains_compiled(all_domains, stats, _is_browser_domain)
     else:
         now = time.time()
         cooldown_domains = []
         for d in all_domains:
+            if _wall_guard(d, config):
+                continue  # persistent verification wall — pacing cooldown
             d_stats = stats.get(d, {})
             last_fail = d_stats.get("last_fail_time", 0)
             fail_streak = d_stats.get("fail_streak", 0)
@@ -349,8 +973,8 @@ def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: boo
             success_rate = successes / total
             avg_latency = s.get("avg_latency_ms", 5000)
             score = success_rate * 1000 - avg_latency / 1000
-            # Boost camofox-accessible domains (bypasses Cloudflare)
-            if _is_camofox_available(config) and _is_camofox_domain(d):
+            # Boost browser-accessible domains (bypasses Cloudflare)
+            if _is_browser_available(config) and _is_browser_domain(d):
                 score += 5000
             return score
 
@@ -360,13 +984,15 @@ def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: boo
 
     if len(domains) == 1:
         try:
-            result = try_scihub_domain(doi, domains[0], output_path, config, use_tor=use_tor)
+            result = try_scihub_domain(doi, domains[0], output_path, config, use_tor=use_tor,
+                                       fail_notes=fail_notes)
             if result:
                 record_result(domains[0], True, config)
                 return result
             record_result(domains[0], False, config)
         except Exception:
             record_result(domains[0], False, config)
+        log.info(f"   Sci-Hub: only domain {domains[0]} failed")
         return None
 
     # Try best domain first with short timeout
@@ -374,7 +1000,9 @@ def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: boo
     best_output = output_path.parent / f"{output_path.stem}_scihub_{best_domain.split('//')[1].replace('.', '_')}.pdf"
     log.info(f"   Sci-Hub: trying {best_domain} first...")
     try:
-        result = try_scihub_domain(doi, best_domain, best_output, config, use_tor=use_tor)
+        result = _race_pool(config).submit(
+            try_scihub_domain, doi, best_domain, best_output, config, use_tor, fail_notes
+        ).result()
         if result and result.get("success"):
             final_path = Path(result.get("file", ""))
             if final_path != output_path and final_path.exists():
@@ -396,55 +1024,63 @@ def try_scihub(doi: str, output_path: Path, config: dict[str, Any], use_tor: boo
         return None
 
     log.info(f"   Sci-Hub: racing {len(remaining)} backup domains...")
-    with ThreadPoolExecutor(max_workers=len(remaining)) as pool:
-        futures = {}
-        for domain in remaining:
-            src_output = output_path.parent / f"{output_path.stem}_scihub_{domain.split('//')[1].replace('.', '_')}.pdf"
-            futures[pool.submit(try_scihub_domain, doi, domain, src_output, config, use_tor)] = (domain, src_output)
-        try:
-            for future in as_completed(futures, timeout=10):
-                domain, src_output = futures[future]
-                try:
-                    result = future.result(timeout=1)
-                except Exception:
-                    result = None
-                if result and result.get("success"):
-                    final_path = Path(result.get("file", ""))
-                    if final_path != output_path and final_path.exists():
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
-                        if output_path.exists():
-                            output_path.unlink()
-                        final_path.rename(output_path)
-                        result["file"] = str(output_path)
-                    for _, other_path in futures.values():
-                        if other_path != output_path and other_path.exists():
-                            try:
-                                other_path.unlink(missing_ok=True)
-                            except OSError:
-                                pass
-                    record_result(domain, True, config)
-                    log.info(f"   Sci-Hub: OK {domain}")
-                    return result
-                else:
-                    record_result(domain, False, config)
-                    if src_output.exists():
+    # Persistent pool — workers (and their browsers) are NOT torn down here.
+    # Losers that outlive the 10s collection window keep running in the
+    # background and are simply ignored; their temp files may linger.
+    pool = _race_pool(config)
+    futures = {}
+    for domain in remaining:
+        src_output = output_path.parent / f"{output_path.stem}_scihub_{domain.split('//')[1].replace('.', '_')}.pdf"
+        futures[pool.submit(try_scihub_domain, doi, domain, src_output, config, use_tor, fail_notes)] = (domain, src_output)
+    try:
+        for future in as_completed(futures, timeout=10):
+            domain, src_output = futures[future]
+            try:
+                result = future.result(timeout=1)
+            except Exception:
+                result = None
+            if result and result.get("success"):
+                final_path = Path(result.get("file", ""))
+                if final_path != output_path and final_path.exists():
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    if output_path.exists():
+                        output_path.unlink()
+                    final_path.rename(output_path)
+                    result["file"] = str(output_path)
+                for _, other_path in futures.values():
+                    if other_path != output_path and other_path.exists():
                         try:
-                            src_output.unlink(missing_ok=True)
+                            other_path.unlink(missing_ok=True)
                         except OSError:
                             pass
-        except TimeoutError:
-            log.info("   Sci-Hub: backup domains timed out")
-        for _, src_output in futures.values():
-            if src_output.exists():
-                try:
-                    src_output.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                record_result(domain, True, config)
+                log.info(f"   Sci-Hub: OK {domain}")
+                return result
+            else:
+                record_result(domain, False, config)
+                if src_output.exists():
+                    try:
+                        src_output.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+    except TimeoutError:
+        log.info("   Sci-Hub: backup domains timed out")
+    for _, src_output in futures.values():
+        if src_output.exists():
+            try:
+                src_output.unlink(missing_ok=True)
+            except OSError:
+                pass
 
-    # All clearnet domains failed — auto-retry with Tor + .onion
+    # All clearnet domains failed — auto-retry with Tor + .onion (only if config allows)
     if not use_tor and config.get("use_tor_for_scihub", True):
         log.info("   Sci-Hub: all clearnet domains failed, retrying via Tor...")
         return try_scihub(doi, output_path, config, use_tor=True)
 
-    log.warning(f"   Sci-Hub: all domains failed for {doi}. Check: 1) network connectivity 2) Tor status (scansci-pdf tor_start)")
+    if fail_notes:
+        from collections import Counter
+        summary = ", ".join(f"{k}×{v}" for k, v in Counter(fail_notes).most_common())
+        log.warning(f"   Sci-Hub: all domains failed for {doi} ({summary})")
+    else:
+        log.warning(f"   Sci-Hub: all domains failed for {doi}. Check: 1) network connectivity 2) Tor status (scansci-pdf tor_start)")
     return None

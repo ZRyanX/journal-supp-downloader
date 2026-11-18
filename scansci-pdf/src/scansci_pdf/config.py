@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -11,10 +12,23 @@ DATA_DIR = Path(os.environ.get("SCANSCI_PDF_DATA_DIR", str(Path.home() / ".scans
 CONFIG_FILE = DATA_DIR / "config.json"
 
 DEFAULT_SCIHUB_DOMAINS = [
-    "https://sci-hub.se",
-    "https://sci-hub.st",
+    # Direct PDF mirrors (no CAPTCHA, PDF via sci.bban.top iframe) — verified 2026-07
+    # vg/al 现为 Turnstile 门/首页壳（2026-08-31 实测），保留用于人工点一次模式
+    "https://sci-hub.vg",
+    "https://sci-hub.al",
+    "https://sci-hub.mk",
+    # 2026-08-31 深夜直连实测新增：bz/mksa 稳定出文章页（iframe PDF，无验证墙）
+    "https://sci-hub.bz",
+    "https://sci-hub.mksa.top",
+    # ALTCHA-protected (stable; used as manual-download hint)
     "https://sci-hub.ru",
     "https://sci-hub.ee",
+    # Cloudflare-protected (requires browser JS challenge bypass)
+    "https://sci-hub.st",
+    # Reported intermittent (2026-06); kept but deprioritized
+    "https://sci-hub.mksa.top",
+    # Legacy (currently down, kept for future recovery)
+    "https://sci-hub.se",
     "https://sci-hub.is",
     "https://sci-hub.41610.org",
 ]
@@ -24,6 +38,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "output_dir": str(DATA_DIR / "papers"),
     "cache_dir": str(DATA_DIR / "cache"),
     "network_proxy": "",
+    "proxy_pool": "",  # 逗号分隔的代理列表；非空时批量下载按代理轮换出口 IP
+    "download_strategy": "fastest",  # fastest / grey_only(all 3 grey) / scihub_only(Sci-Hub only) / scihub_first / oa_first / legal_only
+    "race_mode": "hedge",  # hedge: score-ordered staggered cascade (fewer requests, less anti-bot heat) / full: flat parallel race
+    "hedge_delay_seconds": 1.5,  # hedged cascade: wait this long before widening to the next lane
+    "batch_default_lanes": True,  # batch downloads default to pretriage + channel-lane scheduling (fast HTTP -> grey -> institutional)
+    "lane_s2_batch_min": 10,  # minimum batch size to enrich OA URLs via the S2 batch endpoint (500 ids/request)
+    "lane_mdpi_cdn": True,  # fast lane: construct mdpi-res.com CDN URLs for 10.3390 DOIs (bypasses the bot-walled main site)
     "scihub_enabled": True,
     "scihub_domains": DEFAULT_SCIHUB_DOMAINS,
     "vpnsci_enabled": False,
@@ -32,37 +53,134 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "vpnsci_cookie_file": "",
     "carsi_enabled": False,
     "carsi_idp_name": "",
+    # 中文源开关（均为合法渠道）：
+    #   ncpssd_enabled      国家哲学社会科学文献中心，人文社科免费全文
+    #   cn_journal_direct   中文期刊官网直链 PDF（DOI 落地到刊社网站时）
+    #   cn_databases_enabled CNKI/万方/维普（校园网出口或 CARSI 机构订阅）
+    "ncpssd_enabled": True,
+    "cn_journal_direct": True,
+    "cn_databases_enabled": True,
+    # 中文库 CARSI 登录弹窗由内部阶段控制：免费源阶段只复用已保存会话，
+    # 失败后进入机构阶段才允许打开登录浏览器。
+    "cn_auto_login": True,
+    # 万方/知网失败后用维普再兜底（校园网 IP 或 CARSI 均可）。
+    "cn_vip_fallback": True,
     "ezproxy_enabled": False,
     "ezproxy_login_url": "",
+    # 机构会话自愈：下载走机构渠道前自动校验 WebVPN/CARSI 会话，
+    # 已过期时打开浏览器重新登录。仅当存在历史 cookie 且校验明确判定
+    # 过期才触发；新用户或网络不可达绝不弹浏览器。
+    "auto_relogin": True,
     "core_api_key": "",
     "openalex_api_key": "",
+    # Sciverse 语义检索（agentic-search）：自然语言问题 → 可引用的证据片段。
+    # 需要 https://sciverse.space/tokens 创建的 API Key；未配置时整条链路静默跳过。
+    "sciverse_enabled": True,
+    "sciverse_api_key": "",
+    "sciverse_base_url": "https://api.sciverse.space",
+    "sciverse_sub_queries": 0,  # 查询改写数 0-4；调高召回更好但延迟更高
+    "sciverse_timeout_seconds": 45,
+    # 每次 search 额外跑一路结构化 meta-search（返回 DOI/unique_id，补语义片段的 DOI 缺口）。
+    # 每次检索会因此多消耗一次 Sciverse 配额；配额紧张时设为 false。
+    "sciverse_meta_search_enabled": True,
     "elsevier_api_key": "",
+    "springer_api_key": "",  # Springer Nature Full Text API (TDM) — entitlement follows the institution (ORCID-affiliated key, needs a Springer subscription with TDM rights)
     "elsevier_insttoken": "",
+    "institutional_allow_self_signed": False,  # Campus connectors (EasyConnect/aTrust, and some WebVPN gateways) commonly serve self-signed certificates; this is the one place that justifies skipping TLS verification, and it is opt-in
     "connect_timeout": 15,
     "read_timeout": 30,
     "request_delay_min": 2.0,
     "request_delay_max": 5.0,
+    "fixed_request_delay_enabled": False,
+    "json_probe_cache_seconds": 3600,
     "cache_ttl_hours": 168,
     "parallel_sources": True,
     "parallel_probes": True,
     "batch_workers": 10,
+    "batch_stagger_seconds": 0.3,
     "min_pdf_size_bytes": 10000,
-    "camofox_enabled": True,
-    "camofox_url": os.environ.get("CAMOFOX_URL", "http://localhost:9377"),
+    "browser_headless": False,
+    "browser_humanize": True,
+    # 浏览器后端：patchright（默认，Apache-2.0 开源 playwright fork，内核随本机 Chrome 自动更新）、
+    # camoufox（反检测 Firefox 回退），或 ego-lite（通过 CDP 连接已运行的 ego lite 桌面浏览器）。
+    "browser_backend": "patchright",
+    "ego_lite_cdp_url": "",
+    "ego_lite_executable": "",
+    "ego_lite_auto_launch": False,
+    "ego_lite_user_data_dir": "",
+    "ego_lite_launch_timeout": 20.0,
+    # 批量下载时每 N 篇回收一次浏览器上下文（cookie 内存交接，登录态不丢）。
+    # 0 = 关闭。长批次（上千篇）建议 100-200，避免 Chrome 长会话内存漂移。
+    "browser_restart_every": 0,
+    # 批量下载成功后自动抓取附件/补充材料（SI）。默认关——大多数任务只要主 PDF。
+    # 开启后成功论文会尝试抓取出版商补充材料，存为 {DOI}_SI{n}.{ext}，并写 si_manifest.json。
+    "fast_retry_wait_sec": 60,
+    # 冷却重试期间的逐篇间隔（秒）。实测 15s/篇可 100% 绕开 Elsevier API 限流。
+    "fast_retry_delay_sec": 15,
+    # 任务启动时自动弹出悬浮进度条（独立进程，已有实例则不重复弹出）。
+    "progress_bar_auto": True,
+    # Turnstile 交互门（如 sci-hub.vg）：无头会话下无法点击，默认跳过并冷却。
+    # scihub_browser_headless=false 时可开启人工点一次模式（点一次整批复用）。
+    "scihub_turnstile_click": True,
+    "turnstile_wait_sec": 180,
+    # 机构级联并行 fetcher 数（各持独立登录会话）。默认 1 = 串行；2 可省约一半
+    # Phase 2 时间，代价是同 IP 双浏览器会话。
+    "institutional_workers": 1,
+    # 灰色源竞速浏览器的独立无头开关（只影响 sci-hub 竞速，机构登录仍有可见窗口）。
+    # true = 竞速全程零窗口、零任务栏闪烁；指纹安全性由 UA 清洗保证。
+    "scihub_browser_headless": False,
+    "scihub_browser_first": True,  # false = pure-HTTP Sci-Hub lane (use when the PDF CDN challenges headless browsers but serves plain requests)
+    # 浏览器内核选择：显式指定浏览器二进制路径（本机 Chrome/Edge）；留空=使用 channel=chrome。
+    "browser_executable": "",
     "is_campus_network": False,
-    "camofox_api_key": os.environ.get("CAMOFOX_API_KEY", ""),
-    "camofox_access_key": os.environ.get("CAMOFOX_ACCESS_KEY", ""),
     "tor_proxy": os.environ.get("TOR_PROXY", ""),
+    "tor_binary_path": "",  # Explicit tor binary; empty falls back to the embedded install and then PATH. Pinning it stops lookup order from deciding which binary runs
     "tor_use_bridges": False,
     "use_tor_for_scihub": True,
     "google_scholar_limit": 5,
-    "download_strategy": "fastest",
+    "max_browser_workers": 1,
+    "scihub_browser_workers": 3,  # Number of Sci-Hub domains to race in parallel via browser
     "host_concurrency": {},
     "auto_rename": True,
     "zotero_api_key": "",
     "zotero_library_type": "user",
     "zotero_library_id": "",
+    "flaresolverr_url": "http://127.0.0.1:8191/v1",
+    "cookie_path": "",
+    "chrome_profile_dir": "",
+    "carsi_cookie_dir": "",
 }
+
+# Compliance profiles are enforced by the process that serves the MCP connector.
+# They are deliberately NOT user-configurable: a profile is selected on the
+# command line (`scansci-pdf run --profile qoder`) and can only tighten the
+# source set, never widen it.
+_PROFILE_ENV = "SCANSCI_PDF_PROFILE"
+GREY_STRATEGIES = frozenset({"scihub_first", "scihub_only", "grey_only"})
+_COMPLIANCE_PROFILES: dict[str, dict[str, Any]] = {
+    "qoder": {
+        "scihub_enabled": False,
+        "download_strategy": "legal_only",
+    },
+}
+
+
+def active_profile() -> str:
+    """Return the active compliance profile (default: ``default``)."""
+    return os.environ.get(_PROFILE_ENV, "default").strip().lower() or "default"
+
+
+def is_legal_only_profile() -> bool:
+    """True when the active profile forbids grey sources."""
+    overrides = _COMPLIANCE_PROFILES.get(active_profile(), {})
+    return overrides.get("scihub_enabled") is False
+
+
+def _apply_compliance_profile(config: dict[str, Any]) -> dict[str, Any]:
+    profile = active_profile()
+    config["profile"] = profile
+    config.update(_COMPLIANCE_PROFILES.get(profile, {}))
+    return config
 
 
 def load_config() -> dict[str, Any]:
@@ -77,30 +195,68 @@ def load_config() -> dict[str, Any]:
             pass
     for key, value in DEFAULT_CONFIG.items():
         config.setdefault(key, value)
-    return config
+    return _apply_compliance_profile(config)
 
 
 def save_config(config: dict[str, Any]) -> None:
+    # `profile` is derived from the process environment, never persisted: the
+    # same config file may be used by the full package and the Qoder edition.
+    persisted = {k: v for k, v in config.items() if k != "profile"}
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     with CONFIG_FILE.open("w", encoding="utf-8") as fh:
-        json.dump(config, fh, indent=2, ensure_ascii=False)
+        json.dump(persisted, fh, indent=2, ensure_ascii=False)
 
 
 _VALIDATION_RULES: dict[str, tuple[type, Any, Any]] = {
     # key: (type, min_value, max_value)
     "connect_timeout": (int, 1, 60),
     "read_timeout": (int, 1, 120),
-    "request_delay_min": (float, 0, 10),
-    "request_delay_max": (float, 0, 30),
-    "cache_ttl_hours": (float, 0, 8760),
-    "batch_workers": (int, 1, 20),
-    "min_pdf_size_bytes": (int, 100, 10_000_000),
-    "google_scholar_limit": (int, 1, 100),
+    "request_delay_min": (float, 0.0, 30.0),
+    "request_delay_max": (float, 0.0, 60.0),
+    "json_probe_cache_seconds": (int, 0, 86400),
+    "cache_ttl_hours": (int, 1, 8760),
+    "batch_workers": (int, 1, 50),
+    "batch_stagger_seconds": (float, 0.0, 10.0),
+    "min_pdf_size_bytes": (int, 100, 1000000),
+    "google_scholar_limit": (int, 1, 50),
+    "sciverse_sub_queries": (int, 0, 4),
+    "sciverse_timeout_seconds": (int, 5, 300),
 }
+
+_VALID_STRATEGIES = frozenset({"fastest", "scihub_first", "scihub_only", "grey_only", "oa_first", "legal_only"})
 
 
 def update_config(key: str, value: str) -> dict[str, Any]:
+    import warnings as _warnings
+
     config = load_config()
+
+    locked = _COMPLIANCE_PROFILES.get(active_profile(), {})
+    if key in locked:
+        raise ValueError(
+            f"Config key '{key}' is locked by the '{active_profile()}' compliance "
+            f"profile (forced to {locked[key]!r})"
+        )
+
+    # Validate: warn on unknown keys
+    if key not in DEFAULT_CONFIG:
+        _warnings.warn(
+            f"Unknown config key '{key}' — it will be stored but may have no effect. "
+            f"Valid keys include: {', '.join(sorted(DEFAULT_CONFIG.keys()))}",
+            stacklevel=2,
+        )
+
+    # Special handling for download_strategy
+    if key == "download_strategy":
+        value_lower = value.lower().strip()
+        if value_lower not in _VALID_STRATEGIES:
+            raise ValueError(
+                f"Invalid download_strategy '{value}'. Valid options: {', '.join(sorted(_VALID_STRATEGIES))}"
+            )
+        config[key] = value_lower
+        save_config(config)
+        return config
+
     if key in config:
         old_type = type(config[key])
         if old_type == bool:
@@ -115,6 +271,18 @@ def update_config(key: str, value: str) -> dict[str, Any]:
                 config[key] = float(value)
             except ValueError:
                 raise ValueError(f"Invalid float value for '{key}': '{value}'")
+        elif old_type == list:
+            # Try JSON parse for list values (e.g. scihub_domains)
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    config[key] = parsed
+                else:
+                    raise ValueError(f"Expected a JSON list for '{key}', got {type(parsed).__name__}")
+            except json.JSONDecodeError:
+                raise ValueError(
+                    f"Invalid list value for '{key}'. Use JSON format, e.g.: '[\"https://sci-hub.vg\",\"https://sci-hub.al\"]'"
+                )
         else:
             config[key] = value
     else:
@@ -129,10 +297,61 @@ def update_config(key: str, value: str) -> dict[str, Any]:
     return config
 
 
+SENSITIVE_KEYS = [
+    "core_api_key",
+    "vpnsci_cookie_file",
+    "zotero_api_key",
+    "zotero_library_id",
+    "elsevier_api_key",
+    "elsevier_insttoken",
+    "sciverse_api_key",
+]
+
+# The list above is for names that do not advertise themselves. Everything else
+# is decided by name, because an exact-match list silently leaks every key that
+# is added later: springer_api_key, openalex_api_key, cookie_path and
+# carsi_cookie_dir all reached MCP clients in cleartext that way (#70).
+_SECRET_NAME_RE = re.compile(r"key|token|secret|password|cookie|credential", re.I)
+
+_PROXY_URL_CREDS_RE = re.compile(r"(//[^/@\s]+:)[^@\s]+@")
+
+
+def mask_config_value(key: str, value: Any) -> Any:
+    """Return a display-safe copy of a config value.
+
+    Secrets (API keys, tokens, cookie files) are fully masked; proxy URLs keep
+    host/port but hide the password (``http://user:***@host:port``).
+    """
+    if value is None:
+        return value
+    if key in SENSITIVE_KEYS or _SECRET_NAME_RE.search(key):
+        # Empty means "not configured", not a masked secret — callers use
+        # this to decide whether to show a setup prompt.
+        return "***" if value != "" else ""
+    if "proxy" in key.lower() and isinstance(value, str) and "@" in value:
+        return _PROXY_URL_CREDS_RE.sub(r"\1***@", value)
+    return value
+
+
 def get_config_safe() -> dict[str, Any]:
     config = load_config()
-    sensitive_keys = ["core_api_key", "vpnsci_cookie_file", "zotero_api_key", "zotero_library_id", "elsevier_api_key", "elsevier_insttoken"]
-    for key in sensitive_keys:
-        if config.get(key):
-            config[key] = "***"
-    return config
+    return {key: mask_config_value(key, value) for key, value in config.items()}
+
+
+def parse_proxy_pool(value: str | None) -> list[str]:
+    """Parse a comma-separated proxy list into a deduplicated list.
+
+    Accepts forms like ``"socks5://1.1.1.1:1080, http://2.2.2.2:8080"`` and
+    returns ``["socks5://1.1.1.1:1080", "http://2.2.2.2:8080"]``. Empty/blank
+    entries are dropped. Order is preserved; duplicates removed.
+    """
+    if not value:
+        return []
+    seen: set[str] = set()
+    proxies: list[str] = []
+    for token in str(value).split(","):
+        proxy = token.strip()
+        if proxy and proxy not in seen:
+            seen.add(proxy)
+            proxies.append(proxy)
+    return proxies

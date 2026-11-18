@@ -31,7 +31,7 @@ def _load_db() -> dict:
     # Try encrypted .dat first (production)
     if _DATA_FILE_ENCRYPTED.exists():
         try:
-            from ._core.vpnsci_core import decrypt_data
+            from ._core.instsci_core import decrypt_data
             encrypted = _DATA_FILE_ENCRYPTED.read_bytes()
             return json.loads(decrypt_data(encrypted))
         except Exception:
@@ -110,4 +110,4 @@ def get_school(name: str) -> SchoolEntry:
         if s.name in name:
             return s
 
-    raise ValueError(f"School not found: '{name}'. Use vpnsci_schools to list.")
+    raise ValueError(f"School not found: '{name}'. Use instsci_schools to list.")

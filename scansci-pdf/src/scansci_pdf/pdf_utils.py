@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -60,6 +61,52 @@ def is_plausible_pdf_url(url: str) -> bool:
 def _response_looks_pdf(resp: requests.Response, first_chunk: bytes) -> bool:
     ctype = resp.headers.get("content-type", "").lower()
     return first_chunk.startswith(b"%PDF-") or "application/pdf" in ctype
+
+
+def is_suspicious_pdf(path: Path) -> bool:
+    """Check if a PDF looks like a cover page or preview (not full text).
+
+    Heuristics:
+      - Very small file (< 50 KB): likely a 1-page cover
+      - At most 1 readable page: preview/cover page. File size alone is NOT
+        trusted — Elsevier serves >100KB single-page previews to API keys
+        without full-text entitlement.
+    """
+    try:
+        size = path.stat().st_size
+        # Very small files are suspicious regardless
+        if size < 50_000:
+            return True
+        try:
+            import fitz  # type: ignore[import-not-found]
+        except Exception:
+            # No pymupdf: fall back to the cheap regex heuristic
+            with path.open("rb") as fh:
+                content = fh.read(512_000)
+            # Count PDF page objects: look for "/Type /Page" not followed by "s"
+            import re
+            pages = len(re.findall(rb"/Type\s*/Page\b", content))
+            return pages <= 1
+        try:
+            with fitz.open(path) as doc:
+                return int(doc.page_count) <= 1
+        except Exception:
+            return True  # unreadable PDF — treat as suspicious
+    except OSError:
+        return False
+
+
+def suspicious_pdf(identifier: str, file_path: Path, source_label: str) -> dict[str, Any]:
+    """Build a result dict for a suspicious/preview PDF (not full text)."""
+    return {
+        "success": False,
+        "identifier": identifier,
+        "doi": identifier,
+        "file": str(file_path),
+        "source": source_label,
+        "error_type": "suspicious_pdf",
+        "reason": "PDF appears to be a cover page or preview (too small / too few pages)",
+    }
 
 
 def success(identifier: str, file_path: Path, source: str) -> dict[str, Any]:
@@ -152,19 +199,40 @@ def download_pdf(
     require_pdf_like_url: bool = True,
     use_tor: bool = False,
     cookies: Any = None,
+    referer: str = "",
+    browser_ua: bool = False,
 ) -> dict[str, Any] | None:
     if require_pdf_like_url and not is_plausible_pdf_url(url):
         return None
 
     try:
         if cookies is not None:
-            from .network import request_timeout, proxy_dict, select_proxy_for_url, USER_AGENT
-            session = requests.Session()
-            session.trust_env = False
-            session.headers.update({"User-Agent": USER_AGENT})
-            session.cookies.update(cookies)
+            from .network import (
+                CHROME_UA,
+                request_timeout,
+                proxy_dict,
+                select_proxy_for_url,
+                thread_session,
+                USER_AGENT,
+            )
+            request_headers = {"User-Agent": USER_AGENT}
+            if referer:
+                # Some shadow-library CDNs (sci.bban.top, observed 2026-09)
+                # 403 any PDF request without a same-site Referer.
+                request_headers["Referer"] = referer
+            if browser_ua:
+                # …and they also 403 non-browser User-Agents outright — the
+                # engine UA ("scansci-pdf/x") gets HTML even with Referer.
+                request_headers["User-Agent"] = CHROME_UA
+            # Session per worker thread, and the per-call headers/cookies go on
+            # the request rather than onto the session: the session outlives the
+            # call now, so mutating it would carry this PDF's Referer and cookie
+            # jar into the next one (#72).
+            session = thread_session(proxy_dict(select_proxy_for_url(url, config)))
             resp = session.get(
                 url,
+                headers=request_headers,
+                cookies=cookies,
                 timeout=request_timeout(config),
                 proxies=proxy_dict(select_proxy_for_url(url, config)),
                 allow_redirects=True,
@@ -183,9 +251,15 @@ def download_pdf(
         output_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = output_path.with_suffix(output_path.suffix + ".part")
         try:
+            # requests' timeout tuple only guards connect + each socket read;
+            # a peer that drips bytes forever would hold the race open, so
+            # bound the whole stream with a wall-clock deadline too.
+            deadline = time.monotonic() + float(config.get("download_deadline_seconds", 60))
             with tmp_path.open("wb") as fh:
                 fh.write(first_chunk)
                 for chunk in iterator:
+                    if time.monotonic() > deadline:
+                        raise TimeoutError("stream deadline exceeded")
                     if chunk:
                         fh.write(chunk)
             tmp_path.replace(output_path)

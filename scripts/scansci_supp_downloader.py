@@ -186,18 +186,84 @@ try:
 except ImportError:
     HAS_SCRAPLING = False
 
-# Try importing scansci_pdf components
+# Try importing scansci_pdf components (compatible with v1.5.0, v1.21.0+, and standalone)
+_scansci_load_config = None
+_scansci_default_config = None
+_scansci_webvpn_session_status = None
+_scansci_is_campus_connector_mode = None
+_scansci_get_socks5_proxy = None
+_scansci_get_ezproxy_base = None
+_scansci_make_ezproxy_url = None
+_scansci_ezproxy_cookie_path = None
+_scansci_configured_proxy = None
+_scansci_allow_self_signed = None
+_scansci_is_challenge_page = None
+_scansci_is_elsevier_crasolve = None
+
 try:
-    import scansci_pdf
-    from scansci_pdf.config import load_config as _scansci_load_config
-    from scansci_pdf.browser_cookies import inject_cookies, load_saved_cookies
-    from scansci_pdf.sources.vpnsci import (
-        convert_url,
-        vpnsci_is_configured,
-        _get_webvpn_base,
-        _load_cookies as load_webvpn_cookies,
-        vpnsci_cookie_path,
-    )
+    import logging as _logging
+
+    _bb_logger = _logging.getLogger("scansci_pdf.browser_backend")
+    _prev_bb_level = _bb_logger.level
+    _bb_logger.setLevel(_logging.ERROR)
+    try:
+        import scansci_pdf
+        from scansci_pdf.config import load_config as _scansci_load_config
+        from scansci_pdf.config import DEFAULT_CONFIG as _scansci_default_config
+        from scansci_pdf.browser_cookies import inject_cookies, load_saved_cookies
+        from scansci_pdf.sources.vpnsci import (
+            convert_url,
+            vpnsci_is_configured,
+            _get_webvpn_base,
+            vpnsci_cookie_path,
+        )
+    finally:
+        _bb_logger.setLevel(_prev_bb_level)
+
+    try:
+        from scansci_pdf.sources.instsci import (
+            _load_cookies as load_webvpn_cookies,
+            session_status as _scansci_webvpn_session_status,
+            _is_campus_connector_mode as _scansci_is_campus_connector_mode,
+            _get_socks5_proxy as _scansci_get_socks5_proxy,
+        )
+    except ImportError:
+        try:
+            from scansci_pdf.sources.vpnsci import _load_cookies as load_webvpn_cookies
+        except ImportError:
+            load_webvpn_cookies = None
+
+    try:
+        from scansci_pdf.sources.ezproxy import (
+            _get_ezproxy_base as _scansci_get_ezproxy_base,
+            _make_ezproxy_url as _scansci_make_ezproxy_url,
+            _ezproxy_cookie_path as _scansci_ezproxy_cookie_path,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from scansci_pdf.network import (
+            configured_proxy as _scansci_configured_proxy,
+            allow_self_signed as _scansci_allow_self_signed,
+        )
+    except ImportError:
+        pass
+
+    try:
+        from scansci_pdf.publisher_strategies import (
+            _is_challenge_page as _scansci_is_challenge_page,
+            _is_elsevier_crasolve as _scansci_is_elsevier_crasolve,
+        )
+    except ImportError:
+        try:
+            from scansci_pdf._publisher_strategies_core import (
+                _is_challenge_page as _scansci_is_challenge_page,
+                _is_elsevier_crasolve as _scansci_is_elsevier_crasolve,
+            )
+        except ImportError:
+            pass
+
     HAS_SCANSCI = True
 except ImportError as e:
     _scansci_load_config = None
@@ -216,6 +282,23 @@ def load_config():
         elif val not in (None, "") and not cfg.get(key):
             cfg[key] = val
     return cfg
+
+
+def resolve_scansci_proxy(config=None, cli_proxy=None):
+    """Resolve explicit proxy: CLI --proxy > SCANSCI_PDF_PROXY env > network_proxy config."""
+    if cli_proxy:
+        return str(cli_proxy).strip()
+    env_proxy = os.environ.get("SCANSCI_PDF_PROXY", "").strip()
+    if env_proxy:
+        return env_proxy
+    if HAS_SCANSCI and _scansci_configured_proxy is not None:
+        try:
+            px = str(_scansci_configured_proxy(config) or "").strip()
+            if px:
+                return px
+        except Exception:
+            pass
+    return str((config or {}).get("network_proxy") or "").strip() or None
 
 
 def _parse_cookie_file_items_standalone(cookie_file: str):
@@ -661,17 +744,107 @@ def find_supplementary_links(html_content, base_url, original_url=None):
 
 # ── Cookie Loading ───────────────────────────────────────────────────────────
 
+def _scansci_cache_dir(config):
+    default_cache = (
+        _scansci_default_config.get("cache_dir")
+        if isinstance(_scansci_default_config, dict) and _scansci_default_config.get("cache_dir")
+        else str(Path.home() / ".scansci-pdf" / "cache")
+    )
+    return Path((config or {}).get("cache_dir") or default_cache).expanduser()
+
+
+def _is_webvpn_enabled(config):
+    cfg = config or {}
+    return bool(cfg.get("vpnsci_enabled") or cfg.get("instsci_enabled"))
+
+
+def _is_campus_connector_active(config):
+    if not HAS_SCANSCI or _scansci_is_campus_connector_mode is None:
+        return False
+    try:
+        return bool(_scansci_is_campus_connector_mode(config or {}))
+    except Exception:
+        return False
+
+
+def _should_allow_self_signed_tls(config, no_vpn=False):
+    cfg = config or {}
+    if HAS_SCANSCI and _scansci_allow_self_signed is not None:
+        try:
+            if _scansci_allow_self_signed(cfg):
+                return True
+        except Exception:
+            pass
+    if cfg.get("institutional_allow_self_signed"):
+        return True
+    if not no_vpn and _is_webvpn_enabled(cfg) and not _is_campus_connector_active(cfg):
+        return True
+    return False
+
+
+def _resolve_webvpn_base_safe(config):
+    if HAS_SCANSCI:
+        try:
+            base = _get_webvpn_base(config)
+            if base:
+                return base
+        except Exception:
+            pass
+    return (config or {}).get("vpnsci_base_url") or (config or {}).get("instsci_base_url") or (config or {}).get("webvpn_base", "")
+
+
+def _carsi_cookie_files(config):
+    cfg = config or {}
+    custom_dir = cfg.get("carsi_cookie_dir")
+    carsi_dir = Path(custom_dir).expanduser() if custom_dir else (_scansci_cache_dir(cfg) / "carsi_cookies")
+    if carsi_dir.is_dir():
+        return sorted(carsi_dir.glob("*.json"))
+    return []
+
+
+def _load_ezproxy_cookies_list(config):
+    cfg = config or {}
+    paths = []
+    if HAS_SCANSCI and _scansci_ezproxy_cookie_path is not None:
+        try:
+            paths.append(Path(_scansci_ezproxy_cookie_path(cfg)))
+        except Exception:
+            pass
+    paths.append(_scansci_cache_dir(cfg) / "ezproxy_cookies.json")
+    seen = set()
+    items = []
+    for p in paths:
+        if p in seen or not p.exists():
+            continue
+        seen.add(p)
+        try:
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                items.extend(c for c in loaded if isinstance(c, dict))
+        except Exception:
+            pass
+    return items
+
+
 def load_vpnsci_cookies_unified(config):
-    """Load WebVPN cookies from either vpnsci-cookies.json or vpnsci_cookies.json."""
+    """Load WebVPN cookies from vpnsci/instsci cookie files (v1.5.0 and v1.21.0+ compatible)."""
     if not HAS_SCANSCI:
         return {}
-    from scansci_pdf.config import DEFAULT_CONFIG
-    cache_dir = Path(config.get("cache_dir", DEFAULT_CONFIG["cache_dir"])).expanduser()
-
-    paths = [
-        cache_dir / "vpnsci-cookies.json",
-        cache_dir / "vpnsci_cookies.json",
-    ]
+    cache_dir = _scansci_cache_dir(config)
+    paths = []
+    try:
+        paths.append(Path(vpnsci_cookie_path(config)))
+    except Exception:
+        pass
+    for fname in (
+        "vpnsci-cookies.json",
+        "vpnsci_cookies.json",
+        "instsci-cookies.json",
+        "instsci_cookies.json",
+    ):
+        candidate = cache_dir / fname
+        if candidate not in paths:
+            paths.append(candidate)
 
     jar = {}
     for path in paths:
@@ -689,20 +862,14 @@ def load_vpnsci_cookies_unified(config):
 
 
 def load_all_scansci_cookies(config, no_vpn=False):
-    """Load and merge all scansci-pdf cookies (WebVPN, publisher, CARSI) as Playwright list."""
+    """Load and merge all scansci-pdf cookies (WebVPN, publisher, CARSI, EZProxy) as Playwright list."""
     cookies = []
 
     # 1. WebVPN cookies
-    if not no_vpn and config.get("vpnsci_enabled"):
+    if not no_vpn and _is_webvpn_enabled(config):
         try:
             vpn_cookies = load_vpnsci_cookies_unified(config)
-            if HAS_SCANSCI:
-                try:
-                    base_url = _get_webvpn_base(config)
-                except Exception:
-                    base_url = config.get("webvpn_base", "")
-            else:
-                base_url = config.get("webvpn_base", "")
+            base_url = _resolve_webvpn_base_safe(config)
             domain = base_url.split("://")[-1].split(":")[0] if "://" in base_url else (base_url or "localhost")
             for name, value in vpn_cookies.items():
                 cookies.append({
@@ -724,19 +891,25 @@ def load_all_scansci_cookies(config, no_vpn=False):
         pass
 
     # 3. CARSI cookies
-    cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
-    carsi_dir = cache_dir / "carsi_cookies"
-    if carsi_dir.is_dir():
-        for cf in carsi_dir.glob("*.json"):
-            try:
-                for c in json.loads(cf.read_text(encoding="utf-8")):
-                    cookies.append({
-                        "name": c.get("name", ""), "value": c.get("value", ""),
-                        "domain": c.get("domain", ""), "path": c.get("path", "/"),
-                        "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
-                    })
-            except Exception:
-                pass
+    for cf in _carsi_cookie_files(config):
+        try:
+            for c in json.loads(cf.read_text(encoding="utf-8")):
+                cookies.append({
+                    "name": c.get("name", ""), "value": c.get("value", ""),
+                    "domain": c.get("domain", ""), "path": c.get("path", "/"),
+                    "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
+                })
+        except Exception:
+            pass
+
+    # 4. EZProxy cookies
+    if not no_vpn and (config or {}).get("ezproxy_enabled"):
+        for c in _load_ezproxy_cookies_list(config):
+            cookies.append({
+                "name": c.get("name", ""), "value": c.get("value", ""),
+                "domain": c.get("domain", ""), "path": c.get("path", "/"),
+                "secure": c.get("secure", False), "httpOnly": c.get("httpOnly", False),
+            })
 
     # Deduplicate
     deduped = {}
@@ -751,54 +924,57 @@ def load_all_scansci_cookies(config, no_vpn=False):
 def _setup_authenticated_session_and_cookies(config, args, cdp_target=None):
     """
     Create a requests.Session and Playwright cookie list populated uniformly from:
-    1. scansci-pdf publisher cookies, WebVPN cookies, and CARSI cookies (when HAS_SCANSCI)
+    1. scansci-pdf publisher cookies, WebVPN cookies, CARSI cookies, and EZProxy cookies (when HAS_SCANSCI)
     2. standalone local cookies.json / ~/.journal_supp_downloader_profile/cookies.json
     3. live CDP browser cookies (when cdp_target is provided)
     """
-    session = configure_session_direct(requests.Session(), proxy=getattr(args, "proxy", None))
+    no_vpn = getattr(args, "no_vpn", False)
+    effective_proxy = getattr(args, "proxy", None) or resolve_scansci_proxy(config)
+    session = configure_session_direct(requests.Session(), proxy=effective_proxy)
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
     })
-    session.verify = False
+    session.verify = not _should_allow_self_signed_tls(config, no_vpn=no_vpn)
     play_cookies = []
 
     if getattr(args, "no_cookies", False):
         return session, play_cookies
 
-    no_vpn = getattr(args, "no_vpn", False)
     if HAS_SCANSCI:
         try:
             inject_cookies(session, config)
         except Exception:
             pass
         # Inject WebVPN cookies into requests session as well
-        if not no_vpn and config.get("vpnsci_enabled"):
+        if not no_vpn and _is_webvpn_enabled(config):
             try:
                 vpn_cookies = load_vpnsci_cookies_unified(config)
-                try:
-                    base_url = _get_webvpn_base(config)
-                except Exception:
-                    base_url = config.get("webvpn_base", "")
+                base_url = _resolve_webvpn_base_safe(config)
                 domain = base_url.split("://")[-1].split(":")[0] if "://" in base_url else None
                 for name, value in vpn_cookies.items():
                     session.cookies.set(name, value, domain=domain, path="/")
             except Exception:
                 pass
         # Inject CARSI cookies into requests session
-        cache_dir = Path(config.get("cache_dir", str(Path.home() / ".scansci-pdf" / "cache")))
-        carsi_dir = cache_dir / "carsi_cookies"
-        if carsi_dir.is_dir():
-            for cf in carsi_dir.glob("*.json"):
-                try:
-                    for c in json.loads(cf.read_text(encoding="utf-8")):
-                        if c.get("name"):
-                            session.cookies.set(
-                                c.get("name", ""), c.get("value", ""),
-                                domain=c.get("domain") or None, path=c.get("path", "/"),
-                            )
-                except Exception:
-                    pass
+        for cf in _carsi_cookie_files(config):
+            try:
+                for c in json.loads(cf.read_text(encoding="utf-8")):
+                    if c.get("name"):
+                        session.cookies.set(
+                            c.get("name", ""), c.get("value", ""),
+                            domain=c.get("domain") or None, path=c.get("path", "/"),
+                        )
+            except Exception:
+                pass
+        # Inject EZProxy cookies into requests session
+        if not no_vpn and (config or {}).get("ezproxy_enabled"):
+            for c in _load_ezproxy_cookies_list(config):
+                if c.get("name"):
+                    session.cookies.set(
+                        c.get("name", ""), c.get("value", ""),
+                        domain=c.get("domain") or None, path=c.get("path", "/"),
+                    )
         play_cookies = load_all_scansci_cookies(config, no_vpn=no_vpn)
 
     # Always merge standalone cookies (cookies.json and login wizard profile)
@@ -899,13 +1075,54 @@ def _mime_or_format_to_ext(fmt_str, valid_exts):
     return ""
 
 
+def _elsevier_api_get(api_url, headers, proxy=None, timeout=30):
+    """Issue Elsevier API GET ignoring ambient env proxies, while preserving test mocks on requests.get."""
+    if getattr(requests.get, "__module__", "") != "requests.api":
+        kwargs = {"headers": headers, "timeout": timeout}
+        if proxy:
+            kwargs["proxies"] = {"http": proxy, "https": proxy}
+        return requests.get(api_url, **kwargs)
+    api_session = configure_session_direct(requests.Session(), proxy=proxy)
+    try:
+        return api_session.get(api_url, headers=headers, timeout=timeout)
+    finally:
+        try:
+            api_session.close()
+        except Exception:
+            pass
+
+
+def _diagnose_elsevier_403(resp, has_proxy=False):
+    """Return an actionable diagnostic message for Elsevier Retrieval API HTTP 403."""
+    body = ""
+    try:
+        body = str(getattr(resp, "text", "") or "")
+    except Exception:
+        body = ""
+    if "requestor configuration settings insufficient" in body.lower():
+        if has_proxy:
+            return (
+                "HTTP 403 ('Requestor configuration settings insufficient') — "
+                "proxy egress reached Elsevier, so this API key lacks institutional full-text "
+                "enablement (contact institution Elsevier admin, or set ELSEVIER_INSTTOKEN)."
+            )
+        return (
+            "HTTP 403 ('Requestor configuration settings insufficient') — "
+            "egress IP is likely off-campus (set SCANSCI_PDF_PROXY / network_proxy or connect "
+            "campus VPN), or the API key was not bound to an institutional account."
+        )
+    return "HTTP 403 — Access denied (API quota, entitlement, or IP not recognized)."
+
+
 def try_elsevier_api_campus(doi, pii, output_dir, config):
     """
-    On campus network, the Elsevier Article Retrieval API returns the full
-    article XML/JSON. We parse it to extract the precise mmc file references
-    (including correct extensions), then download directly from CDN.
+    On campus network (or via explicit campus egress proxy / insttoken), the
+    Elsevier Article Retrieval API returns the full article XML/JSON. We parse
+    it to extract the precise mmc file references (including correct extensions),
+    then download directly from CDN.
     """
-    if not config.get("is_campus_network") and not config.get("elsevier_insttoken"):
+    campus_proxy = resolve_scansci_proxy(config, cli_proxy=(config or {}).get("_cli_proxy"))
+    if not config.get("is_campus_network") and not config.get("elsevier_insttoken") and not campus_proxy:
         return [], set()
 
     api_key = config.get("elsevier_api_key", "")
@@ -938,7 +1155,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         return [], set()
 
     try:
-        resp = requests.get(api_url, headers=headers, timeout=30)
+        resp = _elsevier_api_get(api_url, headers=headers, proxy=campus_proxy, timeout=30)
     except Exception as e:
         print(f"  [Tier A] API request failed: {e}")
         return [], set()
@@ -947,7 +1164,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
         if resp.status_code == 401:
             print(f"  [Tier A] HTTP 401 — API key rejected (not on campus network?).")
         elif resp.status_code == 403:
-            print(f"  [Tier A] HTTP 403 — Access denied (API quota or IP not recognized).")
+            print(f"  [Tier A] {_diagnose_elsevier_403(resp, has_proxy=bool(campus_proxy))}")
         elif resp.status_code == 404:
             print(f"  [Tier A] HTTP 404 — Article not in API index yet.")
         else:
@@ -1055,7 +1272,7 @@ def try_elsevier_api_campus(doi, pii, output_dir, config):
     # Download from CDN
     found_files = []
     cdn_base = f"https://ars.els-cdn.com/content/image/1-s2.0-{pii}"
-    dl_session = configure_session_direct(requests.Session())
+    dl_session = configure_session_direct(requests.Session(), proxy=campus_proxy)
     dl_session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
     manifest = load_download_manifest(output_dir)
 
@@ -1524,7 +1741,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
     print(f"  [FETCH] {fname} ...", end=" ", flush=True)
     last_error = ""  # P1 (50-paper test, Cause G): keep the last failure reason for the final FAIL line
 
-    # Method 1: requests (with cookies, verify=False for WebVPN SSL issues)
+    # Method 1: requests (with cookies; TLS verify follows session config)
     # H9: stream to a same-directory temp file, validate it, then commit
     # with os.replace; the final path never holds a partial file, and a
     # failure only ever discards the temp file.
@@ -1532,6 +1749,9 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         tmp_path = None
         try:
             sess_obj = session or configure_session_direct(requests.Session(), proxy=proxy)
+            _sess_verify = getattr(sess_obj, "verify", True)
+            if not isinstance(_sess_verify, bool):
+                _sess_verify = True
             req_headers = {"Referer": referer} if referer else {}
             if not session:
                 req_headers["User-Agent"] = (
@@ -1544,12 +1764,12 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 check_url = cand_or_url.extra_info.get("check_url")
                 if check_url:
                     try:
-                        sess_obj.post(check_url, timeout=15, verify=False, headers=req_headers)
+                        sess_obj.post(check_url, timeout=15, verify=_sess_verify, headers=req_headers)
                     except Exception:
                         pass
-                resp = sess_obj.post(post_url, data=post_data, timeout=30, stream=True, verify=False, headers=req_headers)
+                resp = sess_obj.post(post_url, data=post_data, timeout=30, stream=True, verify=_sess_verify, headers=req_headers)
             else:
-                resp = sess_obj.get(url, timeout=30, stream=True, verify=False, headers=req_headers)
+                resp = sess_obj.get(url, timeout=30, stream=True, verify=_sess_verify, headers=req_headers)
             if resp.status_code < 400:
                 hdr = {k.lower(): v for k, v in resp.headers.items()}
                 cd = hdr.get("content-disposition", "")
@@ -2093,7 +2313,10 @@ def fetch_page_html(
             req_timeout = 15.0
             if deadline is not None:
                 req_timeout = min(15.0, max(1.0, deadline - time.monotonic()))
-            resp = session.get(url, timeout=req_timeout, verify=False)
+            _sess_verify = getattr(session, "verify", True)
+            if not isinstance(_sess_verify, bool):
+                _sess_verify = True
+            resp = session.get(url, timeout=req_timeout, verify=_sess_verify)
             if resp.status_code < 400 and resp.status_code != 202:
                 enc = getattr(resp, "encoding", None)
                 if isinstance(enc, str) and enc.lower() in ("iso-8859-1", "latin-1", "latin1"):
@@ -2110,11 +2333,13 @@ def fetch_page_html(
                     is_challenge = is_blocked_page(text) or (
                         "/verify/" in final_url.lower() and "cnki.net" in final_url.lower()
                     )
-                    if HAS_SCANSCI:
+                    if HAS_SCANSCI and (_scansci_is_challenge_page or _scansci_is_elsevier_crasolve):
                         try:
-                            from scansci_pdf.publisher_strategies import _is_challenge_page, _is_elsevier_crasolve
                             visible_for_scan = strip_nonvisible_html(text)
-                            if _is_challenge_page(visible_for_scan) or _is_elsevier_crasolve(final_url, visible_for_scan):
+                            if (
+                                (_scansci_is_challenge_page and _scansci_is_challenge_page(visible_for_scan))
+                                or (_scansci_is_elsevier_crasolve and _scansci_is_elsevier_crasolve(final_url, visible_for_scan))
+                            ):
                                 is_challenge = True
                         except Exception:
                             pass
@@ -2821,6 +3046,16 @@ def run_download(args, bsk_runtime):
         config["crossref_email"] = os.environ["CROSSREF_EMAIL"].strip()
     if os.environ.get("UNPAYWALL_EMAIL"):
         config["unpaywall_email"] = os.environ["UNPAYWALL_EMAIL"].strip()
+    if os.environ.get("SCANSCI_PDF_PROXY"):
+        config["network_proxy"] = os.environ["SCANSCI_PDF_PROXY"].strip()
+    if proxy:
+        config["_cli_proxy"] = proxy
+    else:
+        cfg_proxy = resolve_scansci_proxy(config)
+        if cfg_proxy:
+            playwright_proxy_config(cfg_proxy)
+            proxy = cfg_proxy
+            print(f"  Proxy (config): {redact_proxy_url(proxy)}")
     os.makedirs(args.output_dir, exist_ok=True)
 
     if getattr(args, "browserskill", False):
@@ -2864,16 +3099,34 @@ def run_download(args, bsk_runtime):
     url = normalize_url(url)
     print(f"  Normalized:  {url}")
 
-    # Extract PII for Elsevier CDN (before WebVPN transformation)
+    # Extract PII for Elsevier CDN (before WebVPN / EZProxy transformation)
     pii = extract_pii_from_url(url) or extract_pii_from_url(doi)
 
-    # WebVPN URL conversion if configured and not disabled
-    if not args.no_vpn and HAS_SCANSCI and vpnsci_is_configured(config):
-        webvpn_base = _get_webvpn_base(config)
-        vpn_url = convert_url(url, webvpn_base, config)
-        if vpn_url and vpn_url != url:
-            print(f"  WebVPN URL:  {vpn_url}")
-            url = vpn_url
+    # Institutional URL conversion / campus connector routing
+    if not args.no_vpn and HAS_SCANSCI:
+        if _is_campus_connector_active(config):
+            socks5 = _scansci_get_socks5_proxy(config) if _scansci_get_socks5_proxy else ""
+            print(f"  [Campus Connector] EasyConnect/aTrust SOCKS5 direct mode active ({redact_proxy_url(socks5) if socks5 else 'proxy'})")
+        elif vpnsci_is_configured(config):
+            if _scansci_webvpn_session_status is not None and not getattr(args, "no_cookies", False):
+                try:
+                    wv_status = _scansci_webvpn_session_status(config)
+                    if wv_status == "expired":
+                        print("  [WebVPN] Saved WebVPN cookies appear expired; re-login via scansci-pdf or login_publishers.py if institutional access fails.")
+                    elif wv_status == "valid":
+                        print("  [WebVPN] Saved WebVPN session verified active.")
+                except Exception:
+                    pass
+            webvpn_base = _get_webvpn_base(config)
+            vpn_url = convert_url(url, webvpn_base, config)
+            if vpn_url and vpn_url != url:
+                print(f"  WebVPN URL:  {vpn_url}")
+                url = vpn_url
+        elif config.get("ezproxy_enabled") and _scansci_make_ezproxy_url is not None:
+            ez_url = _scansci_make_ezproxy_url(url, config)
+            if ez_url and ez_url != url:
+                print(f"  EZProxy URL: {ez_url}")
+                url = ez_url
 
     if pii:
         print(f"  Elsevier PII: {pii}")

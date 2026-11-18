@@ -9,6 +9,7 @@ Tracks per-source success rate and latency. Uses EMA so:
 from __future__ import annotations
 
 import json
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,14 @@ _ALPHA = 0.1
 # Initial score for unknown sources (neutral)
 _DEFAULT_SCORE = 0.5
 
+# Batch downloads run on a ThreadPoolExecutor, so every reader and writer here
+# is a worker thread. The table is parsed once per process instead of once per
+# call -- sort_sources alone did two reads per source per DOI, ~26 per DOI -- and
+# the read-modify-write in record_result holds this lock, so two workers cannot
+# overwrite each other's EMA update (#72).
+_LOCK = threading.Lock()
+_cache: dict[str, dict[str, Any]] | None = None
+
 
 def _load_scores() -> dict[str, dict[str, Any]]:
     if _SCORES_FILE.exists():
@@ -34,6 +43,19 @@ def _load_scores() -> dict[str, dict[str, Any]]:
     return {}
 
 
+def _scores_locked() -> dict[str, dict[str, Any]]:
+    """The live score table, read from disk on first use.
+
+    Callers must hold _LOCK: the returned dict is mutated in place before it is
+    written back, so sharing it without the lock would reintroduce the race this
+    exists to remove.
+    """
+    global _cache
+    if _cache is None:
+        _cache = _load_scores()
+    return _cache
+
+
 def _save_scores(scores: dict[str, dict[str, Any]]) -> None:
     _SCORES_FILE.parent.mkdir(parents=True, exist_ok=True)
     with _SCORES_FILE.open("w", encoding="utf-8") as f:
@@ -42,35 +64,36 @@ def _save_scores(scores: dict[str, dict[str, Any]]) -> None:
 
 def record_result(source: str, success: bool, latency_ms: float = 0, error_type: str = "") -> None:
     """Record a download attempt result for adaptive scoring."""
-    scores = _load_scores()
-    entry = scores.get(source, {
-        "success_ema": _DEFAULT_SCORE,
-        "latency_ema": 5000.0,
-        "attempts": 0,
-        "last_error": "",
-        "last_update": 0,
-    })
+    with _LOCK:
+        scores = _scores_locked()
+        entry = scores.get(source, {
+            "success_ema": _DEFAULT_SCORE,
+            "latency_ema": 5000.0,
+            "attempts": 0,
+            "last_error": "",
+            "last_update": 0,
+        })
 
-    # Update success EMA
-    success_val = 1.0 if success else 0.0
-    entry["success_ema"] = _ALPHA * success_val + (1 - _ALPHA) * entry["success_ema"]
+        # Update success EMA
+        success_val = 1.0 if success else 0.0
+        entry["success_ema"] = _ALPHA * success_val + (1 - _ALPHA) * entry["success_ema"]
 
-    # Update latency EMA (only on success)
-    if success and latency_ms > 0:
-        entry["latency_ema"] = _ALPHA * latency_ms + (1 - _ALPHA) * entry["latency_ema"]
+        # Update latency EMA (only on success)
+        if success and latency_ms > 0:
+            entry["latency_ema"] = _ALPHA * latency_ms + (1 - _ALPHA) * entry["latency_ema"]
 
-    entry["attempts"] = entry.get("attempts", 0) + 1
-    entry["last_error"] = error_type if not success else ""
-    entry["last_update"] = int(time.time())
+        entry["attempts"] = entry.get("attempts", 0) + 1
+        entry["last_error"] = error_type if not success else ""
+        entry["last_update"] = int(time.time())
 
-    scores[source] = entry
-    _save_scores(scores)
+        scores[source] = entry
+        _save_scores(scores)
 
 
 def get_score(source: str) -> float:
     """Get adaptive score for a source (0.0-1.0, higher = better)."""
-    scores = _load_scores()
-    entry = scores.get(source)
+    with _LOCK:
+        entry = _scores_locked().get(source)
     if not entry:
         return _DEFAULT_SCORE
     return entry.get("success_ema", _DEFAULT_SCORE)
@@ -78,8 +101,8 @@ def get_score(source: str) -> float:
 
 def get_latency(source: str) -> float:
     """Get EMA latency for a source in ms."""
-    scores = _load_scores()
-    entry = scores.get(source)
+    with _LOCK:
+        entry = _scores_locked().get(source)
     if not entry:
         return 5000.0
     return entry.get("latency_ema", 5000.0)
@@ -119,16 +142,17 @@ def get_user_advice(error_type: str, source: str) -> str:
     """Return user-friendly advice with actionable steps."""
     advice = {
         "not_found": "论文在此源不存在（404），跳过",
-        "forbidden": "访问被拒绝（403）→ 建议：1) 配置代理 config_set network_proxy 2) 启用 WebVPN 3) 换用 strategy=legal_only",
+        "forbidden": "访问被拒绝（403）→ 建议：1) 配置代理 config_set network_proxy 2) 启用 WebVPN",
         "rate_limited": "请求过于频繁（429）→ 建议：稍后重试，或配置 openalex_api_key 提升配额",
         "timeout": "连接超时 → 建议：1) 检查网络连通性 2) 配置代理绕过封锁 config_set network_proxy 3) 启用 Tor（tor_start）",
-        "captcha": "触发 Cloudflare 防护 → 建议：1) 启动 camofox-browser（默认端口 9377）2) 配置代理",
+        "captcha": "触发 Cloudflare 防护 → 建议：1) 安装浏览器后端 (pip install 'scansci-pdf[patchright]') 2) 配置代理",
         "ssl_error": "SSL 连接错误 → 建议：1) 检查代理是否正确 2) 尝试不同代理协议（socks5/http）3) 更新证书",
         "server_error": "服务器错误（5xx）→ 暂时不可用，稍后重试",
         "dns_blocked": "DNS 解析失败 → 建议：1) 配置代理 config_set network_proxy 2) 更换 DNS（8.8.8.8）3) 启用 Tor",
         "network_blocked": "网络完全不通 → 建议：1) 检查代理配置 config_set network_proxy 2) 使用 WebVPN 机构代理 3) 换用海外网络",
-        "paywall": "论文需要机构订阅 → 运行 scansci_pdf_camofox_login 或 scansci_pdf_vpnsci_login 登录机构账号",
-        "cloudflare_blocked": "Cloudflare 反爬封锁 → 启动 camofox-browser（端口 9377）或配置代理",
+        "paywall": "论文需要机构订阅 → 运行 scansci_pdf_browser_login 或 scansci_pdf_instsci_login 登录机构账号",
+        "cloudflare_blocked": "Cloudflare 反爬封锁 → 安装浏览器后端 (pip install 'scansci-pdf[patchright]') 或配置代理",
+        "caj_format": "知网返回 CAJ 格式 → 用 CAJViewer 打开，或用 caj2pdf 转换 PDF；详情页有 PDF 按钮时优先重试 PDF",
     }
     return advice.get(error_type, "未知错误 → 建议：运行 network_diagnose 检查网络状态")
 
@@ -171,7 +195,7 @@ def diagnose_network(config: dict[str, Any] | None = None) -> dict[str, Any]:
 
     # Test DNS resolution
     test_domains = [
-        ("sci-hub.st", "Sci-Hub"),
+        ("sci-hub.mksa.top", "Sci-Hub"),
         ("api.openalex.org", "OpenAlex"),
         ("doi.org", "DOI"),
     ]
@@ -185,7 +209,7 @@ def diagnose_network(config: dict[str, Any] | None = None) -> dict[str, Any]:
 
     # Test TCP connectivity
     tcp_tests = [
-        ("sci-hub.st", 443, "Sci-Hub HTTPS"),
+        ("sci-hub.mksa.top", 443, "Sci-Hub HTTPS"),
         ("api.openalex.org", 443, "OpenAlex HTTPS"),
     ]
     for host, port, label in tcp_tests:
@@ -202,7 +226,7 @@ def diagnose_network(config: dict[str, Any] | None = None) -> dict[str, Any]:
     if active_proxy:
         try:
             import requests
-            resp = requests.get("https://sci-hub.st", timeout=10,
+            resp = requests.get("https://sci-hub.mksa.top", timeout=10,
                               proxies={"https": active_proxy, "http": active_proxy},
                               headers={"User-Agent": "Mozilla/5.0"})
             report["tests"].append({"target": "Sci-Hub via proxy", "status": resp.status_code})
@@ -222,18 +246,18 @@ def diagnose_network(config: dict[str, Any] | None = None) -> dict[str, Any]:
     except Exception:
         report["tests"].append({"target": "Tor SOCKS5", "status": "unknown"})
 
-    # Check camofox-browser
+    # Check browser
     try:
-        from ..camofox import is_available as camofox_avail
-        if camofox_avail(config):
-            report["tests"].append({"target": "camofox-browser", "status": "running"})
+        from ..browser_engine import is_available as browser_avail
+        if browser_avail(config):
+            report["tests"].append({"target": "browser", "status": "available"})
         else:
-            report["tests"].append({"target": "camofox-browser", "status": "not running"})
+            report["tests"].append({"target": "browser", "status": "not installed"})
             report["recommendations"].append(
-                "camofox-browser 未运行 → 如遇 Cloudflare 封锁，启动 camofox-browser (默认端口 9377)"
+                "浏览器后端不可用 → 如遇 Cloudflare 封锁，运行: pip install 'scansci-pdf[patchright]'"
             )
     except Exception:
-        report["tests"].append({"target": "camofox-browser", "status": "not installed"})
+        report["tests"].append({"target": "browser", "status": "not installed"})
 
 
     # Summary
