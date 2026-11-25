@@ -2399,6 +2399,129 @@ def _merge_blocked_domains(url: str, existing_domains, proxy: str = "") -> set[s
     return merged
 
 
+def _get_profile_and_reaper_helpers():
+    """Import persistent-profile and browser-reaper helpers from playwright_utils."""
+    try:
+        from playwright_utils import (
+            resolve_persistent_profile_dir,
+            acquire_profile_dir,
+            release_profile_dir,
+            is_profile_lock_error,
+            register_live_browser,
+            close_and_unregister_browser,
+        )
+        return (
+            resolve_persistent_profile_dir,
+            acquire_profile_dir,
+            release_profile_dir,
+            is_profile_lock_error,
+            register_live_browser,
+            close_and_unregister_browser,
+        )
+    except ImportError:
+        return (
+            lambda **kw: None,
+            lambda p: None,
+            lambda p: None,
+            lambda e: False,
+            lambda *a, **k: None,
+            lambda obj, **k: (obj.__exit__(None, None, None) if k.get("use_context_manager") and hasattr(obj, "__exit__") else (obj.close() if obj is not None and hasattr(obj, "close") else None)),
+        )
+
+
+def start_managed_stealthy_session(
+    session_cls,
+    session_kwargs: Dict[str, Any],
+    *,
+    profile_dir: Optional[str] = None,
+    persistent_profile: bool = True,
+    use_context_manager: bool = False,
+):
+    """Instantiate and start a ``StealthySession`` with persistent profile & exit reaping.
+
+    - When ``cdp_url`` is not set and ``user_data_dir`` is not explicitly disabled
+      (``""``), resolves and claims a persistent browser profile directory so
+      cookies, localStorage, and browser fingerprint persist across runs.
+    - If another Chromium process holds a lock on the profile directory, cleanly
+      retries once with an ephemeral temporary profile without interfering with
+      non-lock errors (e.g. proxy/tunnel errors).
+    - Registers the started session with the ``atexit`` cross-platform process-tree
+      reaper so interrupted runs never leave orphan Chromium processes.
+
+    Returns ``(session_instance, acquired_profile_dir)``.
+    """
+    (
+        resolve_profile,
+        acquire_profile,
+        release_profile,
+        is_lock_err,
+        register_browser,
+        close_browser,
+    ) = _get_profile_and_reaper_helpers()
+
+    kw = dict(session_kwargs)
+    acquired_profile = None
+    explicit_udd = kw.get("user_data_dir", None)
+    if kw.get("cdp_url"):
+        kw.pop("user_data_dir", None)
+    elif explicit_udd == "":
+        # Explicit empty string disables persistent profile for this call.
+        kw.pop("user_data_dir", None)
+    else:
+        resolved = resolve_profile(
+            profile_dir=explicit_udd or profile_dir,
+            real_chrome=bool(kw.get("real_chrome", False)),
+            enabled=bool(persistent_profile),
+        )
+        acquired_profile = acquire_profile(resolved)
+        if acquired_profile:
+            kw["user_data_dir"] = acquired_profile
+        else:
+            kw.pop("user_data_dir", None)
+
+    def _boot(opts: Dict[str, Any]):
+        inst = session_cls(**opts)
+        if use_context_manager and hasattr(inst, "__enter__"):
+            inst.__enter__()
+        elif hasattr(inst, "start"):
+            inst.start()
+        return inst
+
+    engine = None
+    try:
+        engine = _boot(kw)
+    except Exception as exc:
+        if acquired_profile and is_lock_err(exc):
+            if engine is not None:
+                close_browser(engine, profile_dir=acquired_profile, use_context_manager=use_context_manager)
+            else:
+                release_profile(acquired_profile)
+            acquired_profile = None
+            retry_kw = dict(kw)
+            retry_kw.pop("user_data_dir", None)
+            engine = _boot(retry_kw)
+        else:
+            if engine is not None:
+                close_browser(engine, profile_dir=acquired_profile, use_context_manager=use_context_manager)
+            elif acquired_profile:
+                release_profile(acquired_profile)
+            raise
+
+    register_browser(engine, profile_dir=acquired_profile, use_context_manager=use_context_manager)
+    return engine, acquired_profile
+
+
+def close_managed_stealthy_session(
+    engine: Any,
+    *,
+    profile_dir: Optional[str] = None,
+    use_context_manager: bool = False,
+) -> None:
+    """Close a session started via ``start_managed_stealthy_session`` and reap if needed."""
+    (_, _, _, _, _, close_browser) = _get_profile_and_reaper_helpers()
+    close_browser(engine, profile_dir=profile_dir, use_context_manager=use_context_manager)
+
+
 def stealthy_fetch_bounded(fetcher_cls, url: str, **kwargs):
     """Call ``fetcher_cls.fetch(url, **kwargs)`` while honouring ``timeout < 60000``
     even when ``solve_cloudflare=True``.
@@ -2515,7 +2638,12 @@ def stealthy_fetch_bounded(fetcher_cls, url: str, **kwargs):
     if wait_ms is not None:
         fetch_kwargs["wait"] = min(int(wait_ms), max(0, req_ms // 3))
 
-    with StealthySession(**session_kwargs) as engine:
+    engine, acquired_profile = start_managed_stealthy_session(
+        StealthySession,
+        session_kwargs,
+        use_context_manager=True,
+    )
+    try:
         try:
             return engine.fetch(url, **fetch_kwargs)
         except Exception as exc:
@@ -2530,6 +2658,12 @@ def stealthy_fetch_bounded(fetcher_cls, url: str, **kwargs):
             retry_kwargs = dict(fetch_kwargs)
             retry_kwargs["timeout"] = max(1000, min(req_ms, int(rem_s * 1000)))
             return engine.fetch(url, **retry_kwargs)
+    finally:
+        close_managed_stealthy_session(
+            engine,
+            profile_dir=acquired_profile,
+            use_context_manager=True,
+        )
 
 
 # A .pdf candidate is a real supplement file here (candidates are already
@@ -2611,7 +2745,7 @@ def has_gui_display() -> bool:
 
 
 def add_auto_browser_arguments(parser) -> None:
-    """Register opt-out flags for automatic live-browser / headful recovery."""
+    """Register opt-out flags for automatic live-browser / headful recovery and persistent profile."""
     parser.add_argument(
         "--no-cdp",
         action="store_true",
@@ -2623,6 +2757,16 @@ def add_auto_browser_arguments(parser) -> None:
         dest="no_auto_headful",
         action="store_true",
         help="Disable automatic standalone headful Chrome fallback on blocked/empty discovery",
+    )
+    parser.add_argument(
+        "--profile-dir",
+        default=None,
+        help="Persistent stealth browser user_data_dir (default: ~/.journal_supp_downloader_profile/browser_profile/<channel>)",
+    )
+    parser.add_argument(
+        "--no-persistent-profile",
+        action="store_true",
+        help="Disable persistent stealth browser profile and use a fresh temporary profile per session",
     )
 
 
@@ -5969,6 +6113,8 @@ class RepoBrowserSession:
         explicit_budget=None,
         bsk_fetch=None,
         allow_auto_headful: bool = True,
+        profile_dir: Optional[str] = None,
+        persistent_profile: bool = True,
     ):
         self.play_cookies = play_cookies
         self.headful = bool(headful)
@@ -5980,7 +6126,10 @@ class RepoBrowserSession:
         self.explicit_budget = explicit_budget
         self.bsk_fetch = bsk_fetch
         self.allow_auto_headful = bool(allow_auto_headful)
+        self.profile_dir = profile_dir
+        self.persistent_profile = bool(persistent_profile)
         self._engine = None
+        self._acquired_profile = None
 
     def _ensure_engine(self, first_url: str):
         if self._engine is not None:
@@ -6012,9 +6161,15 @@ class RepoBrowserSession:
                     kwargs["cookies"] = norm
             except Exception:
                 pass
-        eng = StealthySession(**kwargs)
-        eng.__enter__()
+        eng, acquired = start_managed_stealthy_session(
+            StealthySession,
+            kwargs,
+            profile_dir=self.profile_dir,
+            persistent_profile=self.persistent_profile,
+            use_context_manager=True,
+        )
         self._engine = eng
+        self._acquired_profile = acquired
         return eng
 
     def _merge_page_cookies(self, page):
@@ -6115,10 +6270,15 @@ class RepoBrowserSession:
     def close(self):
         if self._engine is not None:
             try:
-                self._engine.__exit__(None, None, None)
+                close_managed_stealthy_session(
+                    self._engine,
+                    profile_dir=self._acquired_profile,
+                    use_context_manager=True,
+                )
             except Exception:
                 pass
             self._engine = None
+            self._acquired_profile = None
 
 
 def single_line(text, max_len: int = 1000) -> str:
@@ -7032,6 +7192,7 @@ _LOCAL_ENV_TO_CONFIG_KEY = {
     "OPENALEX_API_KEY": "openalex_api_key",
     "CORE_API_KEY": "core_api_key",
     "SCANSCI_PDF_PROXY": "network_proxy",
+    "JOURNAL_SUPP_BROWSER_PROFILE_DIR": "browser_profile_dir",
 }
 
 

@@ -19,7 +19,6 @@ import os
 import json
 import subprocess
 import time
-from playwright.sync_api import sync_playwright
 
 scripts_dir = os.path.dirname(os.path.abspath(__file__))
 if scripts_dir not in sys.path:
@@ -35,6 +34,7 @@ try:
         extract_cdp_cookies,
         merge_cookies,
         normalize_playwright_cookies,
+        get_sync_playwright,
     )
 except ImportError:
     find_playwright_chromium = lambda: None
@@ -45,6 +45,15 @@ except ImportError:
     extract_cdp_cookies = lambda ep, timeout=4.0: []
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
     normalize_playwright_cookies = lambda c, default_url=None: c
+    def get_sync_playwright():
+        try:
+            from patchright.sync_api import sync_playwright as _sp
+            return _sp
+        except ImportError:
+            from playwright.sync_api import sync_playwright as _sp
+            return _sp
+
+sync_playwright = get_sync_playwright()
 
 
 def save_merged_cookies(new_cookies, output_path):

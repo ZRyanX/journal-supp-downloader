@@ -4,11 +4,342 @@ import re
 import glob
 import json
 import time
+import atexit
+import signal
 import shutil
 import socket
+import subprocess
+import threading
 import urllib.parse
 import urllib.request
 from typing import List, Dict, Any, Optional, Tuple
+
+
+# ── Patchright-first Sync Playwright Loader ───────────────────────────────────
+
+def get_sync_playwright():
+    """Return the preferred ``sync_playwright`` callable (patchright first, playwright fallback).
+
+    Using ``patchright`` for CDP connections avoids stock Playwright's
+    ``Runtime.enable`` automation leak on strict sites. If a caller or test has
+    explicitly monkeypatched ``playwright.sync_api.sync_playwright``, honor that
+    patched callable so existing mock-based tests remain compatible.
+    """
+    pw_mod = sys.modules.get("playwright.sync_api")
+    if pw_mod is not None:
+        pw_fn = getattr(pw_mod, "sync_playwright", None)
+        if pw_fn is not None and not (
+            getattr(pw_fn, "__module__", "") == "playwright.sync_api"
+            and getattr(pw_fn, "__qualname__", "") == "sync_playwright"
+        ):
+            return pw_fn
+    try:
+        from patchright.sync_api import sync_playwright
+        return sync_playwright
+    except ImportError:
+        from playwright.sync_api import sync_playwright
+        return sync_playwright
+
+
+# ── Persistent Browser Profile Management ─────────────────────────────────────
+
+DEFAULT_PERSISTENT_PROFILE_SUBDIR = os.path.join(".journal_supp_downloader_profile", "browser_profile")
+
+_PROFILE_LOCK_ERROR_MARKERS = (
+    "processsingleton",
+    "singletonlock",
+    "user data directory is already in use",
+    "profile appears to be in use",
+    "cannot lock",
+    "failed to create a processsingleton",
+    "already in use by another",
+    "browser profile is locked",
+)
+
+_ACTIVE_PROFILE_DIRS: set = set()
+_ACTIVE_PROFILE_LOCK = threading.Lock()
+_PROFILE_TLS = threading.local()
+
+
+def set_thread_persistent_profile(
+    *,
+    profile_dir: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> Tuple[Optional[str], Optional[bool]]:
+    """Set thread-local persistent profile defaults and return previous ``(profile_dir, enabled)``."""
+    prev = (
+        getattr(_PROFILE_TLS, "profile_dir", None),
+        getattr(_PROFILE_TLS, "enabled", None),
+    )
+    _PROFILE_TLS.profile_dir = profile_dir
+    _PROFILE_TLS.enabled = enabled
+    return prev
+
+
+def is_persistent_profile_enabled(no_persistent_profile: bool = False, config: Optional[Dict[str, Any]] = None) -> bool:
+    """Return True unless persistent stealth browser profile is explicitly disabled."""
+    if no_persistent_profile:
+        return False
+    env_disable = os.environ.get("JOURNAL_SUPP_NO_PERSISTENT_PROFILE", "").strip().lower()
+    if env_disable in ("1", "true", "yes", "y"):
+        return False
+    if isinstance(config, dict) and "persistent_browser_profile" in config:
+        val = config.get("persistent_browser_profile")
+        if isinstance(val, bool):
+            return val
+        if str(val).strip().lower() in ("0", "false", "no", "n", "off"):
+            return False
+    tls_enabled = getattr(_PROFILE_TLS, "enabled", None)
+    if tls_enabled is not None:
+        return bool(tls_enabled)
+    return True
+
+
+def resolve_persistent_profile_dir(
+    *,
+    profile_dir: Optional[str] = None,
+    real_chrome: bool = False,
+    enabled: bool = True,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Resolve the persistent ``user_data_dir`` path for standalone stealth browsers.
+
+    Precedence:
+      1. Explicit *profile_dir* argument (used as-is)
+      2. Thread-local run default set via ``set_thread_persistent_profile`` (used as-is)
+      3. ``JOURNAL_SUPP_BROWSER_PROFILE_DIR`` env var (used as-is)
+      4. ``config['browser_profile_dir']`` (used as-is)
+      5. Default ``~/.journal_supp_downloader_profile/browser_profile/<channel>``
+         where ``<channel>`` is ``chrome`` for ``real_chrome=True`` and
+         ``chromium`` otherwise, avoiding SQLite schema clashes and profile
+         locks between bundled Chromium and system Chrome.
+    """
+    if not enabled or not is_persistent_profile_enabled(config=config):
+        return None
+    tls_dir = getattr(_PROFILE_TLS, "profile_dir", None)
+    explicit = (
+        (profile_dir or "").strip()
+        or (tls_dir or "").strip()
+        or os.environ.get("JOURNAL_SUPP_BROWSER_PROFILE_DIR", "").strip()
+        or str((config or {}).get("browser_profile_dir") or "").strip()
+    )
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+    channel = "chrome" if real_chrome else "chromium"
+    return os.path.abspath(
+        os.path.join(os.path.expanduser("~"), DEFAULT_PERSISTENT_PROFILE_SUBDIR, channel)
+    )
+
+
+def is_profile_lock_error(error: Any) -> bool:
+    """True when *error* indicates a Chromium persistent profile directory lock/conflict."""
+    msg = str(error or "").lower()
+    return any(marker in msg for marker in _PROFILE_LOCK_ERROR_MARKERS)
+
+
+def acquire_profile_dir(profile_dir: Optional[str]) -> Optional[str]:
+    """Claim an in-process lock on *profile_dir* and ensure the directory exists.
+
+    Returns the normalized path on success, or ``None`` if *profile_dir* is empty,
+    already held by another active session in this process, or cannot be created.
+    """
+    if not profile_dir:
+        return None
+    norm = os.path.normcase(os.path.abspath(os.path.expanduser(str(profile_dir))))
+    raw_abs = os.path.abspath(os.path.expanduser(str(profile_dir)))
+    with _ACTIVE_PROFILE_LOCK:
+        if norm in _ACTIVE_PROFILE_DIRS:
+            return None
+        try:
+            os.makedirs(raw_abs, exist_ok=True)
+        except OSError:
+            return None
+        _ACTIVE_PROFILE_DIRS.add(norm)
+    return raw_abs
+
+
+def release_profile_dir(profile_dir: Optional[str]) -> None:
+    """Release an in-process profile lock previously acquired via ``acquire_profile_dir``."""
+    if not profile_dir:
+        return
+    norm = os.path.normcase(os.path.abspath(os.path.expanduser(str(profile_dir))))
+    with _ACTIVE_PROFILE_LOCK:
+        _ACTIVE_PROFILE_DIRS.discard(norm)
+
+
+# ── Cross-Platform Browser Process-Tree Reaper ────────────────────────────────
+
+_LIVE_BROWSERS: Dict[int, Dict[str, Any]] = {}
+_LIVE_BROWSERS_LOCK = threading.Lock()
+
+
+def _is_process_alive(proc: Any) -> bool:
+    """Check whether a Popen, asyncio.subprocess.Process, or multiprocessing.Process is alive."""
+    if proc is None:
+        return False
+    try:
+        if hasattr(proc, "poll") and callable(proc.poll):
+            return proc.poll() is None
+        if hasattr(proc, "returncode"):
+            return proc.returncode is None
+        if hasattr(proc, "is_alive") and callable(proc.is_alive):
+            return bool(proc.is_alive())
+    except Exception:
+        return True
+    return True
+
+
+def extract_driver_process(obj: Any) -> Any:
+    """Extract the underlying Playwright/Patchright driver process handle from a session/browser."""
+    if obj is None:
+        return None
+    candidates = [obj]
+    for attr in ("playwright", "browser", "context", "_engine"):
+        sub = getattr(obj, attr, None)
+        if sub is not None:
+            candidates.append(sub)
+    for item in candidates:
+        try:
+            impl = getattr(item, "_impl_obj", None)
+            conn = getattr(impl, "_connection", None)
+            transport = getattr(conn, "_transport", None)
+            proc = getattr(transport, "_proc", None)
+            if proc is not None:
+                return proc
+        except Exception:
+            continue
+    return None
+
+
+def tree_kill_process(proc: Any) -> bool:
+    """Force-kill a browser driver process and its child tree (Windows-safe).
+
+    Returns True when a kill command/signal was issued for a live process.
+    """
+    if proc is None or not _is_process_alive(proc):
+        return False
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return False
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=15,
+            )
+            return True
+        except Exception:
+            return False
+    killed = False
+    try:
+        if hasattr(proc, "kill") and callable(proc.kill):
+            proc.kill()
+            killed = True
+    except Exception:
+        pass
+    if not killed:
+        try:
+            os.kill(int(pid), getattr(signal, "SIGKILL", 9))
+            killed = True
+        except Exception:
+            pass
+    return killed
+
+
+def register_live_browser(
+    session_or_browser: Any,
+    *,
+    profile_dir: Optional[str] = None,
+    use_context_manager: bool = False,
+) -> None:
+    """Register an active browser/session for deterministic cleanup at process exit."""
+    if session_or_browser is None:
+        return
+    proc = extract_driver_process(session_or_browser)
+    with _LIVE_BROWSERS_LOCK:
+        _LIVE_BROWSERS[id(session_or_browser)] = {
+            "obj": session_or_browser,
+            "proc": proc,
+            "profile_dir": profile_dir,
+            "use_context_manager": bool(use_context_manager),
+        }
+
+
+def unregister_live_browser(session_or_browser: Any) -> Optional[Dict[str, Any]]:
+    """Remove *session_or_browser* from the exit reaper registry and return its metadata."""
+    if session_or_browser is None:
+        return None
+    with _LIVE_BROWSERS_LOCK:
+        return _LIVE_BROWSERS.pop(id(session_or_browser), None)
+
+
+def close_and_unregister_browser(
+    session_or_browser: Any,
+    *,
+    profile_dir: Optional[str] = None,
+    use_context_manager: Optional[bool] = None,
+) -> None:
+    """Close *session_or_browser*, release its profile lock, and tree-kill any surviving driver."""
+    meta = unregister_live_browser(session_or_browser) or {}
+    effective_profile = profile_dir if profile_dir is not None else meta.get("profile_dir")
+    effective_cm = meta.get("use_context_manager", False) if use_context_manager is None else bool(use_context_manager)
+    proc = extract_driver_process(session_or_browser) or meta.get("proc")
+    try:
+        if session_or_browser is not None:
+            if effective_cm and hasattr(session_or_browser, "__exit__"):
+                session_or_browser.__exit__(None, None, None)
+            elif hasattr(session_or_browser, "close"):
+                session_or_browser.close()
+            elif hasattr(session_or_browser, "__exit__"):
+                session_or_browser.__exit__(None, None, None)
+    except Exception:
+        pass
+    finally:
+        if proc is not None and _is_process_alive(proc):
+            try:
+                tree_kill_process(proc)
+            except Exception:
+                pass
+        if effective_profile:
+            release_profile_dir(effective_profile)
+
+
+def reap_live_browsers() -> int:
+    """Close and force-reap every still-registered browser session (atexit backstop)."""
+    with _LIVE_BROWSERS_LOCK:
+        entries = list(_LIVE_BROWSERS.values())
+        _LIVE_BROWSERS.clear()
+    reaped = 0
+    for entry in entries:
+        obj = entry.get("obj")
+        proc = extract_driver_process(obj) or entry.get("proc")
+        profile_dir = entry.get("profile_dir")
+        use_cm = bool(entry.get("use_context_manager", False))
+        try:
+            if obj is not None:
+                if use_cm and hasattr(obj, "__exit__"):
+                    obj.__exit__(None, None, None)
+                elif hasattr(obj, "close"):
+                    obj.close()
+                elif hasattr(obj, "__exit__"):
+                    obj.__exit__(None, None, None)
+        except Exception:
+            pass
+        finally:
+            if proc is not None and _is_process_alive(proc):
+                try:
+                    tree_kill_process(proc)
+                except Exception:
+                    pass
+            if profile_dir:
+                release_profile_dir(profile_dir)
+            reaped += 1
+    return reaped
+
+
+atexit.register(reap_live_browsers)
 
 
 def find_playwright_chromium():
@@ -409,7 +740,7 @@ def extract_cdp_cookies(endpoint_or_port, timeout: float = 4.0) -> List[Dict[str
         target = f"http://127.0.0.1:{target}"
 
     try:
-        from playwright.sync_api import sync_playwright
+        sync_playwright = get_sync_playwright()
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(target, timeout=int(timeout * 1000))
             cookies = []
@@ -503,7 +834,7 @@ def fetch_page_via_cdp(endpoint_or_port, target_url: str, wait_selector: Optiona
     if target.isdigit():
         target = f"http://127.0.0.1:{target}"
 
-    from playwright.sync_api import sync_playwright
+    sync_playwright = get_sync_playwright()
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(target, timeout=int(timeout * 1000))

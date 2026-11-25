@@ -84,6 +84,8 @@ from supp_finder import (
     browser_budget_from_args,
     ensure_phase_browser_budget,
     stealthy_fetch_bounded,
+    start_managed_stealthy_session,
+    close_managed_stealthy_session,
     fetch_sciengine_api_candidates,
     load_local_skill_config,
     configure_session_direct,
@@ -103,6 +105,7 @@ try:
         merge_cookies,
         fetch_page_via_cdp,
         download_via_playwright_request,
+        is_persistent_profile_enabled,
     )
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
@@ -112,6 +115,7 @@ except ImportError:
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
     fetch_page_via_cdp = lambda ep, url, wait_selector=None, timeout=30.0: None
     download_via_playwright_request = lambda context, url, dest_path, headers=None, timeout_ms=30000: (False, "")
+    is_persistent_profile_enabled = lambda no_persistent_profile=False, config=None: not no_persistent_profile
 
 from browserskill_adapter import (
     BrowserSkillError,
@@ -250,6 +254,8 @@ def download_file(
     error_out=None,
     headful: bool = False,
     real_chrome: bool = False,
+    profile_dir=None,
+    persistent_profile: bool = True,
 ):
     """
     Download a single file using HTTP Fetcher, falling back to BrowserSkill or
@@ -474,8 +480,13 @@ def download_file(
                     session_stealth = stealth_session_holder["session"]
                     context = session_stealth.context
                 else:
-                    session_stealth = StealthySession(**_stealth_kwargs)
-                    session_stealth.start()
+                    session_stealth, _acquired_profile = start_managed_stealthy_session(
+                        StealthySession,
+                        _stealth_kwargs,
+                        profile_dir=profile_dir,
+                        persistent_profile=persistent_profile,
+                        use_context_manager=False,
+                    )
                     context = session_stealth.context
                     if cookies:
                         normalized_c = normalize_playwright_cookies(cookies, default_url=url)
@@ -485,6 +496,7 @@ def download_file(
                             except Exception:
                                 pass
                     stealth_session_holder["session"] = session_stealth
+                    stealth_session_holder["profile_dir"] = _acquired_profile
 
                 page = context.new_page()
                 try:
@@ -597,10 +609,15 @@ def download_file(
                 last_err = f"{last_err}; browser: {single_line(b_exc)}"
                 if session_stealth is not None and stealth_session_holder.get("session") is session_stealth:
                     try:
-                        session_stealth.close()
+                        close_managed_stealthy_session(
+                            session_stealth,
+                            profile_dir=stealth_session_holder.get("profile_dir"),
+                            use_context_manager=False,
+                        )
                     except Exception:
                         pass
                     stealth_session_holder["session"] = None
+                    stealth_session_holder["profile_dir"] = None
             finally:
                 if page is not None:
                     try:
@@ -888,6 +905,11 @@ def run_download(args, bsk_runtime):
 
     # Load saved cookies if available from login_publishers.py
     local_cfg = load_local_skill_config()
+    effective_profile_dir = getattr(args, "profile_dir", None) or local_cfg.get("browser_profile_dir")
+    persistent_profile = is_persistent_profile_enabled(
+        no_persistent_profile=bool(getattr(args, "no_persistent_profile", False)),
+        config=local_cfg,
+    )
     cookies = load_saved_cookies()
     if cookies:
         print(f"Loaded {len(cookies)} saved cookies from login wizard profile.")
@@ -916,6 +938,10 @@ def run_download(args, bsk_runtime):
         "page_action": expand_page_accordions_action,
         "google_search": False,
     }
+    if not persistent_profile:
+        fetch_kwargs["user_data_dir"] = ""
+    elif effective_profile_dir:
+        fetch_kwargs["user_data_dir"] = effective_profile_dir
     # P1 round-3 minor (a): the MITM proxy's CA trust config. fetch_kwargs
     # is built once and every later fetch copies it (CDP retry, OA mirror,
     # browser retry), so first call and retries carry identical proxy +
@@ -1848,6 +1874,8 @@ def run_download(args, bsk_runtime):
         explicit_budget=getattr(args, "browser_fallback_budget", None),
         bsk_fetch=_repo_bsk_fetch,
         allow_auto_headful=bool((not getattr(args, "no_auto_headful", False)) and has_gui_display()),
+        profile_dir=effective_profile_dir,
+        persistent_profile=persistent_profile,
     )
     try:
         candidates = expand_repository_candidates(candidates, proxy=args.proxy, browser_fetch=_repo_browser.fetch)
@@ -1914,6 +1942,8 @@ def run_download(args, bsk_runtime):
             error_out=err_info,
             headful=effective_headful,
             real_chrome=effective_real_chrome,
+            profile_dir=effective_profile_dir,
+            persistent_profile=persistent_profile,
         )
         if res:
             return res
@@ -1931,6 +1961,8 @@ def run_download(args, bsk_runtime):
                     error_out={},
                     headful=effective_headful,
                     real_chrome=effective_real_chrome,
+                    profile_dir=effective_profile_dir,
+                    persistent_profile=persistent_profile,
                 )
                 if alt_res:
                     return alt_res
@@ -1945,9 +1977,15 @@ def run_download(args, bsk_runtime):
         _shared_sess = stealth_session_holder.get("session")
         if _shared_sess is not None:
             try:
-                _shared_sess.close()
+                close_managed_stealthy_session(
+                    _shared_sess,
+                    profile_dir=stealth_session_holder.get("profile_dir"),
+                    use_context_manager=False,
+                )
             except Exception:
                 pass
+            stealth_session_holder["session"] = None
+            stealth_session_holder["profile_dir"] = None
     if mirrors.info and mirrors.info.title:
         _refresh_title_and_dir_from_html_or_str(mirrors.info.title, is_raw_title=True)
     incomplete, reason = evidence.check(successful)

@@ -34,7 +34,7 @@
   - **Tier 0**：Elsevier CDN 直链探测（无需 API 认证，快速探测 `mmc*.xlsx/pdf/zip`）。
   - **Tier 1**：静态页面与 `Requests` 会话提取（带 Cookie 与直连重试；自动修复 ISO-8859-1 中文文件名并按文件魔数校正 `.bin` 扩展名）。
   - **Tier 2**：Scrapling 隐匿浏览器渲染（`stealthy_fetch_bounded`，自动拦截阻塞页面渲染的第三方挂起域名，如 GSW/Silverchair 页面上的 `ajax.googleapis.com`）。
-  - **Tier 3 / Tier 3-Auto (自动分级浏览器接管)**：当常规抓取遇拦截（401/403/CF）或未命中/缺漏附件时，在 `--browser-fallback-budget`（默认 `60s`）与 `--phase-timeout`（默认 `150s`）预算内按优先级自动尝试：**已就绪的 Tencent BrowserSkill (`bsk`) → 本地活动 Chrome `--cdp` 自动探测 → 独立有头真 Chrome (`--headful`)**（支持 `--no-bsk`、`--no-cdp`、`--no-auto-headful` 按项关闭）。
+  - **Tier 3 / Tier 3-Auto (自动分级浏览器接管)**：当常规抓取遇拦截（401/403/CF）或未命中/缺漏附件时，在 `--browser-fallback-budget`（默认 `60s`）与 `--phase-timeout`（默认 `150s`）预算内按优先级自动尝试：**已就绪的 Tencent BrowserSkill (`bsk`) → 本地活动 Chrome `--cdp`（优先 `patchright` 连接） → 独立有头真 Chrome (`--headful`)**（支持 `--no-bsk`、`--no-cdp`、`--no-auto-headful` 按项关闭）。独立隐匿浏览器默认启用按渠道隔离的持久化 Profile（支持 `--profile-dir` / `--no-persistent-profile` 与锁冲突自动回退）及跨平台 `atexit` 进程树回收。
   - **Crossref 多出版商回退 (`[chooser-alt]`)**：主出版商无候选或受限时（例如 Lyell Collection `10.1144/` 无订阅权限），自动通过 Crossref 切换同 DOI 的替代出版商宿主（如 GeoScienceWorld）继续发现。
   - **Tier OA 与外部数据仓储穿透**：集成 Unpaywall & OpenAlex（PMC/Europe PMC）及 **Figshare（REST API + `__APOLLO_STATE__`）、ScienceBase（JSON + 裸 DOI 修正）、GSA（`10.1130/`）、DiVA（OAI-PMH 与镜像回退）** 深度解析，支持 `RepoBrowserSession` 跨候选页复用浏览器会话与 Playwright `context.request` 原生上下文下载。
 * **出版商专用提取器与完整性质检**：针对 Silverchair、Atypon、RSC、Cambridge、Frontiers、Copernicus、PeerJ、MDPI、OJS/J-STAGE/中文期刊、Nuxt/JSON、SciEngine 等平台提供专用提取器与 SPA 空壳页面守卫；智能排除正文插图、参考文献与网页噪声，并依据文中附表数量与 `S1..Sn` 编号声明提示潜在缺漏。

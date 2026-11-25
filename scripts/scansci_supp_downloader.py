@@ -122,6 +122,8 @@ from supp_finder import (
     browser_budget_from_args,
     ensure_phase_browser_budget,
     stealthy_fetch_bounded,
+    start_managed_stealthy_session,
+    close_managed_stealthy_session,
     has_system_chrome,
     has_gui_display,
     add_auto_browser_arguments,
@@ -137,6 +139,8 @@ try:
         merge_cookies,
         fetch_page_via_cdp,
         download_via_playwright_request,
+        is_persistent_profile_enabled,
+        set_thread_persistent_profile,
     )
 except ImportError:
     normalize_playwright_cookies = lambda c, default_url=None: c
@@ -145,6 +149,8 @@ except ImportError:
     extract_cdp_cookies = lambda ep, timeout=4.0: []
     merge_cookies = lambda a, b: list(a or []) + list(b or [])
     download_via_playwright_request = lambda *a, **k: (False, "playwright_utils unavailable")
+    is_persistent_profile_enabled = lambda no_persistent_profile=False, config=None: not no_persistent_profile
+    set_thread_persistent_profile = lambda **k: (None, None)
 from browserskill_adapter import (
     BrowserSkillError,
     BrowserSkillRuntime,
@@ -1665,7 +1671,7 @@ def is_html_file(filepath):
 MMC_NUM_REGEX = re.compile(r"(?:^|[^a-z0-9])(?:es)?mmc[-_\s]?([1-9]\d{0,2})(?=$|[^0-9])", re.IGNORECASE)
 
 
-def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None, stealth_session_holder=None, deadline=None, error_out=None, headful: bool = False, real_chrome: bool = False):
+def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_session=None, referer=None, bsk_runtime=None, proxy=None, tunnel_tracker=None, stealth_session_holder=None, deadline=None, error_out=None, headful: bool = False, real_chrome: bool = False, profile_dir=None, persistent_profile: bool = True):
     """Download a single file, trying requests, Scrapling, and authenticated BrowserSkill session.
 
     P1-D: ``proxy`` (``http://[user:pass@]host:port``, same syntax as
@@ -1927,6 +1933,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
         tmp_path = None
         owns_session = stealth_session_holder is None
         session_stealth = None
+        acquired_profile = None
         page = None
         try:
             from scrapling.fetchers import StealthySession
@@ -1955,10 +1962,16 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
             _stealth_kwargs.update(proxy_browser_trust_kwargs(proxy))
             if not owns_session and stealth_session_holder.get("session") is not None:
                 session_stealth = stealth_session_holder["session"]
+                acquired_profile = stealth_session_holder.get("profile_dir")
                 context = session_stealth.context
             else:
-                session_stealth = StealthySession(**_stealth_kwargs)
-                session_stealth.start()
+                session_stealth, acquired_profile = start_managed_stealthy_session(
+                    StealthySession,
+                    _stealth_kwargs,
+                    profile_dir=profile_dir,
+                    persistent_profile=persistent_profile,
+                    use_context_manager=False,
+                )
                 context = session_stealth.context
                 if cookies:
                     normalized_c = normalize_playwright_cookies(cookies, default_url=url)
@@ -1969,6 +1982,7 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                             pass
                 if not owns_session:
                     stealth_session_holder["session"] = session_stealth
+                    stealth_session_holder["profile_dir"] = acquired_profile
             page = context.new_page()
             try:
                 page.set_default_timeout(timeout_ms)
@@ -2031,8 +2045,13 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                 tmp_path = temp_path_for(filepath)
                 download.save_as(tmp_path)
             if owns_session:
-                session_stealth.close()
+                close_managed_stealthy_session(
+                    session_stealth,
+                    profile_dir=acquired_profile,
+                    use_context_manager=False,
+                )
                 session_stealth = None
+                acquired_profile = None
             else:
                 try:
                     page.close()
@@ -2091,16 +2110,27 @@ def download_file(cand_or_url, output_dir, session=None, cookies=None, bsk_sessi
                       f"(连续 {tracker.consecutive_failures(url)} 次 {TUNNEL_ERROR_MARKER})，跳过该站点后续浏览器尝试。")
             if owns_session and session_stealth is not None:
                 try:
-                    session_stealth.close()
+                    close_managed_stealthy_session(
+                        session_stealth,
+                        profile_dir=acquired_profile,
+                        use_context_manager=False,
+                    )
                 except Exception:
                     pass
+                session_stealth = None
+                acquired_profile = None
             elif not owns_session and stealth_session_holder is not None and session_stealth is not None:
                 # Reset broken shared session so next candidate can reopen cleanly if needed
                 try:
-                    session_stealth.close()
+                    close_managed_stealthy_session(
+                        session_stealth,
+                        profile_dir=stealth_session_holder.get("profile_dir"),
+                        use_context_manager=False,
+                    )
                 except Exception:
                     pass
                 stealth_session_holder["session"] = None
+                stealth_session_holder["profile_dir"] = None
         finally:
             if page is not None:
                 try:
@@ -2978,6 +3008,17 @@ def main():
 
 
 def run_download(args, bsk_runtime):
+    _prev_profile_tls = set_thread_persistent_profile(
+        profile_dir=getattr(args, "profile_dir", None),
+        enabled=(False if getattr(args, "no_persistent_profile", False) else None),
+    )
+    try:
+        return _run_download_impl(args, bsk_runtime)
+    finally:
+        set_thread_persistent_profile(profile_dir=_prev_profile_tls[0], enabled=_prev_profile_tls[1])
+
+
+def _run_download_impl(args, bsk_runtime):
 
     # P1-CE: the phase budget (default 150s, --phase-timeout), shared by
     # discovery and the download loop below.
@@ -3056,6 +3097,13 @@ def run_download(args, bsk_runtime):
             playwright_proxy_config(cfg_proxy)
             proxy = cfg_proxy
             print(f"  Proxy (config): {redact_proxy_url(proxy)}")
+    set_thread_persistent_profile(
+        profile_dir=getattr(args, "profile_dir", None) or config.get("browser_profile_dir"),
+        enabled=is_persistent_profile_enabled(
+            no_persistent_profile=bool(getattr(args, "no_persistent_profile", False)),
+            config=config,
+        ),
+    )
     os.makedirs(args.output_dir, exist_ok=True)
 
     if getattr(args, "browserskill", False):
@@ -4007,10 +4055,15 @@ def run_download(args, bsk_runtime):
         shared_stealth = stealth_session_holder.get("session")
         if shared_stealth is not None:
             try:
-                shared_stealth.close()
+                close_managed_stealthy_session(
+                    shared_stealth,
+                    profile_dir=stealth_session_holder.get("profile_dir"),
+                    use_context_manager=False,
+                )
             except Exception:
                 pass
             stealth_session_holder["session"] = None
+            stealth_session_holder["profile_dir"] = None
 
     success_count = len(successful)
     _seen_success_keys = set()

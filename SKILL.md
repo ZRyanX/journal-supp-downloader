@@ -72,6 +72,8 @@ python scripts/journal_downloader.py "<doi_or_url>" --bsk-browser "<browser-id>"
 | `--cdp` / `--cdp-url` | 显式接入已经开放调试端口的 Chromium 浏览器 |
 | `--no-cdp` | 禁用阻塞/缺漏后的本地 Chrome CDP 自动接管 |
 | `--no-auto-headful` / `--no-auto-browser` | 禁用阻塞/缺漏后的独立有头 Chrome 自动回退 |
+| `--profile-dir` | 指定独立抓取浏览器的持久化 Profile 目录（默认 `~/.journal_supp_downloader_profile/browser_profile/<channel>`） |
+| `--no-persistent-profile` | 禁用持久化浏览器 Profile，每次使用临时目录 |
 | `--oa` / `--no-oa` | 优先查询/禁用开放获取仓储镜像查询 |
 | `--phase-timeout` | 单篇阶段（发现+下载）总预算秒数，默认 `150` |
 | `--browser-goto-timeout` | 浏览器回退单页加载超时秒数，默认 `30` |
